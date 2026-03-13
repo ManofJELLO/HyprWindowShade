@@ -202,8 +202,12 @@ void applyShaderRulesSafe(ConfigManager& cm, WindowPtr pWindow) {
         else if constexpr (requires { rule.rule; }) { ruleStr = rule.rule; }
         else continue;
 
-        if (ruleStr.starts_with("plugin:shader:")) {
-            std::string shaderPath = ruleStr.substr(14);
+        // --- CRITICAL FIX 7: HYPRLAND STRICT PARSER BYPASS ---
+        // Hyprland's internal parser strictly rejects custom/plugin window rules,
+        // throwing an "invalid field type" error. To bypass this entirely, we 
+        // piggyback on the native "tag" rule, which natively allows arbitrary strings!
+        if (ruleStr.starts_with("tag +shader:")) {
+            std::string shaderPath = ruleStr.substr(12);
             if (g_mCompiledShaders.find(shaderPath) == g_mCompiledShaders.end()) {
                 g_mCompiledShaders[shaderPath] = compileShader(shaderPath);
             }
