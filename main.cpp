@@ -301,17 +301,21 @@ void hkRenderWindow(void* thisptr, PHLWINDOW pWindow, void* pMonitor, timespec* 
     }
 }
 
+// --- REQUIRED HYPRLAND API EXPORTS ---
+// We MUST use the exact macros provided by HyprlandAPI.hpp.
+// They automatically handle the C-linkage and exact string names that dlsym expects.
+
+APICALL EXPORT std::string PLUGIN_API_VERSION() {
+    return HYPRLAND_API_VERSION;
+}
+
 APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     PHANDLE = handle;
 
-    // glewInit() has been removed as we are using native GLES3
-
     // --- SAFEGUARD 2: RUNTIME ABI CHECK ---
-    // Fetch the active Hyprland version.
     SVersionInfo hyprVer = HyprlandAPI::getHyprlandVersion(PHANDLE);
     std::string currentVerString = hyprVer.tag;
 
-    // If the expected target version is NOT found in the active version string, ABORT the hook.
     if (currentVerString.find(TARGET_HYPRLAND_VERSION) == std::string::npos) {
         std::cerr << "\n[HyprWindowShade] =========================================\n";
         std::cerr << "[HyprWindowShade] FATAL ABI SHIELD: HYPRLAND VERSION MISMATCH!\n";
@@ -321,7 +325,6 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         std::cerr << "[HyprWindowShade] Please verify the TRenderWindow signature and update TARGET_HYPRLAND_VERSION.\n";
         std::cerr << "[HyprWindowShade] =========================================\n\n";
         
-        // Return dummy info. The plugin will load into hyprctl, but it will sit completely dormant.
         return {"HyprWindowShade (DISABLED: ABI LOCKOUT)", "Version Safety Lockout", "YourName", "1.1"};
     }
 
