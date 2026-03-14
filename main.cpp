@@ -58,6 +58,10 @@ std::map<std::string, std::string> g_mWindowClassShaderMap;
 // --- CRITICAL FIX 50: NATIVE CSHADER CACHE ---
 std::map<std::string, Hyprutils::Memory::CSharedPointer<CShader>> g_mCompiledCShaders;
 
+// --- CRITICAL FIX 62: TIME TRACKER MAP ---
+// Intelligently tracks which shaders require a continuous render loop!
+std::map<std::string, bool> g_mShaderUsesTime;
+
 
 // --- HELPER: SHADER COMPILATION ---
 // Extracts the compilation logic so both Windows and Layers can use it cleanly.
@@ -70,10 +74,15 @@ Hyprutils::Memory::CSharedPointer<CShader> getOrCompileShader(CHyprOpenGLImpl* t
             
             auto customShader = Hyprutils::Memory::makeShared<CShader>();
             
+            // --- SMART DAMAGE DETECTION ---
+            // If the shader file contains the word "time", we flag it for continuous animation!
+            std::string shaderCode = buffer.str();
+            g_mShaderUsesTime[shaderPath] = (shaderCode.find("time") != std::string::npos);
+
             // --- CRITICAL FIX 53: MATCH GLES VERSIONS ---
             // Because pixelate.glsl uses #version 320 es, we MUST link it
             // against Hyprland's TEXVERTSRC320 vertex shader!
-            customShader->createProgram(thisptr->m_shaders->TEXVERTSRC320, buffer.str(), true, true);
+            customShader->createProgram(thisptr->m_shaders->TEXVERTSRC320, shaderCode, true, true);
             g_mCompiledCShaders[shaderPath] = customShader;
             
             if (customShader->program() == 0) {
@@ -107,8 +116,12 @@ Hyprutils::Memory::CWeakPointer<CShader> hkGetSurfaceShader(CHyprOpenGLImpl* thi
         
         // 1. Check for specific window instance overrides first
         if (g_mWindowShaderMap.find(rawWin) != g_mWindowShaderMap.end()) {
-            auto customShader = getOrCompileShader(thisptr, g_mWindowShaderMap[rawWin]);
-            if (customShader && customShader->program() != 0) return customShader;
+            std::string path = g_mWindowShaderMap[rawWin];
+            auto customShader = getOrCompileShader(thisptr, path);
+            if (customShader && customShader->program() != 0) {
+                if (g_mShaderUsesTime[path]) g_pHyprRenderer->damageWindow(window);
+                return customShader;
+            }
         } 
         
         // 2. Fall back to checking if the entire app class is targeted
@@ -118,11 +131,19 @@ Hyprutils::Memory::CWeakPointer<CShader> hkGetSurfaceShader(CHyprOpenGLImpl* thi
         std::string currentClass = rawWin->m_class;
         
         if (g_mWindowClassShaderMap.find(initClass) != g_mWindowClassShaderMap.end()) {
-            auto customShader = getOrCompileShader(thisptr, g_mWindowClassShaderMap[initClass]);
-            if (customShader && customShader->program() != 0) return customShader;
+            std::string path = g_mWindowClassShaderMap[initClass];
+            auto customShader = getOrCompileShader(thisptr, path);
+            if (customShader && customShader->program() != 0) {
+                if (g_mShaderUsesTime[path]) g_pHyprRenderer->damageWindow(window);
+                return customShader;
+            }
         } else if (g_mWindowClassShaderMap.find(currentClass) != g_mWindowClassShaderMap.end()) {
-            auto customShader = getOrCompileShader(thisptr, g_mWindowClassShaderMap[currentClass]);
-            if (customShader && customShader->program() != 0) return customShader;
+            std::string path = g_mWindowClassShaderMap[currentClass];
+            auto customShader = getOrCompileShader(thisptr, path);
+            if (customShader && customShader->program() != 0) {
+                if (g_mShaderUsesTime[path]) g_pHyprRenderer->damageWindow(window);
+                return customShader;
+            }
         }
     } 
     else if (layer) {
@@ -130,13 +151,41 @@ Hyprutils::Memory::CWeakPointer<CShader> hkGetSurfaceShader(CHyprOpenGLImpl* thi
         // Updated to use 'm_namespace' as per the v0.54.2 LayerSurface.hpp
         std::string ns = layer->m_namespace;
         if (g_mLayerNamespaceShaderMap.find(ns) != g_mLayerNamespaceShaderMap.end()) {
-            auto customShader = getOrCompileShader(thisptr, g_mLayerNamespaceShaderMap[ns]);
-            if (customShader && customShader->program() != 0) return customShader;
+            std::string path = g_mLayerNamespaceShaderMap[ns];
+            auto customShader = getOrCompileShader(thisptr, path);
+            if (customShader && customShader->program() != 0) {
+                if (g_mShaderUsesTime[path]) {
+                    auto pMon = thisptr->m_renderData.pMonitor.lock();
+                    if (pMon) g_pCompositor->scheduleFrameForMonitor(pMon);
+                }
+                return customShader;
+            }
         }
     }
     
     // Pass through to the original Hyprland shader builder for non-tagged elements
     return ((TGetSurfaceShader)g_pGetSurfaceShaderHook->m_original)(thisptr, features);
+}
+
+// --- CRITICAL FIX 63: TIME UNIFORM INJECTION ---
+// By hooking useShader, we wait until the custom shader is actively bound 
+// to the graphics card, and then we instantly push the steady_clock time into it!
+inline CFunctionHook* g_pUseShaderHook = nullptr;
+typedef Hyprutils::Memory::CWeakPointer<CShader> (*TUseShader)(CHyprOpenGLImpl* thisptr, Hyprutils::Memory::CWeakPointer<CShader> prog);
+
+Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, Hyprutils::Memory::CWeakPointer<CShader> prog) {
+    auto result = ((TUseShader)g_pUseShaderHook->m_original)(thisptr, prog);
+
+    auto shnd = prog.lock();
+    if (shnd && shnd->program() != 0) {
+        GLint timeLoc = glGetUniformLocation(shnd->program(), "time");
+        if (timeLoc >= 0) {
+            auto now = std::chrono::steady_clock::now();
+            float t = std::chrono::duration_cast<std::chrono::duration<float>>(now.time_since_epoch()).count();
+            glUniform1f(timeLoc, t);
+        }
+    }
+    return result;
 }
 
 void applyShaderRulesSafe(PHLWINDOW pWindow) {
@@ -181,12 +230,26 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] FATAL: getSurfaceShader not found!", CHyprColor(1.0f, 0.0f, 0.0f, 1.0f), 10000.0f);
     }
 
-    // 3. Listen to native rules
+    // 3. Hook useShader to push our time uniforms
+    auto methodsUse = HyprlandAPI::findFunctionsByName(PHANDLE, "useShader");
+    void* useAddr = nullptr;
+    for (auto& m : methodsUse) {
+        if (m.demangled.find("CHyprOpenGLImpl::useShader") != std::string::npos) {
+            useAddr = m.address;
+            break;
+        }
+    }
+    if (useAddr) {
+        g_pUseShaderHook = HyprlandAPI::createFunctionHook(PHANDLE, useAddr, (void*)&hkUseShader);
+        g_pUseShaderHook->hook();
+    }
+
+    // 4. Listen to native rules
     g_Listeners.push_back(Event::bus()->m_events.window.updateRules.listen([&](PHLWINDOW window) {
         try { applyShaderRulesSafe(window); } catch (...) {}
     }));
 
-    // 4. Custom Dispatcher for Layer Surfaces
+    // 5. Custom Dispatcher for Layer Surfaces
     HyprlandAPI::addDispatcherV2(PHANDLE, "layershader", [&](std::string args) -> SDispatchResult {
         size_t spacePos = args.find_first_of(" \t");
         if (spacePos != std::string::npos) {
@@ -323,6 +386,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
     g_mWindowShaderMap.clear();
     g_mLayerNamespaceShaderMap.clear();
     g_mWindowClassShaderMap.clear(); 
+    g_mShaderUsesTime.clear();
 
     // --- CRITICAL FIX 60: THE UNLOAD CRASH (GL CONTEXT) ---
     // If we clear the CShader map normally, the CShader destructor calls glDeleteProgram().
@@ -336,6 +400,10 @@ APICALL EXPORT void PLUGIN_EXIT() {
         // --- CRITICAL FIX 61: DOUBLE UNHOOK CRASH ---
         // removeFunctionHook calls unhook() internally. Calling it twice can cause a crash!
         HyprlandAPI::removeFunctionHook(PHANDLE, g_pGetSurfaceShaderHook);
+    }
+    
+    if (g_pUseShaderHook) {
+        HyprlandAPI::removeFunctionHook(PHANDLE, g_pUseShaderHook);
     }
 
     // --- CRITICAL FIX 55: DISPATCHER CLEANUP ---
