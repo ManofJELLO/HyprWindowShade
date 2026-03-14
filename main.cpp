@@ -78,10 +78,9 @@ Hyprutils::Memory::CWeakPointer<CShader> hkGetSurfaceShader(CHyprOpenGLImpl* thi
                     customShader->createProgram(thisptr->m_shaders->TEXVERTSRC320, buffer.str(), true, true);
                     g_mCompiledCShaders[shaderPath] = customShader;
                     
-                    if (customShader->program() != 0) {
-                        HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] Native Shader Compiled!", CHyprColor(0.2f, 1.0f, 0.2f, 1.0f), 3000.0f);
-                    } else {
-                        HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] Shader Compile FAILED!", CHyprColor(1.0f, 0.0f, 0.0f, 1.0f), 5000.0f);
+                    if (customShader->program() == 0) {
+                        // Increased error notification time to 10 seconds (10000.0f)
+                        HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] Shader Compile FAILED!", CHyprColor(1.0f, 0.0f, 0.0f, 1.0f), 10000.0f);
                     }
                 }
             }
@@ -135,9 +134,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     if (getVariantAddr) {
         g_pGetSurfaceShaderHook = HyprlandAPI::createFunctionHook(PHANDLE, getVariantAddr, (void*)&hkGetSurfaceShader);
         g_pGetSurfaceShaderHook->hook();
-        HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] Shader Hook Active!", CHyprColor(0.2f, 1.0f, 0.2f, 1.0f), 3000.0f);
     } else {
-        HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] FATAL: getSurfaceShader not found!", CHyprColor(1.0f, 0.0f, 0.0f, 1.0f), 5000.0f);
+        // Increased error notification time to 10 seconds (10000.0f)
+        HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] FATAL: getSurfaceShader not found!", CHyprColor(1.0f, 0.0f, 0.0f, 1.0f), 10000.0f);
     }
 
     // 3. Listen to native rules
