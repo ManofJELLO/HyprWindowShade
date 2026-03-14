@@ -25,17 +25,23 @@ exec-once = hyprctl plugin load /home/USERNAME/.local/share/hyprland/plugins/Hyp
 If you want to apply to a layer at startup below is an example:  
 exec-once = hyprctl dispatch layershader mpvpaper /home/manofjello/.config/hypr/shaders/pixelate.glsl  
 
-KeyBind layer example for toggle:  
-Toggle pixelate shader
+## KeyBind layer example for toggle:  
 bind = $mainMod, B, togglelayershader, mpvpaper /home/manofjello/.config/hypr/shaders/pixelate.glsl  
 
-Turn the pixelate shader ON for mpvpaper
+## Turn the pixelate shader ON for mpvpaper
 bind = $mainMod, B, layershader, mpvpaper /home/manofjello/.config/hypr/shaders/pixelate.glsl
 
-Turn the shader OFF (clear it)
+## Turn the shader OFF (clear it)
 bind = $mainMod SHIFT, B, layershader, mpvpaper clear
 
-Example windowRule for reading_mode.glsl shader:
+## Example windowRule for reading_mode.glsl shader:
 windowrule = match:class kitty, tag +shader:/home/manofjello/.config/hypr/shaders/reading_mode.glsl
+
+## if you want a dynamic keybind to toggle the effect for every single open program
+ bind = $mainMod, K, toggleclassshader, google-chrome /home/manofjello/.config/hypr/shaders/reading_mode.glsl
+## Toggle the shader on the currently focused window
+ bind = $mainMod, W, togglewindowshader, /home/manofjello/.config/hypr/shaders/pixelate.glsl
+## If you want a program to always have the shader applied automatically on startup
+  exec-once = hyprctl dispatch classshader kitty /home/manofjello/.config/hypr/shaders/pixelate.glsl
 
 This was a vibe coding experiment with base Gemini Pro. I didn't write any of this code other than spending hours fighting the clankers. The AI makes a lot of assumptions for naming and function calls, overly believes the compiler suggestions and doesn't ask for help or more information when it should. Honestly though, I learned C++ 25 years ago and haven't touched it since and I was able to write a working plugin without writing a single line of code.  
