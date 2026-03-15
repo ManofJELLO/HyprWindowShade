@@ -376,6 +376,29 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         return SDispatchResult{};
     });
 
+    // --- CRITICAL FIX 64: RELOAD SHADERS DISPATCHER ---
+    // Clears the compiled shader cache and forces a global screen redraw to live-reload changes!
+    HyprlandAPI::addDispatcherV2(PHANDLE, "reloadshaders", [&](std::string args) -> SDispatchResult {
+        
+        // 1. Wipe the current compiled binaries from RAM
+        g_mCompiledCShaders.clear();
+        
+        // 2. Force every open window to redraw
+        for (auto& w : g_pCompositor->m_windows) {
+            if (w) g_pHyprRenderer->damageWindow(w);
+        }
+        
+        // 3. Force every monitor to redraw (this catches all Layer Surfaces like mpvpaper)
+        for (auto& m : g_pCompositor->m_monitors) {
+            if (m) g_pCompositor->scheduleFrameForMonitor(m);
+        }
+        
+        // Pop a quick notification to let you know the files were re-read
+        HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] Shaders Reloaded from Disk!", CHyprColor(0.2f, 1.0f, 0.2f, 1.0f), 3000.0f);
+        
+        return SDispatchResult{};
+    });
+
     return {"HyprWindowShade", "Native CShader Injection", "ManofJELLO", "1.1"};
 }
 
@@ -412,4 +435,5 @@ APICALL EXPORT void PLUGIN_EXIT() {
     HyprlandAPI::removeDispatcher(PHANDLE, "togglewindowshader");
     HyprlandAPI::removeDispatcher(PHANDLE, "classshader");
     HyprlandAPI::removeDispatcher(PHANDLE, "toggleclassshader");
+    HyprlandAPI::removeDispatcher(PHANDLE, "reloadshaders"); // Add new dispatcher cleanup
 }

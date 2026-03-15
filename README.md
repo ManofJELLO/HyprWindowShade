@@ -40,10 +40,14 @@ bind = $mainMod SHIFT, B, layershader, mpvpaper clear
 windowrule = match:class kitty, tag +shader:/home/manofjello/.config/hypr/shaders/reading_mode.glsl
 
 ## if you want a dynamic keybind to toggle the effect for every single open program
- bind = $mainMod, K, toggleclassshader, google-chrome /home/manofjello/.config/hypr/shaders/reading_mode.glsl
+bind = $mainMod, K, toggleclassshader, google-chrome /home/manofjello/.config/hypr/shaders/reading_mode.glsl
 ## Toggle the shader on the currently focused window
- bind = $mainMod, W, togglewindowshader, /home/manofjello/.config/hypr/shaders/pixelate.glsl
+bind = $mainMod, W, togglewindowshader, /home/manofjello/.config/hypr/shaders/pixelate.glsl
 ## If you want a program to always have the shader applied automatically on startup
-  exec-once = hyprctl dispatch classshader kitty /home/manofjello/.config/hypr/shaders/pixelate.glsl
+exec-once = hyprctl dispatch classshader kitty /home/manofjello/.config/hypr/shaders/pixelate.glsl
+  
+## keybind to reload the shaders if you made changes to their .glsl file to adjust the effect
+## or you can write "hyprctl dispatch reloadshaders" in terminal
+bind = $mainMod, R, reloadshaders 
 
 This was a vibe coding experiment with base Gemini Pro. I didn't write any of this code other than spending hours fighting the clankers. The AI makes a lot of assumptions for naming and function calls, overly believes the compiler suggestions and doesn't ask for help or more information when it should. Honestly though, I learned C++ 25 years ago and haven't touched it since and I was able to write a working plugin without writing a single line of code.  
