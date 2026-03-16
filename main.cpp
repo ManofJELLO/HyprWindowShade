@@ -63,7 +63,7 @@ std::map<std::string, Hyprutils::Memory::CSharedPointer<CShader>> g_mCompiledCSh
 std::map<std::string, bool> g_mShaderUsesTime;
 
 
-// --- HELPER: SHADER COMPILATION ---
+// --- HELPER: SHADER COMPILATION (WITH AUTO-ALPHA INJECTION) ---
 // Extracts the compilation logic so both Windows and Layers can use it cleanly.
 Hyprutils::Memory::CSharedPointer<CShader> getOrCompileShader(CHyprOpenGLImpl* thisptr, const std::string& shaderPath) {
     if (g_mCompiledCShaders.find(shaderPath) == g_mCompiledCShaders.end()) {
@@ -72,13 +72,32 @@ Hyprutils::Memory::CSharedPointer<CShader> getOrCompileShader(CHyprOpenGLImpl* t
             std::stringstream buffer;
             buffer << shaderFile.rdbuf();
             
-            auto customShader = Hyprutils::Memory::makeShared<CShader>();
-            
+            std::string shaderCode = buffer.str();
+
             // --- SMART DAMAGE DETECTION ---
             // If the shader file contains the word "time", we flag it for continuous animation!
-            std::string shaderCode = buffer.str();
             g_mShaderUsesTime[shaderPath] = (shaderCode.find("time") != std::string::npos);
 
+            // --- THE FIX: SHADER WRAPPING (AUTO-ALPHA) ---
+            // We search for the user's main function, rename it, and append a hidden 
+            // wrapper that automatically handles the premultiplied alpha math!
+            size_t mainPos = shaderCode.find("void main()");
+            if (mainPos != std::string::npos) {
+                // Rename the user's main function
+                shaderCode.replace(mainPos, 11, "void user_main()");
+                
+                // Inject the alpha uniform and the wrapper function at the bottom
+                shaderCode += R"(
+                    uniform float plugin_alpha;
+                    void main() {
+                        user_main(); 
+                        fragColor *= plugin_alpha; 
+                    }
+                )";
+            }
+
+            auto customShader = Hyprutils::Memory::makeShared<CShader>();
+            
             // --- CRITICAL FIX 53: MATCH GLES VERSIONS ---
             // Because pixelate.glsl uses #version 320 es, we MUST link it
             // against Hyprland's TEXVERTSRC320 vertex shader!
@@ -167,9 +186,9 @@ Hyprutils::Memory::CWeakPointer<CShader> hkGetSurfaceShader(CHyprOpenGLImpl* thi
     return ((TGetSurfaceShader)g_pGetSurfaceShaderHook->m_original)(thisptr, features);
 }
 
-// --- CRITICAL FIX 63: TIME UNIFORM INJECTION ---
+// --- CRITICAL FIX 63: TIME & AUTO-ALPHA UNIFORM INJECTION ---
 // By hooking useShader, we wait until the custom shader is actively bound 
-// to the graphics card, and then we instantly push the steady_clock time into it!
+// to the graphics card, and then we instantly push our custom uniforms into it!
 inline CFunctionHook* g_pUseShaderHook = nullptr;
 typedef Hyprutils::Memory::CWeakPointer<CShader> (*TUseShader)(CHyprOpenGLImpl* thisptr, Hyprutils::Memory::CWeakPointer<CShader> prog);
 
@@ -178,11 +197,28 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
 
     auto shnd = prog.lock();
     if (shnd && shnd->program() != 0) {
+        // 1. Inject Time
         GLint timeLoc = glGetUniformLocation(shnd->program(), "time");
         if (timeLoc >= 0) {
             auto now = std::chrono::steady_clock::now();
             float t = std::chrono::duration_cast<std::chrono::duration<float>>(now.time_since_epoch()).count();
             glUniform1f(timeLoc, t);
+        }
+
+        // 2. Inject Plugin Alpha
+        // We now target "plugin_alpha" which is hidden inside our injected wrapper
+        GLint alphaLoc = glGetUniformLocation(shnd->program(), "plugin_alpha");
+        if (alphaLoc >= 0) {
+            float currentAlpha = 1.0f;
+            auto window = thisptr->m_renderData.currentWindow.lock();
+            auto layer = thisptr->m_renderData.currentLS.lock();
+            
+            if (window) {
+                currentAlpha = window->m_alpha->value() * window->m_activeInactiveAlpha->value();
+            } else if (layer) {
+                currentAlpha = layer->m_alpha->value();
+            }
+            glUniform1f(alphaLoc, currentAlpha);
         }
     }
     return result;
@@ -230,7 +266,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] FATAL: getSurfaceShader not found!", CHyprColor(1.0f, 0.0f, 0.0f, 1.0f), 10000.0f);
     }
 
-    // 3. Hook useShader to push our time uniforms
+    // 3. Hook useShader to push our time & alpha uniforms
     auto methodsUse = HyprlandAPI::findFunctionsByName(PHANDLE, "useShader");
     void* useAddr = nullptr;
     for (auto& m : methodsUse) {
@@ -435,5 +471,5 @@ APICALL EXPORT void PLUGIN_EXIT() {
     HyprlandAPI::removeDispatcher(PHANDLE, "togglewindowshader");
     HyprlandAPI::removeDispatcher(PHANDLE, "classshader");
     HyprlandAPI::removeDispatcher(PHANDLE, "toggleclassshader");
-    HyprlandAPI::removeDispatcher(PHANDLE, "reloadshaders"); // Add new dispatcher cleanup
+    HyprlandAPI::removeDispatcher(PHANDLE, "reloadshaders"); 
 }
