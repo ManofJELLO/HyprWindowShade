@@ -67,6 +67,16 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         }
     }));
 
+    // --- CRITICAL FIX 66: FULLSCREEN SHIFT DAMAGE ---
+    // Forces an immediate redraw when a window enters or exits fullscreen mode.
+    g_Listeners.push_back(Event::bus()->m_events.window.fullscreen.listen([&](auto window) {
+        if (window) {
+            Desktop::View::CWindow* rawWin = window.get();
+            // We redraw to either apply the fullscreen shader OR instantly strip the active shader
+            g_pHyprRenderer->damageWindow(window);
+        }
+    }));
+
     // 5. Custom Dispatcher for Layer Surfaces
     HyprlandAPI::addDispatcherV2(PHANDLE, "layershader", [&](std::string args) -> SDispatchResult {
         size_t spacePos = args.find_first_of(" \t");

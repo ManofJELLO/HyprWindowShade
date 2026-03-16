@@ -37,11 +37,16 @@ bind = $mainMod, B, layershader, mpvpaper /home/manofjello/.config/hypr/shaders/
 bind = $mainMod SHIFT, B, layershader, mpvpaper clear  
 
 Update:  
-You can now use three different tags in your hyprland.conf:  
+You can now use five different tags in your hyprland.conf:  
   
 tag +shader:/path.glsl (Applies all the time, regardless of focus)  
+tag +shader_fullscreen:/path.glsl (Default behavior is to disable shaders on fullscreen apps, this tag applies the shader on a fullscreen app)  
 tag +shader_active:/path.glsl (Applies ONLY when you click the window)  
 tag +shader_inactive:/path.glsl (Applies ONLY when you click away)  
+tag +shader_floating:/path.glsl (Applies ONLY to floating windows)  
+tag +shader_tiled:/path.glsl (Applies ONLY to tiled windows)  
+Behavior Note:  
+Floating rules are prioritized over the Active rules. This means if you have both a floating rule AND an active rule, the floating shader will takeprecedence while the window is floating.  
   
 ## Example windowRule for reading_mode.glsl shader:
 windowrule = match:class kitty, tag +shader:/home/manofjello/.config/hypr/shaders/reading_mode.glsl

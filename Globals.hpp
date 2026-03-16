@@ -52,6 +52,9 @@ extern std::map<Desktop::View::CWindow*, std::string> g_mWindowManualShaders;
 struct WindowShaderState {
     std::string active;
     std::string inactive;
+    std::string floating; 
+    std::string tiled;    
+    std::string fullscreen; // NEW: Fullscreen state tracker
     std::string fallback;
 };
 extern std::map<Desktop::View::CWindow*, WindowShaderState> g_mWindowRuleShaders;

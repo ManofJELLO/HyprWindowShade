@@ -17,25 +17,41 @@ Hyprutils::Memory::CWeakPointer<CShader> hkGetSurfaceShader(CHyprOpenGLImpl* thi
         if (g_mWindowManualShaders.find(rawWin) != g_mWindowManualShaders.end()) {
             pathToUse = g_mWindowManualShaders[rawWin];
         } 
-        // 2. Dynamic Rules (Active vs Inactive) evaluated dynamically!
-        else if (g_mWindowRuleShaders.find(rawWin) != g_mWindowRuleShaders.end()) {
-            auto& state = g_mWindowRuleShaders[rawWin];
-            bool isActive = g_pCompositor->isWindowActive(window);
-            
-            if (isActive && !state.active.empty()) pathToUse = state.active;
-            else if (!isActive && !state.inactive.empty()) pathToUse = state.inactive;
-            else if (!state.fallback.empty()) pathToUse = state.fallback;
+        // 2. Fullscreen Block (Overrides all other rules by default!)
+        // --- THE FIX: METHOD CALL (FULLSCREEN) ---
+        // In v0.54.2, isFullscreen is a function, not a simple boolean variable!
+        else if (rawWin->isFullscreen()) {
+            if (g_mWindowRuleShaders.find(rawWin) != g_mWindowRuleShaders.end() && 
+                !g_mWindowRuleShaders[rawWin].fullscreen.empty()) {
+                pathToUse = g_mWindowRuleShaders[rawWin].fullscreen;
+            }
+            // If it's fullscreen and no specific fullscreen rule exists, pathToUse remains empty.
         }
-        
-        // 3. App Class map fallback
-        if (pathToUse.empty()) {
-            // --- CRITICAL FIX 59: RENAME FIXES ---
-            std::string initClass = rawWin->m_initialClass;
-            std::string currentClass = rawWin->m_class;
-            if (g_mWindowClassShaderMap.find(initClass) != g_mWindowClassShaderMap.end()) {
-                pathToUse = g_mWindowClassShaderMap[initClass];
-            } else if (g_mWindowClassShaderMap.find(currentClass) != g_mWindowClassShaderMap.end()) {
-                pathToUse = g_mWindowClassShaderMap[currentClass];
+        // 3. Dynamic Rules (Floating vs Active vs Inactive) evaluated dynamically!
+        else {
+            if (g_mWindowRuleShaders.find(rawWin) != g_mWindowRuleShaders.end()) {
+                auto& state = g_mWindowRuleShaders[rawWin];
+                bool isActive = g_pCompositor->isWindowActive(window);
+                bool isFloating = rawWin->m_isFloating; 
+                
+                // Priority tree: Floating/Tiled overrides standard Active/Inactive Focus
+                if (isFloating && !state.floating.empty()) pathToUse = state.floating;
+                else if (!isFloating && !state.tiled.empty()) pathToUse = state.tiled;
+                else if (isActive && !state.active.empty()) pathToUse = state.active;
+                else if (!isActive && !state.inactive.empty()) pathToUse = state.inactive;
+                else if (!state.fallback.empty()) pathToUse = state.fallback;
+            }
+            
+            // 4. App Class map fallback
+            if (pathToUse.empty()) {
+                // --- CRITICAL FIX 59: RENAME FIXES ---
+                std::string initClass = rawWin->m_initialClass;
+                std::string currentClass = rawWin->m_class;
+                if (g_mWindowClassShaderMap.find(initClass) != g_mWindowClassShaderMap.end()) {
+                    pathToUse = g_mWindowClassShaderMap[initClass];
+                } else if (g_mWindowClassShaderMap.find(currentClass) != g_mWindowClassShaderMap.end()) {
+                    pathToUse = g_mWindowClassShaderMap[currentClass];
+                }
             }
         }
 
@@ -118,6 +134,15 @@ void applyShaderRulesSafe(PHLWINDOW pWindow) {
             hasRules = true;
         } else if (cleanTag.find("shader_inactive:") == 0) {
             state.inactive = cleanTag.substr(16);
+            hasRules = true;
+        } else if (cleanTag.find("shader_floating:") == 0) {
+            state.floating = cleanTag.substr(16);
+            hasRules = true;
+        } else if (cleanTag.find("shader_tiled:") == 0) {
+            state.tiled = cleanTag.substr(13);
+            hasRules = true;
+        } else if (cleanTag.find("shader_fullscreen:") == 0) {
+            state.fullscreen = cleanTag.substr(18); // NEW: Fullscreen rule parser
             hasRules = true;
         }
     }
