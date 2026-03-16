@@ -37,7 +37,7 @@ bind = $mainMod, B, layershader, mpvpaper /home/manofjello/.config/hypr/shaders/
 bind = $mainMod SHIFT, B, layershader, mpvpaper clear  
 
 Update:  
-You can now use five different tags in your hyprland.conf:  
+You can now use six different tags in your hyprland.conf:  
   
 tag +shader:/path.glsl (Applies all the time, regardless of focus)  
 tag +shader_fullscreen:/path.glsl (Default behavior is to disable shaders on fullscreen apps, this tag applies the shader on a fullscreen app)  
