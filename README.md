@@ -34,8 +34,15 @@ bind = $mainMod, B, togglelayershader, mpvpaper /home/manofjello/.config/hypr/sh
 bind = $mainMod, B, layershader, mpvpaper /home/manofjello/.config/hypr/shaders/pixelate.glsl
 
 ## Turn the shader OFF (clear it)
-bind = $mainMod SHIFT, B, layershader, mpvpaper clear
+bind = $mainMod SHIFT, B, layershader, mpvpaper clear  
 
+Update:  
+You can now use three different tags in your hyprland.conf:  
+  
+tag +shader:/path.glsl (Applies all the time, regardless of focus)  
+tag +shader_active:/path.glsl (Applies ONLY when you click the window)  
+tag +shader_inactive:/path.glsl (Applies ONLY when you click away)  
+  
 ## Example windowRule for reading_mode.glsl shader:
 windowrule = match:class kitty, tag +shader:/home/manofjello/.config/hypr/shaders/reading_mode.glsl
 

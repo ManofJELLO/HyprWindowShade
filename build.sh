@@ -17,7 +17,20 @@ hyprctl plugin unload "$PLUGIN_PATH"
 sleep 2
 
 echo "[Build] Running make..."
-make all
+# --- THE FIX: MULTI-FILE COMPILATION ---
+# Using *.cpp tells g++ to compile main.cpp, Hooks.cpp, and ShaderEngine.cpp together!
+g++ -shared -fPIC -O3 -std=c++23 *.cpp -o HyprWindowShade.so \
+    -I/var/cache/hyprpm/manofjello/headersRoot/include \
+    -I/var/cache/hyprpm/manofjello/headersRoot/include/hyprland/protocols \
+    -I/var/cache/hyprpm/manofjello/headersRoot/include/hyprland \
+    -I/usr/include/cairo \
+    -I/usr/include/freetype2 \
+    -I/usr/include/libpng16 \
+    -I/usr/include/pixman-1 \
+    -I/usr/include/libdrm \
+    -I/usr/include/hyprland/protocols \
+    -I/usr/include/hyprland/include \
+    -lGLESv2 -lEGL -lGL
 
 if [ $? -ne 0 ]; then
     echo -e "${RED}[Error] Compilation failed. Aborting load.${NC}"
