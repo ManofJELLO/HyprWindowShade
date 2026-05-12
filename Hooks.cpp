@@ -1,7 +1,7 @@
 #include "Globals.hpp"
 
 // --- THREAD-LOCAL RENDER CONTEXT ---
-thread_local Desktop::View::CWindow*       g_pCurrentRenderWindow = nullptr;
+thread_local PHLWINDOWREF                  g_pCurrentRenderWindow;
 thread_local Desktop::View::CLayerSurface* g_pCurrentRenderLayer  = nullptr;
 
 // --- V0.55 HOOK: CGLElementRenderer::draw(CTexPassElement, CRegion) ---
@@ -12,48 +12,52 @@ typedef void (*TGLDrawTex)(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPa
 void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement> element, const CRegion& damage) {
     auto elem = element.lock();
 
-    PHLWINDOW pWindow = nullptr;
-    PHLLS     pLS     = nullptr;
+    PHLWINDOW pWindow;
+    PHLLS     pLS;
 
     if (elem && elem->m_data.surface) {
-        // Try to resolve to a window first
         pWindow = g_pCompositor->getWindowFromSurface(elem->m_data.surface);
-        // Layer surface is directly available
-        pLS = elem->m_data.currentLS.lock();
+        pLS     = elem->m_data.currentLS.lock();
     }
 
-    g_pCurrentRenderWindow = pWindow ? pWindow.get() : nullptr;
-    g_pCurrentRenderLayer  = pLS     ? pLS.get()     : nullptr;
+    g_pCurrentRenderWindow = pWindow;
+    g_pCurrentRenderLayer  = pLS ? pLS.get() : nullptr;
 
-    // Schedule continuous redraw if a time-based shader is in play
-    std::string pathToUse = "";
+    // Schedule continuous redraw if a time-based shader is in play.
+    const std::string* pathToUse = nullptr;
     if (pWindow) {
         Desktop::View::CWindow* rawWin = pWindow.get();
-        if (g_mWindowManualShaders.count(rawWin))
-            pathToUse = g_mWindowManualShaders[rawWin];
-        else {
-            std::string initClass    = rawWin->m_initialClass;
-            std::string currentClass = rawWin->m_class;
-            if      (g_mWindowClassShaderMap.count(initClass))    pathToUse = g_mWindowClassShaderMap[initClass];
-            else if (g_mWindowClassShaderMap.count(currentClass)) pathToUse = g_mWindowClassShaderMap[currentClass];
+        auto manualIt = g_mWindowManualShaders.find(rawWin);
+        if (manualIt != g_mWindowManualShaders.end()) {
+            pathToUse = &manualIt->second;
+        } else {
+            const auto& initClass    = rawWin->m_initialClass;
+            const auto& currentClass = rawWin->m_class;
+            auto classIt = g_mWindowClassShaderMap.find(initClass);
+            if (classIt == g_mWindowClassShaderMap.end()) classIt = g_mWindowClassShaderMap.find(currentClass);
+            if (classIt != g_mWindowClassShaderMap.end()) pathToUse = &classIt->second;
         }
-        if (!pathToUse.empty() && g_mShaderUsesTime[pathToUse])
-            g_pHyprRenderer->damageWindow(pWindow);
+        if (pathToUse) {
+            auto sit = g_mCompiledCShaders.find(*pathToUse);
+            if (sit != g_mCompiledCShaders.end() && sit->second.usesTime)
+                g_pHyprRenderer->damageWindow(pWindow);
+        }
     } else if (pLS) {
-        std::string ns = pLS->m_namespace;
-        if (g_mLayerNamespaceShaderMap.count(ns)) {
-            pathToUse = g_mLayerNamespaceShaderMap[ns];
-            if (!pathToUse.empty() && g_mShaderUsesTime[pathToUse]) {
-                // Schedule monitor frame — we don't have direct access here
-                for (auto& m : g_pCompositor->m_monitors)
-                    if (m) g_pCompositor->scheduleFrameForMonitor(m);
+        const auto& ns = pLS->m_namespace;
+        auto nsIt = g_mLayerNamespaceShaderMap.find(ns);
+        if (nsIt != g_mLayerNamespaceShaderMap.end()) {
+            auto sit = g_mCompiledCShaders.find(nsIt->second);
+            if (sit != g_mCompiledCShaders.end() && sit->second.usesTime) {
+                // Schedule the layer's own monitor only, not every monitor.
+                if (auto mon = pLS->m_monitor.lock())
+                    g_pCompositor->scheduleFrameForMonitor(mon);
             }
         }
     }
 
     ((TGLDrawTex)g_pGLDrawTexHook->m_original)(thisptr, element, damage);
 
-    g_pCurrentRenderWindow = nullptr;
+    g_pCurrentRenderWindow.reset();
     g_pCurrentRenderLayer  = nullptr;
 }
 
@@ -62,71 +66,68 @@ typedef Hyprutils::Memory::CWeakPointer<CShader> (*TUseShader)(CHyprOpenGLImpl* 
 
 Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, Hyprutils::Memory::CWeakPointer<CShader> prog) {
 
-    std::string pathToUse     = "";
-    PHLWINDOW   contextWindow = nullptr;
+    const std::string* pathToUse     = nullptr;
+    PHLWINDOW          contextWindow = g_pCurrentRenderWindow.lock();
 
-    if (g_pCurrentRenderWindow) {
-        Desktop::View::CWindow* rawWin = g_pCurrentRenderWindow;
+    if (contextWindow) {
+        Desktop::View::CWindow* rawWin = contextWindow.get();
 
-        for (auto& w : g_pCompositor->m_windows)
-            if (w && w.get() == rawWin) { contextWindow = w; break; }
-
-        if (contextWindow) {
-            if (g_mWindowManualShaders.count(rawWin))
-                pathToUse = g_mWindowManualShaders[rawWin];
-            else if (rawWin->isFullscreen()) {
-                if (g_mWindowRuleShaders.count(rawWin) && !g_mWindowRuleShaders[rawWin].fullscreen.empty())
-                    pathToUse = g_mWindowRuleShaders[rawWin].fullscreen;
-            } else {
-                if (g_mWindowRuleShaders.count(rawWin)) {
-                    auto& state      = g_mWindowRuleShaders[rawWin];
-                    bool  isActive   = g_pCompositor->isWindowActive(contextWindow);
-                    bool  isFloating = rawWin->m_isFloating;
-                    if      (isFloating  && !state.floating.empty())  pathToUse = state.floating;
-                    else if (!isFloating && !state.tiled.empty())     pathToUse = state.tiled;
-                    else if (isActive    && !state.active.empty())    pathToUse = state.active;
-                    else if (!isActive   && !state.inactive.empty())  pathToUse = state.inactive;
-                    else if (!state.fallback.empty())                 pathToUse = state.fallback;
-                }
-                if (pathToUse.empty()) {
-                    std::string initClass    = rawWin->m_initialClass;
-                    std::string currentClass = rawWin->m_class;
-                    if      (g_mWindowClassShaderMap.count(initClass))    pathToUse = g_mWindowClassShaderMap[initClass];
-                    else if (g_mWindowClassShaderMap.count(currentClass)) pathToUse = g_mWindowClassShaderMap[currentClass];
-                }
+        auto manualIt = g_mWindowManualShaders.find(rawWin);
+        if (manualIt != g_mWindowManualShaders.end()) {
+            pathToUse = &manualIt->second;
+        } else if (rawWin->isFullscreen()) {
+            auto ruleIt = g_mWindowRuleShaders.find(rawWin);
+            if (ruleIt != g_mWindowRuleShaders.end() && !ruleIt->second.fullscreen.empty())
+                pathToUse = &ruleIt->second.fullscreen;
+        } else {
+            auto ruleIt = g_mWindowRuleShaders.find(rawWin);
+            if (ruleIt != g_mWindowRuleShaders.end()) {
+                const auto& state      = ruleIt->second;
+                const bool  isActive   = g_pCompositor->isWindowActive(contextWindow);
+                const bool  isFloating = rawWin->m_isFloating;
+                if      (isFloating  && !state.floating.empty())  pathToUse = &state.floating;
+                else if (!isFloating && !state.tiled.empty())     pathToUse = &state.tiled;
+                else if (isActive    && !state.active.empty())    pathToUse = &state.active;
+                else if (!isActive   && !state.inactive.empty())  pathToUse = &state.inactive;
+                else if (!state.fallback.empty())                 pathToUse = &state.fallback;
+            }
+            if (!pathToUse) {
+                const auto& initClass    = rawWin->m_initialClass;
+                const auto& currentClass = rawWin->m_class;
+                auto classIt = g_mWindowClassShaderMap.find(initClass);
+                if (classIt == g_mWindowClassShaderMap.end()) classIt = g_mWindowClassShaderMap.find(currentClass);
+                if (classIt != g_mWindowClassShaderMap.end()) pathToUse = &classIt->second;
             }
         }
     } else if (g_pCurrentRenderLayer) {
-        std::string ns = g_pCurrentRenderLayer->m_namespace;
-        if (g_mLayerNamespaceShaderMap.count(ns))
-            pathToUse = g_mLayerNamespaceShaderMap[ns];
+        const auto& ns = g_pCurrentRenderLayer->m_namespace;
+        auto nsIt = g_mLayerNamespaceShaderMap.find(ns);
+        if (nsIt != g_mLayerNamespaceShaderMap.end())
+            pathToUse = &nsIt->second;
     }
 
     // Swap shader if we have a custom one
-    if (!pathToUse.empty()) {
-        auto customShader = getOrCompileShader(pathToUse);
-        if (customShader && customShader->program() != 0)
-            prog = customShader;
+    CompiledShader* activeEntry = nullptr;
+    if (pathToUse && !pathToUse->empty()) {
+        activeEntry = getOrCompileShader(*pathToUse);
+        if (activeEntry && activeEntry->shader && activeEntry->shader->program() != 0)
+            prog = activeEntry->shader;
+        else
+            activeEntry = nullptr;
     }
 
     auto result = ((TUseShader)g_pUseShaderHook->m_original)(thisptr, prog);
 
-    // Inject uniforms
-    auto shnd = prog.lock();
-    if (shnd && shnd->program() != 0) {
-        GLint timeLoc = glGetUniformLocation(shnd->program(), "time");
-        if (timeLoc >= 0) {
+    // Inject uniforms using cached locations (no per-frame glGetUniformLocation).
+    if (activeEntry) {
+        if (activeEntry->timeLoc >= 0) {
             auto  now = std::chrono::steady_clock::now();
             float t   = std::chrono::duration_cast<std::chrono::duration<float>>(now.time_since_epoch()).count();
-            glUniform1f(timeLoc, t);
+            glUniform1f(activeEntry->timeLoc, t);
         }
-
-        GLint alphaLoc = glGetUniformLocation(shnd->program(), "plugin_alpha");
-        if (alphaLoc >= 0) {
-            float currentAlpha = 1.0f;
-            if (contextWindow)
-                currentAlpha = contextWindow->alphaTotal();
-            glUniform1f(alphaLoc, currentAlpha);
+        if (activeEntry->alphaLoc >= 0) {
+            const float currentAlpha = contextWindow ? contextWindow->alphaTotal() : 1.0f;
+            glUniform1f(activeEntry->alphaLoc, currentAlpha);
         }
     }
 

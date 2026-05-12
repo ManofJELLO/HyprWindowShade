@@ -54,10 +54,16 @@ struct WindowShaderState {
 };
 extern std::map<Desktop::View::CWindow*, WindowShaderState> g_mWindowRuleShaders;
 
-extern std::map<std::string, std::string>                                       g_mLayerNamespaceShaderMap;
-extern std::map<std::string, std::string>                                       g_mWindowClassShaderMap;
-extern std::map<std::string, Hyprutils::Memory::CSharedPointer<CShader>>        g_mCompiledCShaders;
-extern std::map<std::string, bool>                                              g_mShaderUsesTime;
+struct CompiledShader {
+    Hyprutils::Memory::CSharedPointer<CShader> shader;
+    GLint timeLoc      = -1;
+    GLint alphaLoc     = -1;
+    bool  usesTime     = false;
+};
+
+extern std::map<std::string, std::string>          g_mLayerNamespaceShaderMap;
+extern std::map<std::string, std::string>          g_mWindowClassShaderMap;
+extern std::map<std::string, CompiledShader>       g_mCompiledCShaders;
 
 // --- HOOK POINTERS ---
 // V0.55: hook the concrete renderer that draws texture pass elements
@@ -66,11 +72,13 @@ extern CFunctionHook* g_pUseShaderHook;
 
 // --- ACTIVE RENDER CONTEXT ---
 // Set by hkGLDrawTex before delegating; read by hkUseShader during the call.
-extern thread_local Desktop::View::CWindow*       g_pCurrentRenderWindow;
+// PHLWINDOWREF avoids the per-draw linear scan that was previously needed to
+// recover a shared pointer from a raw CWindow*.
+extern thread_local PHLWINDOWREF                  g_pCurrentRenderWindow;
 extern thread_local Desktop::View::CLayerSurface* g_pCurrentRenderLayer;
 
 // --- FUNCTION DECLARATIONS ---
-Hyprutils::Memory::CSharedPointer<CShader>  getOrCompileShader(const std::string& shaderPath);
+CompiledShader*                             getOrCompileShader(const std::string& shaderPath);
 void                                        hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement> element, const CRegion& damage);
 Hyprutils::Memory::CWeakPointer<CShader>    hkUseShader(CHyprOpenGLImpl* thisptr, Hyprutils::Memory::CWeakPointer<CShader> prog);
 void                                        applyShaderRulesSafe(PHLWINDOW pWindow);
