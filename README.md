@@ -1,6 +1,6 @@
 ## HyprWindowShade
 
-There is a plugin Hypr-DarkWindows that already allows shaders on windows and is listed in on the Hyprland website. That author seems to actively maintain it, which is not something I really intend to do here. I'll update it for my own use and maybe time to time, but as was famously said "Don't quote me boy. I ain't said shit"
+Plugin Dispatchers are borked under .lua config for hyprland 0.55; need to use .conf for the plugin to work currently
 
 This is a plugin designed to allow you to apply shaders to individual windows based on windowRules in the Hyprland.conf. The shaders are specifically made to be compatible with HyprShade from the AUR. This was my downfall with trying to use DarkWindows with some of the shaders that I had already written. If a shader works for HyprShade it should work here, but what do I know. You can also  use Time in the shader for glitch like effects.    
 
