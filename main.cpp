@@ -11,6 +11,10 @@ std::map<std::string, CompiledShader>                 g_mCompiledCShaders;
 CFunctionHook*                                        g_pGLDrawTexHook  = nullptr;
 CFunctionHook*                                        g_pUseShaderHook  = nullptr;
 
+// Tracks the most recently activated window so togglewindowshader doesn't have
+// to linear-scan g_pCompositor->m_windows asking isWindowActive on each.
+static PHLWINDOWREF g_lastActiveWindow;
+
 // --- HELPERS ---
 static inline void trimInPlace(std::string& s) {
     size_t start = s.find_first_not_of(" \t");
@@ -69,27 +73,26 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     }
 
     // --- LISTENERS ---
-    g_Listeners.push_back(Event::bus()->m_events.window.updateRules.listen([&](PHLWINDOW window) {
+    g_Listeners.push_back(Event::bus()->m_events.window.updateRules.listen([](PHLWINDOW window) {
         try { applyShaderRulesSafe(window); } catch (...) {}
     }));
 
-    static PHLWINDOWREF s_lastActive;
-    g_Listeners.push_back(Event::bus()->m_events.window.active.listen([&](auto window, auto reason) {
+    g_Listeners.push_back(Event::bus()->m_events.window.active.listen([](auto window, auto reason) {
         // Only the previously- and currently-active windows can change appearance.
-        if (auto prev = s_lastActive.lock(); prev && g_mWindowRuleShaders.find(prev.get()) != g_mWindowRuleShaders.end())
+        if (auto prev = g_lastActiveWindow.lock(); prev && g_mWindowRuleShaders.find(prev.get()) != g_mWindowRuleShaders.end())
             g_pHyprRenderer->damageWindow(prev);
         if (window && g_mWindowRuleShaders.find(window.get()) != g_mWindowRuleShaders.end())
             g_pHyprRenderer->damageWindow(window);
-        s_lastActive = window;
+        g_lastActiveWindow = window;
     }));
 
-    g_Listeners.push_back(Event::bus()->m_events.window.fullscreen.listen([&](auto window) {
+    g_Listeners.push_back(Event::bus()->m_events.window.fullscreen.listen([](auto window) {
         if (window) g_pHyprRenderer->damageWindow(window);
     }));
 
     // Drop entries keyed by raw CWindow* when the window is destroyed so they
     // can't accidentally match a future window at the same address.
-    g_Listeners.push_back(Event::bus()->m_events.window.destroy.listen([&](PHLWINDOW window) {
+    g_Listeners.push_back(Event::bus()->m_events.window.destroy.listen([](PHLWINDOW window) {
         if (!window) return;
         Desktop::View::CWindow* rawWin = window.get();
         g_mWindowManualShaders.erase(rawWin);
@@ -98,7 +101,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     // --- DISPATCHERS ---
 
-    HyprlandAPI::addDispatcherV2(PHANDLE, "layershader", [&](std::string args) -> SDispatchResult {
+    HyprlandAPI::addDispatcherV2(PHANDLE, "layershader", [](std::string args) -> SDispatchResult {
         std::string ns, path;
         if (!splitTwo(args, ns, path)) return SDispatchResult{};
         if (path == "clear" || path == "none") g_mLayerNamespaceShaderMap.erase(ns);
@@ -106,7 +109,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         return SDispatchResult{};
     });
 
-    HyprlandAPI::addDispatcherV2(PHANDLE, "togglelayershader", [&](std::string args) -> SDispatchResult {
+    HyprlandAPI::addDispatcherV2(PHANDLE, "togglelayershader", [](std::string args) -> SDispatchResult {
         std::string ns, path;
         if (!splitTwo(args, ns, path)) return SDispatchResult{};
         if (g_mLayerNamespaceShaderMap.find(ns) != g_mLayerNamespaceShaderMap.end())
@@ -116,13 +119,11 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         return SDispatchResult{};
     });
 
-    HyprlandAPI::addDispatcherV2(PHANDLE, "togglewindowshader", [&](std::string path) -> SDispatchResult {
+    HyprlandAPI::addDispatcherV2(PHANDLE, "togglewindowshader", [](std::string path) -> SDispatchResult {
         trimInPlace(path);
         if (path.empty()) return SDispatchResult{};
 
-        PHLWINDOW pWindow;
-        for (auto& w : g_pCompositor->m_windows)
-            if (g_pCompositor->isWindowActive(w)) { pWindow = w; break; }
+        PHLWINDOW pWindow = g_lastActiveWindow.lock();
         if (!pWindow) return SDispatchResult{};
 
         Desktop::View::CWindow* rawWin = pWindow.get();
@@ -134,7 +135,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         return SDispatchResult{};
     });
 
-    HyprlandAPI::addDispatcherV2(PHANDLE, "classshader", [&](std::string args) -> SDispatchResult {
+    HyprlandAPI::addDispatcherV2(PHANDLE, "classshader", [](std::string args) -> SDispatchResult {
         std::string cls, path;
         if (!splitTwo(args, cls, path)) return SDispatchResult{};
 
@@ -147,7 +148,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         return SDispatchResult{};
     });
 
-    HyprlandAPI::addDispatcherV2(PHANDLE, "toggleclassshader", [&](std::string args) -> SDispatchResult {
+    HyprlandAPI::addDispatcherV2(PHANDLE, "toggleclassshader", [](std::string args) -> SDispatchResult {
         std::string cls, path;
         if (!splitTwo(args, cls, path)) return SDispatchResult{};
 
@@ -160,7 +161,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         return SDispatchResult{};
     });
 
-    HyprlandAPI::addDispatcherV2(PHANDLE, "reloadshaders", [&](std::string args) -> SDispatchResult {
+    HyprlandAPI::addDispatcherV2(PHANDLE, "reloadshaders", [](std::string args) -> SDispatchResult {
         g_mCompiledCShaders.clear();
         for (auto& w : g_pCompositor->m_windows) if (w) g_pHyprRenderer->damageWindow(w);
         for (auto& m : g_pCompositor->m_monitors) if (m) g_pCompositor->scheduleFrameForMonitor(m);
