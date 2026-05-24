@@ -18,10 +18,10 @@ echo "[Build] Running make..."
 # v0.55: Use ONLY the hyprpm cache header tree to avoid duplicate-definition errors.
 # Do not mix /usr/include/hyprland/src with /var/cache/hyprpm — they will conflict.
 g++ -shared -fPIC -O3 -std=c++23 *.cpp -o HyprWindowShade.so \
-    -I/var/cache/hyprpm/manofjello/headersRoot/include \
-    -I/var/cache/hyprpm/manofjello/headersRoot/include/hyprland \
-    -I/var/cache/hyprpm/manofjello/headersRoot/include/hyprland/src \
-    -I/var/cache/hyprpm/manofjello/headersRoot/include/hyprland/protocols \
+    -I/var/cache/hyprpm/$USER/headersRoot/include \
+    -I/var/cache/hyprpm/$USER/headersRoot/include/hyprland \
+    -I/var/cache/hyprpm/$USER/headersRoot/include/hyprland/src \
+    -I/var/cache/hyprpm/$USER/headersRoot/include/hyprland/protocols \
     -I/usr/include/cairo \
     -I/usr/include/freetype2 \
     -I/usr/include/libpng16 \
