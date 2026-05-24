@@ -1,5 +1,9 @@
 #include "Globals.hpp"
 
+// Hyprland (v0.55) links liblua.so.5.5 and /usr/include/lua.h is 5.5; symbols
+// resolve from the host process at dlopen, so we don't link -llua ourselves.
+#include <lua.hpp>
+
 // --- DEFINE EXTERN VARIABLES ---
 HANDLE                                                PHANDLE = nullptr;
 std::vector<CHyprSignalListener>                      g_Listeners;
@@ -31,6 +35,97 @@ static bool splitTwo(const std::string& args, std::string& key, std::string& val
     value = args.substr(spacePos + 1);
     trimInPlace(value);
     return true;
+}
+
+// --- SHARED DISPATCH/LUA ACTIONS ---
+// Each function below is the canonical body of one shader action. Both the
+// .conf-style dispatcher lambdas (which still parse one string via splitTwo)
+// and the Lua C wrappers (which read separate args from the Lua stack) call
+// these — keeping behavior identical across both call sites.
+namespace shadeActions {
+    static void setLayerShader(const std::string& ns, const std::string& path) {
+        if (path == "clear" || path == "none") g_mLayerNamespaceShaderMap.erase(ns);
+        else                                   g_mLayerNamespaceShaderMap[ns] = path;
+    }
+
+    static void toggleLayerShader(const std::string& ns, const std::string& path) {
+        if (g_mLayerNamespaceShaderMap.find(ns) != g_mLayerNamespaceShaderMap.end())
+            g_mLayerNamespaceShaderMap.erase(ns);
+        else
+            g_mLayerNamespaceShaderMap[ns] = path;
+    }
+
+    static void toggleWindowShader(const std::string& path) {
+        if (path.empty()) return;
+
+        PHLWINDOW pWindow = g_lastActiveWindow.lock();
+        if (!pWindow) return;
+
+        Desktop::View::CWindow* rawWin = pWindow.get();
+        if (path == "clear" || path == "none" || g_mWindowManualShaders.find(rawWin) != g_mWindowManualShaders.end())
+            g_mWindowManualShaders.erase(rawWin);
+        else
+            g_mWindowManualShaders[rawWin] = path;
+        g_pHyprRenderer->damageWindow(pWindow);
+    }
+
+    static void setClassShader(const std::string& cls, const std::string& path) {
+        if (path == "clear" || path == "none") g_mWindowClassShaderMap.erase(cls);
+        else                                   g_mWindowClassShaderMap[cls] = path;
+
+        for (auto& w : g_pCompositor->m_windows)
+            if (w && (w->m_initialClass == cls || w->m_class == cls))
+                g_pHyprRenderer->damageWindow(w);
+    }
+
+    static void toggleClassShader(const std::string& cls, const std::string& path) {
+        if (g_mWindowClassShaderMap.find(cls) != g_mWindowClassShaderMap.end())
+            g_mWindowClassShaderMap.erase(cls);
+        else
+            g_mWindowClassShaderMap[cls] = path;
+
+        for (auto& w : g_pCompositor->m_windows)
+            if (w && (w->m_initialClass == cls || w->m_class == cls))
+                g_pHyprRenderer->damageWindow(w);
+    }
+
+    static void reloadShaders() {
+        g_mCompiledCShaders.clear();
+        for (auto& w : g_pCompositor->m_windows) if (w) g_pHyprRenderer->damageWindow(w);
+        for (auto& m : g_pCompositor->m_monitors) if (m) g_pCompositor->scheduleFrameForMonitor(m);
+        HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] Shaders Reloaded from Disk!", CHyprColor(0.2f, 1.0f, 0.2f, 1.0f), 3000.0f);
+    }
+}
+
+// --- LUA C WRAPPERS ---
+// Registered via HyprlandAPI::addLuaFunction so users on Lua-based Hyprland
+// configs can bind keys like: function() hl.plugin.HyprWindowShade.<name>(...) end
+// (Native Hyprland dispatchers from plugins aren't surfaced to the Lua config
+// layer, per vaxry — Lua functions are the supported workaround.)
+static int luaLayerShader(lua_State* L) {
+    shadeActions::setLayerShader(luaL_checkstring(L, 1), luaL_checkstring(L, 2));
+    return 0;
+}
+static int luaToggleLayerShader(lua_State* L) {
+    shadeActions::toggleLayerShader(luaL_checkstring(L, 1), luaL_checkstring(L, 2));
+    return 0;
+}
+static int luaToggleWindowShader(lua_State* L) {
+    shadeActions::toggleWindowShader(luaL_checkstring(L, 1));
+    return 0;
+}
+static int luaClassShader(lua_State* L) {
+    shadeActions::setClassShader(luaL_checkstring(L, 1), luaL_checkstring(L, 2));
+    return 0;
+}
+static int luaToggleClassShader(lua_State* L) {
+    shadeActions::toggleClassShader(luaL_checkstring(L, 1), luaL_checkstring(L, 2));
+    return 0;
+}
+static int luaReloadShaders(lua_State* L) {
+    (void)L;
+    shadeActions::reloadShaders();
+    return 0;
 }
 
 APICALL EXPORT std::string PLUGIN_API_VERSION() { return HYPRLAND_API_VERSION; }
@@ -99,77 +194,58 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         g_mWindowRuleShaders.erase(rawWin);
     }));
 
-    // --- DISPATCHERS ---
+    // --- DISPATCHERS (.conf-style — Hyprland's native bind path) ---
 
     HyprlandAPI::addDispatcherV2(PHANDLE, "layershader", [](std::string args) -> SDispatchResult {
         std::string ns, path;
         if (!splitTwo(args, ns, path)) return SDispatchResult{};
-        if (path == "clear" || path == "none") g_mLayerNamespaceShaderMap.erase(ns);
-        else g_mLayerNamespaceShaderMap[ns] = path;
+        shadeActions::setLayerShader(ns, path);
         return SDispatchResult{};
     });
 
     HyprlandAPI::addDispatcherV2(PHANDLE, "togglelayershader", [](std::string args) -> SDispatchResult {
         std::string ns, path;
         if (!splitTwo(args, ns, path)) return SDispatchResult{};
-        if (g_mLayerNamespaceShaderMap.find(ns) != g_mLayerNamespaceShaderMap.end())
-            g_mLayerNamespaceShaderMap.erase(ns);
-        else
-            g_mLayerNamespaceShaderMap[ns] = path;
+        shadeActions::toggleLayerShader(ns, path);
         return SDispatchResult{};
     });
 
     HyprlandAPI::addDispatcherV2(PHANDLE, "togglewindowshader", [](std::string path) -> SDispatchResult {
         trimInPlace(path);
-        if (path.empty()) return SDispatchResult{};
-
-        PHLWINDOW pWindow = g_lastActiveWindow.lock();
-        if (!pWindow) return SDispatchResult{};
-
-        Desktop::View::CWindow* rawWin = pWindow.get();
-        if (path == "clear" || path == "none" || g_mWindowManualShaders.find(rawWin) != g_mWindowManualShaders.end())
-            g_mWindowManualShaders.erase(rawWin);
-        else
-            g_mWindowManualShaders[rawWin] = path;
-        g_pHyprRenderer->damageWindow(pWindow);
+        shadeActions::toggleWindowShader(path);
         return SDispatchResult{};
     });
 
     HyprlandAPI::addDispatcherV2(PHANDLE, "classshader", [](std::string args) -> SDispatchResult {
         std::string cls, path;
         if (!splitTwo(args, cls, path)) return SDispatchResult{};
-
-        if (path == "clear" || path == "none") g_mWindowClassShaderMap.erase(cls);
-        else g_mWindowClassShaderMap[cls] = path;
-
-        for (auto& w : g_pCompositor->m_windows)
-            if (w && (w->m_initialClass == cls || w->m_class == cls))
-                g_pHyprRenderer->damageWindow(w);
+        shadeActions::setClassShader(cls, path);
         return SDispatchResult{};
     });
 
     HyprlandAPI::addDispatcherV2(PHANDLE, "toggleclassshader", [](std::string args) -> SDispatchResult {
         std::string cls, path;
         if (!splitTwo(args, cls, path)) return SDispatchResult{};
-
-        if (g_mWindowClassShaderMap.find(cls) != g_mWindowClassShaderMap.end()) g_mWindowClassShaderMap.erase(cls);
-        else g_mWindowClassShaderMap[cls] = path;
-
-        for (auto& w : g_pCompositor->m_windows)
-            if (w && (w->m_initialClass == cls || w->m_class == cls))
-                g_pHyprRenderer->damageWindow(w);
+        shadeActions::toggleClassShader(cls, path);
         return SDispatchResult{};
     });
 
-    HyprlandAPI::addDispatcherV2(PHANDLE, "reloadshaders", [](std::string args) -> SDispatchResult {
-        g_mCompiledCShaders.clear();
-        for (auto& w : g_pCompositor->m_windows) if (w) g_pHyprRenderer->damageWindow(w);
-        for (auto& m : g_pCompositor->m_monitors) if (m) g_pCompositor->scheduleFrameForMonitor(m);
-        HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] Shaders Reloaded from Disk!", CHyprColor(0.2f, 1.0f, 0.2f, 1.0f), 3000.0f);
+    HyprlandAPI::addDispatcherV2(PHANDLE, "reloadshaders", [](std::string) -> SDispatchResult {
+        shadeActions::reloadShaders();
         return SDispatchResult{};
     });
 
-    return {"HyprWindowShade", "Native CShader Injection (v0.55)", "ManofJELLO", "1.3"};
+    // --- LUA FUNCTIONS (hl.plugin.HyprWindowShade.* — for Lua-based configs) ---
+    // Removed automatically on plugin unload (per PluginAPI.hpp), but PLUGIN_EXIT
+    // calls removeLuaFunction defensively to keep teardown symmetric.
+    HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "layershader",        &luaLayerShader);
+    HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "togglelayershader",  &luaToggleLayerShader);
+    HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "togglewindowshader", &luaToggleWindowShader);
+    HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "classshader",        &luaClassShader);
+    HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "toggleclassshader",  &luaToggleClassShader);
+    HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "reloadshaders",      &luaReloadShaders);
+
+    return {"HyprWindowShade", "Native CShader Injection (v0.55)", "ManofJELLO", "1.4"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
@@ -195,4 +271,11 @@ APICALL EXPORT void PLUGIN_EXIT() {
     HyprlandAPI::removeDispatcher(PHANDLE, "classshader");
     HyprlandAPI::removeDispatcher(PHANDLE, "toggleclassshader");
     HyprlandAPI::removeDispatcher(PHANDLE, "reloadshaders");
+
+    HyprlandAPI::removeLuaFunction(PHANDLE, "HyprWindowShade", "layershader");
+    HyprlandAPI::removeLuaFunction(PHANDLE, "HyprWindowShade", "togglelayershader");
+    HyprlandAPI::removeLuaFunction(PHANDLE, "HyprWindowShade", "togglewindowshader");
+    HyprlandAPI::removeLuaFunction(PHANDLE, "HyprWindowShade", "classshader");
+    HyprlandAPI::removeLuaFunction(PHANDLE, "HyprWindowShade", "toggleclassshader");
+    HyprlandAPI::removeLuaFunction(PHANDLE, "HyprWindowShade", "reloadshaders");
 }

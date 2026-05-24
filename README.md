@@ -4,7 +4,7 @@ A Hyprland plugin that applies fragment shaders to individual windows (or layers
 
 You can also use a `time` uniform for glitch-style animated effects.
 
-> **Heads up:** Plugin dispatchers are broken under the `.lua` config on Hyprland 0.55. You must use a `.conf` config for this plugin to work.
+> **`.lua` config users:** Plugin dispatchers aren't surfaced to the Lua config layer on Hyprland 0.55, so the plugin also exposes every action as a Lua function under `hl.plugin.HyprWindowShade.*`. See [Lua config](#lua-config) below for usage.
 
 > This has not been stress-tested. It may break when Hyprland updates or simply not work on your system. Only tested on AMD graphics on Arch. Good luck, have fun, don't say I didn't warn ya.
 
@@ -13,7 +13,7 @@ You can also use a `time` uniform for glitch-style animated effects.
 ## Requirements
 
 - **Hyprland 0.55** (the plugin is built against this version's internal API).
-- A `.conf` config — plugin dispatchers do not fire under `.lua` configs on 0.55.
+- Either a `.conf` config (use dispatchers) or a `.lua` config (use the `hl.plugin.HyprWindowShade.*` functions — see [Lua config](#lua-config)).
 - **GLSL ES 3.20** fragment shaders. The plugin uses Hyprland's `TEXVERTSRC320` vertex shader, so your fragment shader should start with `#version 320 es` and declare `in vec2 v_texcoord;`, `out vec4 fragColor;`, and `uniform sampler2D tex;` (same interface HyprShade uses).
 - Tested on AMD graphics, Arch Linux. Other setups may work but are unverified.
 
@@ -112,6 +112,52 @@ All dispatchers are registered via `HyprlandAPI::addDispatcherV2` and can also b
 
 ---
 
+## Lua config
+
+Hyprland 0.55 doesn't surface plugin dispatchers to `.lua` configs, so the plugin also registers each action as a Lua function under `hl.plugin.HyprWindowShade.*`. Bind them by wrapping the call in a `function() ... end` (per vaxry's guidance for plugin actions on the Lua config path).
+
+### Functions
+
+Each one matches the dispatcher of the same name, but takes proper Lua arguments instead of a single space-separated string:
+
+| Function | Arguments | Effect |
+|---|---|---|
+| `hl.plugin.HyprWindowShade.classshader(class, path)` | strings; `path` can be `"clear"`/`"none"` | Force a shader on every window matching `class`. |
+| `hl.plugin.HyprWindowShade.toggleclassshader(class, path)` | strings | Toggle the class shader on/off. |
+| `hl.plugin.HyprWindowShade.togglewindowshader(path)` | string; or `"clear"`/`"none"` | Toggle a shader on the currently focused window. |
+| `hl.plugin.HyprWindowShade.layershader(ns, path)` | strings; `path` can be `"clear"`/`"none"` | Force a shader on a layer namespace. |
+| `hl.plugin.HyprWindowShade.togglelayershader(ns, path)` | strings | Toggle a layer shader on/off. |
+| `hl.plugin.HyprWindowShade.reloadshaders()` | — | Drop the compiled shader cache and re-read every `.glsl` from disk. |
+
+### Calling from your binds
+
+Plugin actions can't be referenced by name in a Lua bind — wrap them in a closure, which is the pattern vaxry recommends for any plugin function on the Lua config path:
+
+```lua
+-- Toggle a shader on the focused window
+function() hl.plugin.HyprWindowShade.togglewindowshader("/home/USERNAME/.config/hypr/shaders/pixelate.glsl") end
+
+-- Toggle a shader on every window of a class
+function() hl.plugin.HyprWindowShade.toggleclassshader("google-chrome", "/home/USERNAME/.config/hypr/shaders/reading_mode.glsl") end
+
+-- Reload all shader sources after editing a .glsl
+function() hl.plugin.HyprWindowShade.reloadshaders() end
+```
+
+Drop those closures into whatever bind helper your Lua config uses — the closure body is the only plugin-specific piece. You can also call the functions directly at config-load time (no closure), e.g. to apply a startup layer shader:
+
+```lua
+hl.plugin.HyprWindowShade.layershader("mpvpaper", "/home/USERNAME/.config/hypr/shaders/pixelate.glsl")
+```
+
+### Tips and notes
+
+- Functions appear under `hl.plugin.HyprWindowShade.*` only after the plugin is loaded. If `hyprctl plugin load ...` runs in your config, make sure it happens before any code that calls these functions.
+- The functions take the same `"clear"` / `"none"` sentinels that the dispatchers do for removing a shader.
+- `.conf`-style dispatchers are still registered too — you can mix them with the Lua functions if you have both kinds of configs, though there's no reason to in a Lua-only setup.
+
+---
+
 ## Writing a shader
 
 The plugin auto-wraps your shader: it renames your `void main()` to `void user_main()` and appends a `main()` that calls it and multiplies `fragColor` by `plugin_alpha`. You only need to write a normal HyprShade-style fragment shader.
@@ -170,7 +216,8 @@ To add a new uniform: register its location in `ShaderEngine.cpp` (the `glGetUni
 - **Shader compile errors.** A failed compile shows a red Hyprland notification for 15 seconds with the first ~200 characters of the GLSL error log. Failed compiles are not cached — fix the file and the next frame will retry automatically, no `reloadshaders` needed.
 - **Edits to a `.glsl` file aren't taking effect.** Successful compiles *are* cached. Run `hyprctl dispatch reloadshaders` (or your bound keybind) to drop the cache.
 - **Plugin doesn't seem to be loaded.** Run `hyprctl plugins list` to confirm `HyprWindowShade` is present. If it isn't, check the path in your `exec-once` line and rebuild with `./build.sh`.
-- **Dispatchers do nothing.** You're probably on a `.lua` config — switch to `.conf` (see Requirements).
+- **Dispatchers do nothing on a `.lua` config.** Hyprland 0.55 doesn't surface plugin dispatchers to Lua configs — use the `hl.plugin.HyprWindowShade.*` functions instead (see [Lua config](#lua-config)).
+- **`attempt to index a nil value (field 'HyprWindowShade')`** in Lua. The plugin isn't loaded yet when the config evaluates this line. Make sure the plugin's `hyprctl plugin load ...` runs first, or wrap your binds in a deferred call.
 - **Shader doesn't show on a fullscreen window.** The default is to disable shaders on fullscreen. Use the `+shader_fullscreen:` tag or add it alongside your existing tag.
 - **Floating rule and active rule both set.** The floating rule wins while the window is floating.
 
