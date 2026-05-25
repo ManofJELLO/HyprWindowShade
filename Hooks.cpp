@@ -4,7 +4,8 @@
 // --- THREAD-LOCAL RENDER CONTEXT ---
 thread_local PHLWINDOWREF        g_pCurrentRenderWindow;
 thread_local PHLLSREF            g_pCurrentRenderLayer;
-thread_local const std::string*  g_pCurrentShaderPath = nullptr;
+thread_local const std::string*  g_pCurrentShaderPath     = nullptr;
+thread_local CompiledShader*     g_pCurrentCompiledShader = nullptr;
 
 // Plugin-relative reference time so the `time` uniform stays in float-precision
 // range. steady_clock::now() seconds-since-epoch is in the billions and loses
@@ -74,21 +75,22 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
     g_pCurrentRenderWindow = pWindow;
     g_pCurrentRenderLayer  = pLS;
 
-    // Resolve the path once and stash it for hkUseShader.
+    // Resolve the path once and stash it. Then do a single lookup-or-compile
+    // on g_mCompiledCShaders and stash the resulting pointer for hkUseShader
+    // to consume — saves the second find that used to happen down there.
     const std::string* pathToUse = resolveShaderPath(pWindow, pLS);
-    g_pCurrentShaderPath = pathToUse;
+    g_pCurrentShaderPath         = pathToUse;
+    g_pCurrentCompiledShader     = pathToUse && !pathToUse->empty()
+                                       ? getOrCompileShader(*pathToUse)
+                                       : nullptr;
 
-    // Schedule continuous redraw if the resolved shader uses `time`. usesTime
-    // is set only after a successful compile, so the entry must already exist.
-    if (pathToUse) {
-        auto sit = g_mCompiledCShaders.find(*pathToUse);
-        if (sit != g_mCompiledCShaders.end() && sit->second.usesTime) {
-            if (pWindow)
-                g_pHyprRenderer->damageWindow(pWindow);
-            else if (pLS) {
-                if (auto mon = pLS->m_monitor.lock())
-                    g_pCompositor->scheduleFrameForMonitor(mon);
-            }
+    // Schedule continuous redraw if the resolved shader uses `time`.
+    if (g_pCurrentCompiledShader && g_pCurrentCompiledShader->usesTime) {
+        if (pWindow)
+            g_pHyprRenderer->damageWindow(pWindow);
+        else if (pLS) {
+            if (auto mon = pLS->m_monitor.lock())
+                g_pCompositor->scheduleFrameForMonitor(mon);
         }
     }
 
@@ -96,28 +98,28 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
 
     g_pCurrentRenderWindow.reset();
     g_pCurrentRenderLayer.reset();
-    g_pCurrentShaderPath = nullptr;
+    g_pCurrentShaderPath     = nullptr;
+    g_pCurrentCompiledShader = nullptr;
 }
 
 // --- V0.55 HOOK: useShader ---
 typedef Hyprutils::Memory::CWeakPointer<CShader> (*TUseShader)(CHyprOpenGLImpl* thisptr, Hyprutils::Memory::CWeakPointer<CShader> prog);
 
 Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, Hyprutils::Memory::CWeakPointer<CShader> prog) {
-    PHLWINDOW contextWindow = g_pCurrentRenderWindow.lock();
-
-    CompiledShader* activeEntry = nullptr;
-    if (g_pCurrentShaderPath && !g_pCurrentShaderPath->empty()) {
-        activeEntry = getOrCompileShader(*g_pCurrentShaderPath);
-        if (activeEntry && activeEntry->shader)
-            prog = activeEntry->shader;
-        else
-            activeEntry = nullptr;
-    }
+    // The compiled-shader pointer was already resolved in hkGLDrawTex; just
+    // pick it up here. If null there's no shader to apply for this surface —
+    // skip the weak_ptr lock entirely (common case for most surfaces).
+    CompiledShader* activeEntry = g_pCurrentCompiledShader;
+    if (activeEntry && activeEntry->shader)
+        prog = activeEntry->shader;
+    else
+        activeEntry = nullptr;
 
     auto result = ((TUseShader)g_pUseShaderHook->m_original)(thisptr, prog);
 
     // Inject uniforms using cached locations (no per-frame glGetUniformLocation).
     if (activeEntry) {
+        PHLWINDOW contextWindow = g_pCurrentRenderWindow.lock();
         if (activeEntry->timeLoc >= 0) {
             const float t = std::chrono::duration_cast<std::chrono::duration<float>>(
                                 std::chrono::steady_clock::now() - g_pluginStartTime)

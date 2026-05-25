@@ -7,11 +7,12 @@
 // --- DEFINE EXTERN VARIABLES ---
 HANDLE                                                PHANDLE = nullptr;
 std::vector<CHyprSignalListener>                      g_Listeners;
-std::map<Desktop::View::CWindow*, std::string>        g_mWindowManualShaders;
-std::map<Desktop::View::CWindow*, WindowShaderState>  g_mWindowRuleShaders;
+std::unordered_map<Desktop::View::CWindow*, std::string>        g_mWindowManualShaders;
+std::unordered_map<Desktop::View::CWindow*, WindowShaderState>  g_mWindowRuleShaders;
 std::map<std::string, std::string>                    g_mLayerNamespaceShaderMap;
 std::map<std::string, std::string>                    g_mWindowClassShaderMap;
 std::map<std::string, CompiledShader>                 g_mCompiledCShaders;
+std::map<std::string, time_t>                         g_mFailedShaderMtimes;
 CFunctionHook*                                        g_pGLDrawTexHook  = nullptr;
 CFunctionHook*                                        g_pUseShaderHook  = nullptr;
 
@@ -28,13 +29,32 @@ static inline void trimInPlace(std::string& s) {
 }
 
 // Splits "<key> <value...>" into trimmed (key, value). Returns false if no separator.
+// Recognizes a leading double-quoted key so class names or layer namespaces that
+// contain whitespace work via the .conf dispatchers, matching the per-arg shape
+// Lua callers already get. Escapes inside the quoted string are not supported —
+// keep it to plain whitespace handling, which is all the realistic case needs.
 static bool splitTwo(const std::string& args, std::string& key, std::string& value) {
-    size_t spacePos = args.find_first_of(" \t");
-    if (spacePos == std::string::npos) return false;
-    key   = args.substr(0, spacePos);
-    value = args.substr(spacePos + 1);
+    size_t pos = 0;
+    while (pos < args.size() && (args[pos] == ' ' || args[pos] == '\t')) pos++;
+    if (pos >= args.size()) return false;
+
+    size_t keyEnd;
+    if (args[pos] == '"') {
+        const size_t closing = args.find('"', pos + 1);
+        if (closing == std::string::npos) return false;
+        key    = args.substr(pos + 1, closing - pos - 1);
+        keyEnd = closing + 1;
+    } else {
+        const size_t ws = args.find_first_of(" \t", pos);
+        if (ws == std::string::npos) return false;
+        key    = args.substr(pos, ws - pos);
+        keyEnd = ws;
+    }
+
+    if (keyEnd >= args.size()) return false;
+    value = args.substr(keyEnd);
     trimInPlace(value);
-    return true;
+    return !value.empty();
 }
 
 // --- SHARED DISPATCH/LUA ACTIONS ---
@@ -91,6 +111,7 @@ namespace shadeActions {
 
     static void reloadShaders() {
         g_mCompiledCShaders.clear();
+        g_mFailedShaderMtimes.clear();
         for (auto& w : g_pCompositor->m_windows) if (w) g_pHyprRenderer->damageWindow(w);
         for (auto& m : g_pCompositor->m_monitors) if (m) g_pCompositor->scheduleFrameForMonitor(m);
         HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] Shaders Reloaded from Disk!", CHyprColor(0.2f, 1.0f, 0.2f, 1.0f), 3000.0f);
@@ -255,6 +276,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
     g_mWindowRuleShaders.clear();
     g_mLayerNamespaceShaderMap.clear();
     g_mWindowClassShaderMap.clear();
+    g_mFailedShaderMtimes.clear();
 
     // Intentionally leak compiled shaders: their CShader destructors call into
     // GL state owned by Hyprland, which may already be torn down at this point.

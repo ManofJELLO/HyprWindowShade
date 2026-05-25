@@ -108,7 +108,9 @@ All dispatchers are registered via `HyprlandAPI::addDispatcherV2` and can also b
 | `togglewindowshader` | `<path>` | Toggle a shader on the currently focused window only. Pass `clear`/`none` to remove. |
 | `layershader` | `<layer-namespace> <path\|clear\|none>` | Force a shader on a layer namespace (e.g. `rofi`, `mpvpaper`). |
 | `togglelayershader` | `<layer-namespace> <path>` | Toggle a layer shader on/off. |
-| `reloadshaders` | — | Drop the compiled shader cache and re-read every `.glsl` from disk. Shows a green toast on success. |
+| `reloadshaders` | — | Drop the compiled shader cache and re-read every `.glsl` from disk. Shows a green toast on success. Usually not needed — see the troubleshooting note about auto-reload. |
+
+> **Args with whitespace.** The first argument supports double-quoting, so a class name with a space works: `hyprctl dispatch classshader "Some Class" /path/to.glsl`. (Lua callers don't need this — each argument is its own string.)
 
 ---
 
@@ -213,8 +215,8 @@ To add a new uniform: register its location in `ShaderEngine.cpp` (the `glGetUni
 
 ## Troubleshooting
 
-- **Shader compile errors.** A failed compile shows a red Hyprland notification for 15 seconds with the first ~200 characters of the GLSL error log. Failed compiles are not cached — fix the file and the next frame will retry automatically, no `reloadshaders` needed.
-- **Edits to a `.glsl` file aren't taking effect.** Successful compiles *are* cached. Run `hyprctl dispatch reloadshaders` (or your bound keybind) to drop the cache.
+- **Shader compile errors.** A failed compile shows a red Hyprland notification for 15 seconds with the first ~200 characters of the GLSL error log. The plugin remembers the failure's mtime and won't re-toast every frame — it just sits silent until the file changes on disk, then automatically retries the compile.
+- **Edits to a `.glsl` file aren't taking effect.** Edits are picked up automatically on the next draw — the cache is keyed by file mtime, so saving the file is enough. `hyprctl dispatch reloadshaders` is still available as a force-reload, but you shouldn't need it for ordinary edits.
 - **Plugin doesn't seem to be loaded.** Run `hyprctl plugins list` to confirm `HyprWindowShade` is present. If it isn't, check the path in your `exec-once` line and rebuild with `./build.sh`.
 - **Dispatchers do nothing on a `.lua` config.** Hyprland 0.55 doesn't surface plugin dispatchers to Lua configs — use the `hl.plugin.HyprWindowShade.*` functions instead (see [Lua config](#lua-config)).
 - **`attempt to index a nil value (field 'HyprWindowShade')`** in Lua. The plugin isn't loaded yet when the config evaluates this line. Make sure the plugin's `hyprctl plugin load ...` runs first, or wrap your binds in a deferred call.
