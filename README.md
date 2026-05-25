@@ -54,20 +54,20 @@ Apply a shader to a window via a `tag` on a `windowrule`. Six tags are supported
 ### Example
 
 ```
-windowrule = match:class kitty, tag +shader:/home/manofjello/.config/hypr/shaders/reading_mode.glsl
+windowrule = match:class kitty, tag +shader:/home/USERNAME/.config/hypr/shaders/reading_mode.glsl
 ```
 
 ### Keybind examples
 
 ```
 # Toggle a shader on every window matching a class
-bind = $mainMod, K, toggleclassshader, google-chrome /home/manofjello/.config/hypr/shaders/reading_mode.glsl
+bind = $mainMod, K, toggleclassshader, google-chrome /home/USERNAME/.config/hypr/shaders/reading_mode.glsl
 
 # Toggle a shader on the currently focused window
-bind = $mainMod, W, togglewindowshader, /home/manofjello/.config/hypr/shaders/pixelate.glsl
+bind = $mainMod, W, togglewindowshader, /home/USERNAME/.config/hypr/shaders/pixelate.glsl
 
 # Always apply a shader to a class at startup
-exec-once = hyprctl dispatch classshader kitty /home/manofjello/.config/hypr/shaders/pixelate.glsl
+exec-once = hyprctl dispatch classshader kitty /home/USERNAME/.config/hypr/shaders/pixelate.glsl
 
 # Reload all shader source files (after editing a .glsl)
 bind = $mainMod, R, reloadshaders
@@ -83,13 +83,13 @@ Layers have a limited rule set, so layer shaders are controlled via dispatchers 
 
 ```
 # Apply at startup
-exec-once = hyprctl dispatch layershader mpvpaper /home/manofjello/.config/hypr/shaders/pixelate.glsl
+exec-once = hyprctl dispatch layershader mpvpaper /home/USERNAME/.config/hypr/shaders/pixelate.glsl
 
 # Toggle keybind
-bind = $mainMod, B, togglelayershader, mpvpaper /home/manofjello/.config/hypr/shaders/pixelate.glsl
+bind = $mainMod, B, togglelayershader, mpvpaper /home/USERNAME/.config/hypr/shaders/pixelate.glsl
 
 # Force ON
-bind = $mainMod, B, layershader, mpvpaper /home/manofjello/.config/hypr/shaders/pixelate.glsl
+bind = $mainMod, B, layershader, mpvpaper /home/USERNAME/.config/hypr/shaders/pixelate.glsl
 
 # Force OFF (clear)
 bind = $mainMod SHIFT, B, layershader, mpvpaper clear
