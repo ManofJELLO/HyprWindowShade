@@ -7,8 +7,35 @@ NC='\033[0m'
 
 PLUGIN_DIR="$HOME/.local/share/hyprland/plugins"
 PLUGIN_PATH="$PLUGIN_DIR/HyprWindowShade.so"
+HEADERS="/var/cache/hyprpm/$USER/headersRoot"
 
 echo -e "${GREEN}Starting build for HyprWindowShade...${NC}"
+
+# HYPRLAND_API_VERSION is the literal "0.1", so Hyprland will happily load a
+# plugin built against the wrong commit and then die on the ABI mismatch.
+# Check the header commit against the running compositor before touching anything.
+echo "[Check] Verifying hyprpm headers..."
+if [ ! -d "$HEADERS/include/hyprland/src" ]; then
+    echo -e "${RED}[Error] hyprpm headers not found at $HEADERS${NC}"
+    echo "        Run: hyprpm update"
+    exit 1
+fi
+
+HDR_COMMIT=$(grep -oP '(?<=GIT_COMMIT_HASH    ")[0-9a-f]+' "$HEADERS/include/hyprland/src/version.h")
+RUN_COMMIT=$(hyprctl version -j | grep -oP '(?<="commit": ")[0-9a-f]+')
+
+if [ -z "$HDR_COMMIT" ] || [ -z "$RUN_COMMIT" ]; then
+    echo -e "${RED}[Error] Could not determine header or compositor commit.${NC}"
+    exit 1
+fi
+
+if [ "$HDR_COMMIT" != "$RUN_COMMIT" ]; then
+    echo -e "${RED}[Error] Header/compositor commit mismatch${NC}"
+    echo "        headers:    $HDR_COMMIT"
+    echo "        compositor: $RUN_COMMIT"
+    echo "        Run: hyprpm update"
+    exit 1
+fi
 
 echo "[Plugin] Unloading previous version from memory..."
 hyprctl plugin unload "$PLUGIN_PATH"
