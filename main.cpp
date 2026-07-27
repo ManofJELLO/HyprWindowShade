@@ -1,6 +1,6 @@
 #include "Globals.hpp"
 
-// Hyprland (v0.55) links liblua.so.5.5 and /usr/include/lua.h is 5.5; symbols
+// Hyprland (v0.56) links liblua.so.5.5 and /usr/include/lua.h is 5.5; symbols
 // resolve from the host process at dlopen, so we don't link -llua ourselves.
 #include <lua.hpp>
 
@@ -17,7 +17,7 @@ CFunctionHook*                                        g_pGLDrawTexHook  = nullpt
 CFunctionHook*                                        g_pUseShaderHook  = nullptr;
 
 // Tracks the most recently activated window so togglewindowshader doesn't have
-// to linear-scan g_pCompositor->m_windows asking isWindowActive on each.
+// to linear-scan Desktop::windowState()->windows() asking isWindowActive on each.
 static PHLWINDOWREF g_lastActiveWindow;
 
 // --- HELPERS ---
@@ -93,7 +93,7 @@ namespace shadeActions {
         if (path == "clear" || path == "none") g_mWindowClassShaderMap.erase(cls);
         else                                   g_mWindowClassShaderMap[cls] = path;
 
-        for (auto& w : g_pCompositor->m_windows)
+        for (auto& w : Desktop::windowState()->windows())
             if (w && (w->m_initialClass == cls || w->m_class == cls))
                 g_pHyprRenderer->damageWindow(w);
     }
@@ -104,7 +104,7 @@ namespace shadeActions {
         else
             g_mWindowClassShaderMap[cls] = path;
 
-        for (auto& w : g_pCompositor->m_windows)
+        for (auto& w : Desktop::windowState()->windows())
             if (w && (w->m_initialClass == cls || w->m_class == cls))
                 g_pHyprRenderer->damageWindow(w);
     }
@@ -112,8 +112,8 @@ namespace shadeActions {
     static void reloadShaders() {
         g_mCompiledCShaders.clear();
         g_mFailedShaderMtimes.clear();
-        for (auto& w : g_pCompositor->m_windows) if (w) g_pHyprRenderer->damageWindow(w);
-        for (auto& m : g_pCompositor->m_monitors) if (m) g_pCompositor->scheduleFrameForMonitor(m);
+        for (auto& w : Desktop::windowState()->windows()) if (w) g_pHyprRenderer->damageWindow(w);
+        for (auto& m : State::monitorState()->monitors()) if (m) m->scheduleFrame();
         HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] Shaders Reloaded from Disk!", CHyprColor(0.2f, 1.0f, 0.2f, 1.0f), 3000.0f);
     }
 }
@@ -154,7 +154,7 @@ APICALL EXPORT std::string PLUGIN_API_VERSION() { return HYPRLAND_API_VERSION; }
 APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     PHANDLE = handle;
 
-    // --- V0.55 HOOK 1: CGLElementRenderer::draw(CTexPassElement, CRegion) ---
+    // --- V0.56 HOOK 1: CGLElementRenderer::draw(CTexPassElement, CRegion) ---
     // The concrete, exported method that draws every textured surface element.
     auto methodsDraw = HyprlandAPI::findFunctionsByName(PHANDLE, "draw");
     void* drawAddr = nullptr;
@@ -172,7 +172,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] FATAL: CGLElementRenderer::draw(CTexPassElement) not found!", CHyprColor(1.0f, 0.0f, 0.0f, 1.0f), 10000.0f);
     }
 
-    // --- V0.55 HOOK 2: useShader ---
+    // --- V0.56 HOOK 2: useShader ---
     auto methodsUse = HyprlandAPI::findFunctionsByName(PHANDLE, "useShader");
     void* useAddr = nullptr;
     for (auto& m : methodsUse) {
@@ -208,7 +208,10 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     // Drop entries keyed by raw CWindow* when the window is destroyed so they
     // can't accidentally match a future window at the same address.
-    g_Listeners.push_back(Event::bus()->m_events.window.destroy.listen([](PHLWINDOW window) {
+    // V0.56: window.destroy emits PHLWINDOWREF (the shared ref is already gone
+    // by the time it fires), so take the weak ref and read the raw pointer off
+    // it — we only ever use it as a map key, never dereference it here.
+    g_Listeners.push_back(Event::bus()->m_events.window.destroy.listen([](PHLWINDOWREF window) {
         if (!window) return;
         Desktop::View::CWindow* rawWin = window.get();
         g_mWindowManualShaders.erase(rawWin);
@@ -266,7 +269,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "toggleclassshader",  &luaToggleClassShader);
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "reloadshaders",      &luaReloadShaders);
 
-    return {"HyprWindowShade", "Native CShader Injection (v0.55)", "ManofJELLO", "1.4"};
+    return {"HyprWindowShade", "Native CShader Injection (v0.56)", "ManofJELLO", "1.4"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {

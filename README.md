@@ -4,7 +4,7 @@ A Hyprland plugin that applies fragment shaders to individual windows (or layers
 
 You can also use a `time` uniform for glitch-style animated effects.
 
-> **`.lua` config users:** Plugin dispatchers aren't surfaced to the Lua config layer on Hyprland 0.55, so the plugin also exposes every action as a Lua function under `hl.plugin.HyprWindowShade.*`. See [Lua config](#lua-config) below for usage.
+> **`.lua` config users:** Plugin dispatchers aren't surfaced to the Lua config layer on Hyprland 0.55+, so the plugin also exposes every action as a Lua function under `hl.plugin.HyprWindowShade.*`. See [Lua config](#lua-config) below for usage.
 
 > This has not been stress-tested. It may break when Hyprland updates or simply not work on your system. Only tested on AMD graphics on Arch. Good luck, have fun, don't say I didn't warn ya.
 
@@ -12,7 +12,7 @@ You can also use a `time` uniform for glitch-style animated effects.
 
 ## Requirements
 
-- **Hyprland 0.55** (the plugin is built against this version's internal API).
+- **Hyprland 0.56** (the plugin is built against this version's internal API).
 - Either a `.conf` config (use dispatchers) or a `.lua` config (use the `hl.plugin.HyprWindowShade.*` functions — see [Lua config](#lua-config)).
 - **GLSL ES 3.20** fragment shaders. The plugin uses Hyprland's `TEXVERTSRC320` vertex shader, so your fragment shader should start with `#version 320 es` and declare `in vec2 v_texcoord;`, `out vec4 fragColor;`, and `uniform sampler2D tex;` (same interface HyprShade uses).
 - Tested on AMD graphics, Arch Linux. Other setups may work but are unverified.
@@ -116,7 +116,7 @@ All dispatchers are registered via `HyprlandAPI::addDispatcherV2` and can also b
 
 ## Lua config
 
-Hyprland 0.55 doesn't surface plugin dispatchers to `.lua` configs, so the plugin also registers each action as a Lua function under `hl.plugin.HyprWindowShade.*`. Bind them by wrapping the call in a `function() ... end` (per vaxry's guidance for plugin actions on the Lua config path).
+Hyprland 0.55+ doesn't surface plugin dispatchers to `.lua` configs, so the plugin also registers each action as a Lua function under `hl.plugin.HyprWindowShade.*`. Bind them by wrapping the call in a `function() ... end` (per vaxry's guidance for plugin actions on the Lua config path).
 
 ### Functions
 
@@ -218,7 +218,7 @@ To add a new uniform: register its location in `ShaderEngine.cpp` (the `glGetUni
 - **Shader compile errors.** A failed compile shows a red Hyprland notification for 15 seconds with the first ~200 characters of the GLSL error log. The plugin remembers the failure's mtime and won't re-toast every frame — it just sits silent until the file changes on disk, then automatically retries the compile.
 - **Edits to a `.glsl` file aren't taking effect.** Edits are picked up automatically on the next draw — the cache is keyed by file mtime, so saving the file is enough. `hyprctl dispatch reloadshaders` is still available as a force-reload, but you shouldn't need it for ordinary edits.
 - **Plugin doesn't seem to be loaded.** Run `hyprctl plugins list` to confirm `HyprWindowShade` is present. If it isn't, check the path in your `exec-once` line and rebuild with `./build.sh`.
-- **Dispatchers do nothing on a `.lua` config.** Hyprland 0.55 doesn't surface plugin dispatchers to Lua configs — use the `hl.plugin.HyprWindowShade.*` functions instead (see [Lua config](#lua-config)).
+- **Dispatchers do nothing on a `.lua` config.** Hyprland 0.55+ doesn't surface plugin dispatchers to Lua configs — use the `hl.plugin.HyprWindowShade.*` functions instead (see [Lua config](#lua-config)).
 - **`attempt to index a nil value (field 'HyprWindowShade')`** in Lua. The plugin isn't loaded yet when the config evaluates this line. Make sure the plugin's `hyprctl plugin load ...` runs first, or wrap your binds in a deferred call.
 - **Shader doesn't show on a fullscreen window.** The default is to disable shaders on fullscreen. Use the `+shader_fullscreen:` tag or add it alongside your existing tag.
 - **Floating rule and active rule both set.** The floating rule wins while the window is floating.

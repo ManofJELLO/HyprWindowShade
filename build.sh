@@ -1,5 +1,5 @@
 #!/bin/bash
-# build.sh - v0.55 build script for HyprWindowShade
+# build.sh - v0.56 build script for HyprWindowShade
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -15,7 +15,7 @@ hyprctl plugin unload "$PLUGIN_PATH"
 sleep 2
 
 echo "[Build] Running make..."
-# v0.55: Use ONLY the hyprpm cache header tree to avoid duplicate-definition errors.
+# v0.56: Use ONLY the hyprpm cache header tree to avoid duplicate-definition errors.
 # Do not mix /usr/include/hyprland/src with /var/cache/hyprpm — they will conflict.
 g++ -shared -fPIC -O3 -std=c++23 *.cpp -o HyprWindowShade.so \
     -I/var/cache/hyprpm/$USER/headersRoot/include \

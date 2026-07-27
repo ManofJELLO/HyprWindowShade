@@ -12,15 +12,15 @@
 #include <chrono>
 #include <sys/stat.h>
 
-// --- V0.55 RENDER INCLUDES ---
+// --- V0.56 RENDER INCLUDES ---
 #include <hyprland/src/render/OpenGL.hpp>
 #include <hyprland/src/render/Renderer.hpp>
 #include <hyprland/src/render/Shader.hpp>
 
-// --- V0.55 NAMESPACE FIX ---
+// --- V0.56 NAMESPACE FIX ---
 using Render::GL::CHyprOpenGLImpl;
 
-// --- V0.55 HOOK TARGETS ---
+// --- V0.56 HOOK TARGETS ---
 #include <hyprland/src/render/pass/TexPassElement.hpp>
 
 // --- PLUGIN SYSTEM ---
@@ -28,10 +28,26 @@ using Render::GL::CHyprOpenGLImpl;
 #include <hyprland/src/plugins/PluginAPI.hpp>
 #include <hyprland/src/desktop/view/Window.hpp>
 #include <hyprland/src/desktop/view/LayerSurface.hpp>
+#include <hyprland/src/desktop/view/View.hpp>
+#include <hyprland/src/desktop/view/WLSurface.hpp>
 #include <hyprland/src/event/EventBus.hpp>
 #include <hyprutils/memory/UniquePtr.hpp>
 #include <hyprland/src/Compositor.hpp>
-#include <hyprland/src/managers/PointerManager.hpp>
+
+// --- V0.56 STATE/MANAGER SPLIT ---
+// 0.56 moved these off CCompositor into dedicated state objects and managers:
+//   m_windows              -> Desktop::windowState()->windows()
+//   m_monitors             -> State::monitorState()->monitors()
+//   isWindowActive()       -> Desktop::focusState()->isWindowActive()
+//   scheduleFrameForMonitor-> PHLMONITOR::scheduleFrame()
+//   CWindow::isFullscreen()-> Fullscreen::controller()->isFullscreen()
+//   g_pPointerManager      -> Pointer::mgr()
+#include <hyprland/src/desktop/state/WindowState.hpp>
+#include <hyprland/src/desktop/state/FocusState.hpp>
+#include <hyprland/src/state/MonitorState.hpp>
+#include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
+#include <hyprland/src/output/Monitor.hpp>
+#include <hyprland/src/pointer/PointerManager.hpp>
 
 // --- SHARED GLOBALS ---
 extern HANDLE PHANDLE;

@@ -24,7 +24,7 @@ static const std::string* resolveShaderPath(const PHLWINDOW& pWindow, const PHLL
         if (auto it = g_mWindowManualShaders.find(rawWin); it != g_mWindowManualShaders.end())
             return &it->second;
 
-        if (rawWin->isFullscreen()) {
+        if (Fullscreen::controller()->isFullscreen(pWindow)) {
             auto it = g_mWindowRuleShaders.find(rawWin);
             if (it != g_mWindowRuleShaders.end() && !it->second.fullscreen.empty())
                 return &it->second.fullscreen;
@@ -32,7 +32,7 @@ static const std::string* resolveShaderPath(const PHLWINDOW& pWindow, const PHLL
             auto it = g_mWindowRuleShaders.find(rawWin);
             if (it != g_mWindowRuleShaders.end()) {
                 const auto& state      = it->second;
-                const bool  isActive   = g_pCompositor->isWindowActive(pWindow);
+                const bool  isActive   = Desktop::focusState()->isWindowActive(pWindow);
                 const bool  isFloating = rawWin->m_isFloating;
                 if      (isFloating  && !state.floating.empty())  return &state.floating;
                 else if (!isFloating && !state.tiled.empty())     return &state.tiled;
@@ -58,18 +58,39 @@ static const std::string* resolveShaderPath(const PHLWINDOW& pWindow, const PHLL
     return nullptr;
 }
 
-// --- V0.55 HOOK: CGLElementRenderer::draw(CTexPassElement, CRegion) ---
+// --- V0.56 HOOK: CGLElementRenderer::draw(CTexPassElement, CRegion) ---
 typedef void (*TGLDrawTex)(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement> element, const CRegion& damage);
 
 void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement> element, const CRegion& damage) {
-    auto elem = element.lock();
+    // V0.56: CRenderPass owns its elements as UP<IPassElement>, so this WP is a
+    // weak-over-unique. CWeakPointer::lock() hard-asserts on that case
+    // (WeakPtr.hpp:181 -> std::terminate) and takes the whole compositor down on
+    // the first textured surface we see. get() has no such assert, and the pass
+    // that owns the element is synchronously calling us, so borrowing is safe.
+    CTexPassElement* elem = element.get();
 
     PHLWINDOW pWindow;
     PHLLS     pLS;
 
     if (elem && elem->m_data.surface) {
-        pWindow = g_pCompositor->getWindowFromSurface(elem->m_data.surface);
-        pLS     = elem->m_data.currentLS.lock();
+        // V0.56: CCompositor::getWindowFromSurface is gone. Resolve the owning
+        // view straight off the surface resource instead.
+        if (auto wlSurface = Desktop::View::CWLSurface::fromResource(elem->m_data.surface)) {
+            if (auto view = wlSurface->view()) {
+                pWindow = Desktop::View::CWindow::fromView(view);
+
+                // Subsurfaces and popups are views in their own right and don't
+                // cast to a window; their owning window is private in 0.56, so
+                // fall back to whichever window the renderer is currently
+                // walking — that's the window they belong to.
+                if (!pWindow) {
+                    const auto type = view->type();
+                    if (type == Desktop::View::VIEW_TYPE_SUBSURFACE || type == Desktop::View::VIEW_TYPE_POPUP)
+                        pWindow = g_pHyprRenderer->m_renderData.currentWindow.lock();
+                }
+            }
+        }
+        pLS = elem->m_data.currentLS.lock();
     }
 
     g_pCurrentRenderWindow = pWindow;
@@ -90,7 +111,7 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
             g_pHyprRenderer->damageWindow(pWindow);
         else if (pLS) {
             if (auto mon = pLS->m_monitor.lock())
-                g_pCompositor->scheduleFrameForMonitor(mon);
+                mon->scheduleFrame();
         }
     }
 
@@ -102,7 +123,7 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
     g_pCurrentCompiledShader = nullptr;
 }
 
-// --- V0.55 HOOK: useShader ---
+// --- V0.56 HOOK: useShader ---
 typedef Hyprutils::Memory::CWeakPointer<CShader> (*TUseShader)(CHyprOpenGLImpl* thisptr, Hyprutils::Memory::CWeakPointer<CShader> prog);
 
 Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, Hyprutils::Memory::CWeakPointer<CShader> prog) {
@@ -137,16 +158,21 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
             glUniform2f(activeEntry->resolutionLoc, (float)res.x, (float)res.y);
         }
         if (activeEntry->surfaceSizeLoc >= 0) {
+            // V0.56: CWindow::m_size is gone; IView::logicalBox() is the
+            // supported way to read a window's logical geometry.
             Vector2D sz(0, 0);
-            if (contextWindow) sz = contextWindow->m_size;
+            if (contextWindow) {
+                if (const auto box = contextWindow->logicalBox())
+                    sz = box->size();
+            }
             glUniform2f(activeEntry->surfaceSizeLoc, (float)sz.x, (float)sz.y);
         }
-        if (activeEntry->mouseLoc >= 0 && g_pPointerManager) {
-            const Vector2D p = g_pPointerManager->position();
+        if (activeEntry->mouseLoc >= 0 && Pointer::mgr()) {
+            const Vector2D p = Pointer::mgr()->position();
             glUniform2f(activeEntry->mouseLoc, (float)p.x, (float)p.y);
         }
         if (activeEntry->isActiveLoc >= 0) {
-            const float v = (contextWindow && g_pCompositor->isWindowActive(contextWindow)) ? 1.0f : 0.0f;
+            const float v = (contextWindow && Desktop::focusState()->isWindowActive(contextWindow)) ? 1.0f : 0.0f;
             glUniform1f(activeEntry->isActiveLoc, v);
         }
         if (activeEntry->isFloatingLoc >= 0) {
@@ -154,7 +180,7 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
             glUniform1f(activeEntry->isFloatingLoc, v);
         }
         if (activeEntry->isFullscreenLoc >= 0) {
-            const float v = (contextWindow && contextWindow->isFullscreen()) ? 1.0f : 0.0f;
+            const float v = (contextWindow && Fullscreen::controller()->isFullscreen(contextWindow)) ? 1.0f : 0.0f;
             glUniform1f(activeEntry->isFullscreenLoc, v);
         }
     }
