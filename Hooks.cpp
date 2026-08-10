@@ -6,6 +6,7 @@ thread_local PHLWINDOWREF        g_pCurrentRenderWindow;
 thread_local PHLLSREF            g_pCurrentRenderLayer;
 thread_local const std::string*  g_pCurrentShaderPath     = nullptr;
 thread_local CompiledShader*     g_pCurrentCompiledShader = nullptr;
+thread_local float               g_pCurrentAnimProgress   = -1.0f;
 
 // Plugin-relative reference time so the `time` uniform stays in float-precision
 // range. steady_clock::now() seconds-since-epoch is in the billions and loses
@@ -58,6 +59,41 @@ static const std::string* resolveShaderPath(const PHLWINDOW& pWindow, const PHLL
     return nullptr;
 }
 
+// --- OPEN ANIMATION STATE ---
+// One-shot reveal animations live in g_mWindowOpenAnims keyed by raw window
+// pointer. They're created by the window.open listener and dropped either when
+// progress reaches 1.0 (in hkGLDrawTex, after the draw uses them) or when the
+// window is destroyed.
+OpenAnimState* getActiveOpenAnim(Desktop::View::CWindow* rawWin) {
+    auto it = g_mWindowOpenAnims.find(rawWin);
+    return it == g_mWindowOpenAnims.end() ? nullptr : &it->second;
+}
+
+// One-shot revert check for close animations. After the close request was sent,
+// a well-behaved client destroys the surface (-> window.destroy cleans up the
+// entry). If it's still alive after the grace period, it likely showed a dialog
+// (e.g. "unsaved changes") — restore the window so it's visible/usable again.
+static void scheduleCloseRevert(const PHLWINDOW& pWindow) {
+    Desktop::View::CWindow* rawWin = pWindow.get();
+    PHLWINDOWREF            weak   = pWindow;
+
+    auto timer = Hyprutils::Memory::makeShared<CEventLoopTimer>(
+        std::chrono::milliseconds(600),
+        [rawWin, weak](SP<CEventLoopTimer> self, void* data) {
+            (void)self;
+            (void)data;
+            auto w = weak.lock();
+            if (!w) return;
+            auto it = g_mWindowOpenAnims.find(rawWin);
+            if (it == g_mWindowOpenAnims.end() || !it->second.isClose) return;
+            g_mWindowOpenAnims.erase(rawWin);
+            g_pHyprRenderer->damageWindow(w);
+        },
+        nullptr);
+
+    g_pEventLoopManager->addTimer(timer);
+}
+
 // --- V0.56 HOOK: CGLElementRenderer::draw(CTexPassElement, CRegion) ---
 typedef void (*TGLDrawTex)(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement> element, const CRegion& damage);
 
@@ -100,13 +136,42 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
     // on g_mCompiledCShaders and stash the resulting pointer for hkUseShader
     // to consume — saves the second find that used to happen down there.
     const std::string* pathToUse = resolveShaderPath(pWindow, pLS);
+
+    // A one-shot open animation overrides whatever the normal resolution picked,
+    // and its progress (0..1) is fed to hkUseShader via the thread-local.
+    g_pCurrentAnimProgress = -1.0f;
+    if (pWindow) {
+        if (OpenAnimState* anim = getActiveOpenAnim(pWindow.get())) {
+            pathToUse = &anim->path;
+            const float elapsed = std::chrono::duration_cast<std::chrono::duration<float>>(
+                                      std::chrono::steady_clock::now() - anim->start)
+                                      .count();
+            g_pCurrentAnimProgress = anim->duration > 0.0f ? std::min(elapsed / anim->duration, 1.0f) : 1.0f;
+        }
+    }
+
     g_pCurrentShaderPath         = pathToUse;
     g_pCurrentCompiledShader     = pathToUse && !pathToUse->empty()
                                        ? getOrCompileShader(*pathToUse)
                                        : nullptr;
 
-    // Schedule continuous redraw if the resolved shader uses `time`.
-    if (g_pCurrentCompiledShader && g_pCurrentCompiledShader->usesTime) {
+    // Schedule continuous redraw if the resolved shader uses `time`, or while
+    // a one-shot animation is still running (its shader may not bind `time`).
+    const bool animActive = g_pCurrentAnimProgress >= 0.0f;
+    bool       needsDamage = false;
+    if (g_pCurrentCompiledShader && g_pCurrentCompiledShader->usesTime)
+        needsDamage = true;
+    else if (animActive && pWindow)
+        needsDamage = true;
+
+    // A close animation freezes at progress==1.0 with the window invisible once
+    // the close request was sent — stop re-damaging it; it either gets destroyed
+    // or is reverted by the timer below.
+    if (needsDamage && pWindow) {
+        if (OpenAnimState* a = getActiveOpenAnim(pWindow.get()); a && a->isClose && a->closeSent)
+            needsDamage = false;
+    }
+    if (needsDamage) {
         if (pWindow)
             g_pHyprRenderer->damageWindow(pWindow);
         else if (pLS) {
@@ -117,10 +182,30 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
 
     ((TGLDrawTex)g_pGLDrawTexHook->m_original)(thisptr, element, damage);
 
+    // Animation completion.
+    // Open animations: drop the entry and damage once more so the frame after
+    // completion renders with the normal (non-anim) shader — the final animated
+    // frame at progress==1.0 already shows the fully-revealed window.
+    // Close animations: send the close request and KEEP the entry so the window
+    // stays invisible (shader frozen at progress==1.0) until it's destroyed or
+    // a revert timer restores it (client showed a dialog instead of closing).
+    if (animActive && g_pCurrentAnimProgress >= 1.0f && pWindow) {
+        OpenAnimState* anim = getActiveOpenAnim(pWindow.get());
+        if (anim && anim->isClose) {
+            if (!anim->closeSent) {
+                anim->closeSent = true;
+                pWindow->sendClose();
+                scheduleCloseRevert(pWindow);
+            }
+        } else if (g_mWindowOpenAnims.erase(pWindow.get()))
+            g_pHyprRenderer->damageWindow(pWindow);
+    }
+
     g_pCurrentRenderWindow.reset();
     g_pCurrentRenderLayer.reset();
     g_pCurrentShaderPath     = nullptr;
     g_pCurrentCompiledShader = nullptr;
+    g_pCurrentAnimProgress   = -1.0f;
 }
 
 // --- V0.56 HOOK: useShader ---
@@ -183,6 +268,23 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
             const float v = (contextWindow && Fullscreen::controller()->isFullscreen(contextWindow)) ? 1.0f : 0.0f;
             glUniform1f(activeEntry->isFullscreenLoc, v);
         }
+        if (activeEntry->progressLoc >= 0) {
+            const float p = g_pCurrentAnimProgress >= 0.0f ? g_pCurrentAnimProgress : 1.0f;
+            glUniform1f(activeEntry->progressLoc, p);
+        }
+        if (activeEntry->seedLoc >= 0) {
+            // Stable per-window random seed (0..1) so each open animation has its
+            // own pattern, like Niri's niri_random_seed. Derived from the window
+            // pointer; stable for the whole life of the window.
+            float s = 0.5f;
+            if (contextWindow) {
+                const uint64_t h = (uint64_t)(uintptr_t)contextWindow.get() * 2654435761u;
+                s = (float)(h >> 32) / 4294967295.0f;
+            } else if (auto l = g_pCurrentRenderLayer.lock()) {
+                s = (float)(std::hash<std::string>{}(l->m_namespace) % 100000) / 100000.0f;
+            }
+            glUniform1f(activeEntry->seedLoc, s);
+        }
     }
 
     return result;
@@ -217,6 +319,21 @@ void applyShaderRulesSafe(PHLWINDOW pWindow) {
         else if (sv.substr(0, 16) == "shader_floating:")   assign(state.floating,   16);
         else if (sv.substr(0, 13) == "shader_tiled:")      assign(state.tiled,      13);
         else if (sv.substr(0, 18) == "shader_fullscreen:") assign(state.fullscreen, 18);
+        else if (sv.substr(0, 17) == "shader_open_anim:") {
+            // Optional @<seconds> suffix sets the animation duration.
+            const std::string_view rest = sv.substr(17);
+            const size_t          at   = rest.find('@');
+            if (at != std::string_view::npos) {
+                state.openAnim.assign(rest.substr(0, at));
+                try {
+                    const float d = std::stof(std::string(rest.substr(at + 1)));
+                    if (d > 0.0f) state.openAnimDuration = d;
+                } catch (...) {}
+            } else {
+                state.openAnim.assign(rest);
+            }
+            hasRules = true;
+        }
     }
 
     if (hasRules) {

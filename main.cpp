@@ -9,6 +9,7 @@ HANDLE                                                PHANDLE = nullptr;
 std::vector<CHyprSignalListener>                      g_Listeners;
 std::unordered_map<Desktop::View::CWindow*, std::string>        g_mWindowManualShaders;
 std::unordered_map<Desktop::View::CWindow*, WindowShaderState>  g_mWindowRuleShaders;
+std::unordered_map<Desktop::View::CWindow*, OpenAnimState>      g_mWindowOpenAnims;
 std::map<std::string, std::string>                    g_mLayerNamespaceShaderMap;
 std::map<std::string, std::string>                    g_mWindowClassShaderMap;
 std::map<std::string, CompiledShader>                 g_mCompiledCShaders;
@@ -116,6 +117,36 @@ namespace shadeActions {
         for (auto& m : State::monitorState()->monitors()) if (m) m->scheduleFrame();
         HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] Shaders Reloaded from Disk!", CHyprColor(0.2f, 1.0f, 0.2f, 1.0f), 3000.0f);
     }
+
+    // Play a one-shot close animation on the focused window (path[@seconds],
+    // default duration 1.2s). At progress==1.0 the hook sends the close request
+    // and keeps the window invisible until it's destroyed (or reverted by timer).
+    static void closeAnim(const std::string& arg) {
+        if (arg.empty()) return;
+
+        std::string path    = arg;
+        float       duration = 0.5f;
+        const size_t at = path.find('@');
+        if (at != std::string::npos) {
+            try {
+                const float d = std::stof(path.substr(at + 1));
+                if (d > 0.0f) duration = d;
+            } catch (...) {}
+            path = path.substr(0, at);
+        }
+
+        PHLWINDOW pWindow = g_lastActiveWindow.lock();
+        if (!pWindow) return;
+
+        OpenAnimState anim;
+        anim.path      = path;
+        anim.start     = std::chrono::steady_clock::now();
+        anim.duration  = duration;
+        anim.isClose   = true;
+        anim.closeSent = false;
+        g_mWindowOpenAnims[pWindow.get()] = std::move(anim);
+        g_pHyprRenderer->damageWindow(pWindow);
+    }
 }
 
 // --- LUA C WRAPPERS ---
@@ -146,6 +177,10 @@ static int luaToggleClassShader(lua_State* L) {
 static int luaReloadShaders(lua_State* L) {
     (void)L;
     shadeActions::reloadShaders();
+    return 0;
+}
+static int luaCloseAnim(lua_State* L) {
+    shadeActions::closeAnim(luaL_checkstring(L, 1));
     return 0;
 }
 
@@ -206,6 +241,23 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         if (window) g_pHyprRenderer->damageWindow(window);
     }));
 
+    // Kick off the one-shot open animation (smoke reveal) for windows that have
+    // a +shader_open_anim: rule. Niri-style: progress 0->1 over ~1.5s, then the
+    // shader is dropped automatically when progress hits 1.0.
+    g_Listeners.push_back(Event::bus()->m_events.window.open.listen([](PHLWINDOW window) {
+        if (!window) return;
+        Desktop::View::CWindow* rawWin = window.get();
+        auto it = g_mWindowRuleShaders.find(rawWin);
+        if (it == g_mWindowRuleShaders.end() || it->second.openAnim.empty()) return;
+
+        OpenAnimState anim;
+        anim.path     = it->second.openAnim;
+        anim.start    = std::chrono::steady_clock::now();
+        anim.duration = it->second.openAnimDuration;
+        g_mWindowOpenAnims[rawWin] = std::move(anim);
+        g_pHyprRenderer->damageWindow(window);
+    }));
+
     // Drop entries keyed by raw CWindow* when the window is destroyed so they
     // can't accidentally match a future window at the same address.
     // V0.56: window.destroy emits PHLWINDOWREF (the shared ref is already gone
@@ -216,6 +268,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         Desktop::View::CWindow* rawWin = window.get();
         g_mWindowManualShaders.erase(rawWin);
         g_mWindowRuleShaders.erase(rawWin);
+        g_mWindowOpenAnims.erase(rawWin);
     }));
 
     // --- DISPATCHERS (.conf-style — Hyprland's native bind path) ---
@@ -259,6 +312,12 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         return SDispatchResult{};
     });
 
+    HyprlandAPI::addDispatcherV2(PHANDLE, "closeanim", [](std::string args) -> SDispatchResult {
+        trimInPlace(args);
+        shadeActions::closeAnim(args);
+        return SDispatchResult{};
+    });
+
     // --- LUA FUNCTIONS (hl.plugin.HyprWindowShade.* — for Lua-based configs) ---
     // Removed automatically on plugin unload (per PluginAPI.hpp), but PLUGIN_EXIT
     // calls removeLuaFunction defensively to keep teardown symmetric.
@@ -268,8 +327,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "classshader",        &luaClassShader);
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "toggleclassshader",  &luaToggleClassShader);
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "reloadshaders",      &luaReloadShaders);
+    HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "closeanim",          &luaCloseAnim);
 
-    return {"HyprWindowShade", "Native CShader Injection (v0.56)", "ManofJELLO", "1.4"};
+    return {"HyprWindowShade", "Native CShader Injection (v0.56)", "ManofJELLO", "1.7"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
@@ -277,6 +337,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
 
     g_mWindowManualShaders.clear();
     g_mWindowRuleShaders.clear();
+    g_mWindowOpenAnims.clear();
     g_mLayerNamespaceShaderMap.clear();
     g_mWindowClassShaderMap.clear();
     g_mFailedShaderMtimes.clear();
@@ -296,6 +357,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
     HyprlandAPI::removeDispatcher(PHANDLE, "classshader");
     HyprlandAPI::removeDispatcher(PHANDLE, "toggleclassshader");
     HyprlandAPI::removeDispatcher(PHANDLE, "reloadshaders");
+    HyprlandAPI::removeDispatcher(PHANDLE, "closeanim");
 
     HyprlandAPI::removeLuaFunction(PHANDLE, "HyprWindowShade", "layershader");
     HyprlandAPI::removeLuaFunction(PHANDLE, "HyprWindowShade", "togglelayershader");
@@ -303,4 +365,5 @@ APICALL EXPORT void PLUGIN_EXIT() {
     HyprlandAPI::removeLuaFunction(PHANDLE, "HyprWindowShade", "classshader");
     HyprlandAPI::removeLuaFunction(PHANDLE, "HyprWindowShade", "toggleclassshader");
     HyprlandAPI::removeLuaFunction(PHANDLE, "HyprWindowShade", "reloadshaders");
+    HyprlandAPI::removeLuaFunction(PHANDLE, "HyprWindowShade", "closeanim");
 }

@@ -126,6 +126,8 @@ CompiledShader* getOrCompileShader(const std::string& shaderPath) {
     entry.isActiveLoc     = glGetUniformLocation(prog, "is_active");
     entry.isFloatingLoc   = glGetUniformLocation(prog, "is_floating");
     entry.isFullscreenLoc = glGetUniformLocation(prog, "is_fullscreen");
+    entry.progressLoc     = glGetUniformLocation(prog, "progress");
+    entry.seedLoc         = glGetUniformLocation(prog, "seed");
     // Continuous redraw is needed only when the shader actually binds `time`.
     // Using the location instead of substring matching avoids false positives
     // like "lifetime" or "uniform_time_offset".

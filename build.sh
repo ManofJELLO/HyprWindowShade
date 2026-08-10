@@ -38,7 +38,12 @@ if [ "$HDR_COMMIT" != "$RUN_COMMIT" ]; then
 fi
 
 echo "[Plugin] Unloading previous version from memory..."
-hyprctl plugin unload "$PLUGIN_PATH"
+hyprctl plugin unload "$PLUGIN_PATH" >/dev/null 2>&1
+# Older dev builds were loaded from unique /tmp copies; unload those too so the
+# reload below doesn't end up with two HyprWindowShade instances.
+for stale in /tmp/HyprWindowShade-*.so; do
+    [ -e "$stale" ] && hyprctl plugin unload "$stale" >/dev/null 2>&1
+done
 sleep 2
 
 echo "[Build] Running make..."
@@ -68,6 +73,17 @@ mv "$(pwd)/HyprWindowShade.so" "$PLUGIN_PATH"
 echo -e "${GREEN}Complete!${NC}"
 
 echo "[Plugin] Loading new version..."
-hyprctl plugin load "$PLUGIN_PATH"
+# v0.56: `hyprctl plugin load` on the same path right after an unload can reuse a
+# stale, still-mapped module (deferred dlclose) and silently keep the previous
+# build alive. Load a fresh copy under a unique path so PLUGIN_INIT runs for real.
+TMP_PLUGIN="/tmp/HyprWindowShade-$$.so"
+cp "$PLUGIN_PATH" "$TMP_PLUGIN"
+LOAD_OUT=$(hyprctl plugin load "$TMP_PLUGIN" 2>&1)
+if echo "$LOAD_OUT" | grep -qiE "could not be loaded|error"; then
+    echo -e "${RED}[Error] Plugin load failed:${NC}"
+    echo "$LOAD_OUT"
+    exit 1
+fi
+echo "$LOAD_OUT"
 
 echo -e "${GREEN}[Success] HyprWindowShade is now live!${NC}"

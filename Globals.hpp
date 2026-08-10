@@ -48,6 +48,8 @@ using Render::GL::CHyprOpenGLImpl;
 #include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
 #include <hyprland/src/output/Monitor.hpp>
 #include <hyprland/src/pointer/PointerManager.hpp>
+#include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
+#include <hyprland/src/helpers/time/Time.hpp>
 
 // --- SHARED GLOBALS ---
 extern HANDLE PHANDLE;
@@ -70,8 +72,23 @@ struct WindowShaderState {
     std::string tiled;
     std::string fullscreen;
     std::string fallback;
+    std::string openAnim;          // one-shot reveal animation applied on window open
+    float       openAnimDuration = 1.0f; // seconds, via +shader_open_anim:/path@<sec>
 };
 extern std::unordered_map<Desktop::View::CWindow*, WindowShaderState> g_mWindowRuleShaders;
+
+// One-shot open animation state. progress starts at 0 (fully revealed hidden)
+// and ramps to 1.0 over `duration`; the entry is dropped once it completes.
+// For close animations (isClose) the entry is kept until the window is gone and
+// the shader freezes at progress==1.0 (window invisible) while close is pending.
+struct OpenAnimState {
+    std::string                            path;
+    std::chrono::steady_clock::time_point  start;
+    float                                  duration = 1.0f;
+    bool                                   isClose  = false;
+    bool                                   closeSent = false;
+};
+extern std::unordered_map<Desktop::View::CWindow*, OpenAnimState> g_mWindowOpenAnims;
 
 struct CompiledShader {
     Hyprutils::Memory::CSharedPointer<CShader> shader;
@@ -83,6 +100,8 @@ struct CompiledShader {
     GLint     isActiveLoc     = -1; // float 0/1
     GLint     isFloatingLoc   = -1; // float 0/1
     GLint     isFullscreenLoc = -1; // float 0/1
+    GLint     progressLoc     = -1; // float 0..1: one-shot open animation progress
+    GLint     seedLoc         = -1; // float 0..1: stable per-window random seed
     bool      usesTime        = false;
     time_t    sourceMtime     = 0; // mtime at compile time; lets us auto-evict on edit
 };
@@ -108,6 +127,9 @@ extern CFunctionHook* g_pUseShaderHook;
 extern thread_local PHLWINDOWREF      g_pCurrentRenderWindow;
 extern thread_local PHLLSREF          g_pCurrentRenderLayer;
 extern thread_local const std::string* g_pCurrentShaderPath;
+// Progress of the active one-shot open animation for the surface being drawn,
+// or -1.0 when no animation applies. Set by hkGLDrawTex, consumed by hkUseShader.
+extern thread_local float              g_pCurrentAnimProgress;
 // Cached compiled-shader pointer for the current draw. Set by hkGLDrawTex (one
 // resolve+compile lookup per surface), consumed by hkUseShader so it can apply
 // the shader and push uniforms without doing a second find on g_mCompiledCShaders.
@@ -118,3 +140,6 @@ CompiledShader*                             getOrCompileShader(const std::string
 void                                        hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement> element, const CRegion& damage);
 Hyprutils::Memory::CWeakPointer<CShader>    hkUseShader(CHyprOpenGLImpl* thisptr, Hyprutils::Memory::CWeakPointer<CShader> prog);
 void                                        applyShaderRulesSafe(PHLWINDOW pWindow);
+// Returns the active open-animation state for a window (owned by
+// g_mWindowOpenAnims), or nullptr. Only valid between render frames.
+OpenAnimState*                              getActiveOpenAnim(Desktop::View::CWindow* rawWin);
