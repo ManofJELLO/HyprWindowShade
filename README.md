@@ -307,13 +307,7 @@ uniforms, same `// @duration`, same snapshot-based close path.
 
 ### How close animations work
 
-There's an obvious-looking way to do this that doesn't work well: intercept the close
-keybind, play the animation, and only then ask the client to quit. That delays every
-close by the length of the animation, does nothing when the window is closed by its own
-X button or by `killactive`, and strands the window on screen if the app answers with an
-"unsaved changes" dialog instead of exiting.
-
-Instead, close animations ride Hyprland's own fadeout. When a window closes, Hyprland
+Close animations ride Hyprland's own fadeout. When a window closes, Hyprland
 snapshots it into a framebuffer and renders that snapshot for the duration of the fadeout
 animation. The plugin tags that snapshot with the window's `shader_close:` shader and
 shades it on the way out. Layer surfaces close through the identical mechanism
@@ -348,5 +342,3 @@ Two consequences worth knowing:
 - **Floating rule and active rule both set.** The floating rule wins while the window is floating.
 
 ---
-
-This was a vibe coding experiment with base Gemini Pro. I didn't write any of this code other than spending hours fighting the clankers. The AI makes a lot of assumptions for naming and function calls, overly believes the compiler suggestions, and doesn't ask for help or more information when it should. Honestly though, I learned C++ 25 years ago and haven't touched it since, and I was able to write a working plugin without writing a single line of code.
