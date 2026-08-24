@@ -1,11 +1,17 @@
 #include "Globals.hpp"
 #include <string_view>
+#include <cstdio>
 
-// --- THREAD-LOCAL RENDER CONTEXT ---
-thread_local PHLWINDOWREF        g_pCurrentRenderWindow;
-thread_local PHLLSREF            g_pCurrentRenderLayer;
-thread_local const std::string*  g_pCurrentShaderPath     = nullptr;
-thread_local CompiledShader*     g_pCurrentCompiledShader = nullptr;
+// --- ACTIVE RENDER CONTEXT ---
+// Plain globals, not thread_local — see the note in Globals.hpp. A thread_local
+// with a non-trivial destructor pins this .so against dlclose and breaks
+// live-reload; rendering is main-thread-only, so TLS bought nothing here.
+PHLWINDOWREF        g_pCurrentRenderWindow;
+PHLLSREF            g_pCurrentRenderLayer;
+const std::string*  g_pCurrentShaderPath     = nullptr;
+CompiledShader*     g_pCurrentCompiledShader = nullptr;
+float               g_pCurrentAnimProgress   = -1.0f;
+float               g_pCurrentAnimSeed       = -1.0f;
 
 // Plugin-relative reference time so the `time` uniform stays in float-precision
 // range. steady_clock::now() seconds-since-epoch is in the billions and loses
@@ -58,6 +64,147 @@ static const std::string* resolveShaderPath(const PHLWINDOW& pWindow, const PHLL
     return nullptr;
 }
 
+// --- ONE-SHOT ANIMATIONS ---
+
+// Stable 0..1 value from a pointer, so two windows running the same open
+// animation don't play it identically. finalizer from splitmix64 — the PR's
+// single multiply left the low bits of consecutive heap addresses correlated,
+// which shows up as neighbouring windows animating in lockstep.
+float animSeedFor(const void* p) {
+    uint64_t h = (uint64_t)(uintptr_t)p;
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33;
+    return (float)(h >> 40) / (float)((1u << 24) - 1);
+}
+
+static float secondsSince(const std::chrono::steady_clock::time_point& t) {
+    return std::chrono::duration_cast<std::chrono::duration<float>>(std::chrono::steady_clock::now() - t).count();
+}
+
+// A shader that binds `progress` is unambiguously written as an animation, so
+// reaching the default because it forgot to say how long it wants to run is an
+// oversight worth surfacing rather than silently papering over. Shaders that
+// don't bind `progress` stay quiet — the duration barely matters for those.
+// Deduped by mtime so it's one toast per edit, not one per frame.
+static void warnMissingDuration(const std::string& path, time_t mtime) {
+    if (auto it = g_mDurationWarnedMtimes.find(path); it != g_mDurationWarnedMtimes.end() && it->second == mtime)
+        return;
+    g_mDurationWarnedMtimes[path] = mtime;
+
+    char fallback[32];
+    std::snprintf(fallback, sizeof(fallback), "%.3g", DEFAULT_ANIM_DURATION);
+
+    HyprlandAPI::addNotification(PHANDLE,
+                                 "[HyprWindowShade] " + path + "\nuses `progress` but declares no `// @duration <sec>` — defaulting to " +
+                                     fallback + "s.",
+                                 CHyprColor(1.0f, 0.7f, 0.2f, 1.0f), 8000.0f);
+}
+
+// Duration precedence: an explicit `@<sec>` on the window rule wins, then the
+// shader's own `// @duration`, then the built-in default. The shader is the
+// natural home for this — a dissolve and a CRT collapse want different lengths,
+// and the binding shouldn't have to restate what the effect already knows.
+//
+// Only ever called from the draw path, so a compile here has a live GL context.
+static float resolveAnimDuration(const std::string& path, float ruleOverride) {
+    // An explicit override is unambiguous — nothing to warn about.
+    if (ruleOverride > 0.0f) return std::min(ruleOverride, MAX_ANIM_DURATION);
+
+    const CompiledShader* cs = getOrCompileShader(path);
+    if (cs && cs->animDuration > 0.0f) return std::min(cs->animDuration, MAX_ANIM_DURATION);
+
+    // Broken shaders (cs == nullptr) already toast their compile error; don't
+    // pile a second notification on top of it.
+    if (cs && cs->progressLoc >= 0) warnMissingDuration(path, cs->sourceMtime);
+
+    return DEFAULT_ANIM_DURATION;
+}
+
+// Open animation for a live window. Returns the shader to use and sets the
+// progress/seed globals, or nullptr once the animation has run its course (at
+// which point the window reverts to its normal shader).
+static const std::string* resolveOpenAnim(const PHLWINDOW& pWindow) {
+    if (g_mWindowOpenTimes.empty()) return nullptr;
+
+    Desktop::View::CWindow* rawWin = pWindow.get();
+    auto                    tIt    = g_mWindowOpenTimes.find(rawWin);
+    if (tIt == g_mWindowOpenTimes.end()) return nullptr;
+
+    // Resolved here rather than when the window opened: window.open and the
+    // rule-application event have no guaranteed order, but by the time we're
+    // drawing the window its rules are definitely in place.
+    auto rIt = g_mWindowRuleShaders.find(rawWin);
+    if (rIt == g_mWindowRuleShaders.end() || rIt->second.openAnim.empty()) {
+        g_mWindowOpenTimes.erase(tIt);
+        return nullptr;
+    }
+
+    const std::string& path     = rIt->second.openAnim;
+    const float        duration = resolveAnimDuration(path, rIt->second.openAnimDuration);
+    const float        elapsed  = secondsSince(tIt->second);
+
+    if (elapsed >= duration) {
+        g_mWindowOpenTimes.erase(tIt);
+        return nullptr;
+    }
+
+    g_pCurrentAnimProgress = elapsed / duration;
+    g_pCurrentAnimSeed     = animSeedFor(rawWin);
+    return &path;
+}
+
+// Drops records whose fadeout no longer exists. The keys are raw pointers, so a
+// stale entry could otherwise be matched by a future fadeout allocated at the
+// same address. Cheap: the list is the set of windows closing right now.
+static void pruneFadeoutAnims() {
+    if (g_mFadeoutAnims.empty()) return;
+
+    auto& state = Desktop::fadingOutState();
+    if (!state) {
+        g_mFadeoutAnims.clear();
+        return;
+    }
+
+    const auto& live = state->fadeouts();
+    for (auto it = g_mFadeoutAnims.begin(); it != g_mFadeoutAnims.end();) {
+        bool found = false;
+        for (const auto& f : live) {
+            if (f.get() == it->first) { found = true; break; }
+        }
+        it = found ? std::next(it) : g_mFadeoutAnims.erase(it);
+    }
+}
+
+// Close animation. The window is already gone; what's being drawn is the
+// snapshot framebuffer Hyprland captured for the fadeout, so we identify it by
+// exact texture identity rather than guessing from geometry.
+static const std::string* resolveCloseAnim(const SP<Render::ITexture>& tex, PHLMONITOR& outMonitor) {
+    if (g_mFadeoutAnims.empty() || !tex) return nullptr;
+
+    auto& state = Desktop::fadingOutState();
+    if (!state) return nullptr;
+
+    for (const auto& f : state->fadeouts()) {
+        if (!f) continue;
+        const auto fb = f->framebuffer();
+        if (!fb || fb->getTexture().get() != tex.get()) continue;
+
+        auto it = g_mFadeoutAnims.find(f.get());
+        if (it == g_mFadeoutAnims.end()) return nullptr;
+
+        FadeoutAnim& anim = it->second;
+        if (anim.duration < 0.0f) anim.duration = resolveAnimDuration(anim.path, -1.0f);
+
+        const float elapsed = secondsSince(anim.start);
+        g_pCurrentAnimProgress = anim.duration > 0.0f ? std::min(elapsed / anim.duration, 1.0f) : 1.0f;
+        g_pCurrentAnimSeed     = anim.seed;
+        outMonitor             = f->monitor().lock();
+        return &anim.path;
+    }
+    return nullptr;
+}
+
 // --- V0.56 HOOK: CGLElementRenderer::draw(CTexPassElement, CRegion) ---
 typedef void (*TGLDrawTex)(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement> element, const CRegion& damage);
 
@@ -95,24 +242,44 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
 
     g_pCurrentRenderWindow = pWindow;
     g_pCurrentRenderLayer  = pLS;
+    g_pCurrentAnimProgress = -1.0f;
+    g_pCurrentAnimSeed     = -1.0f;
+
+    // A one-shot open/close animation overrides the window's normal shader for
+    // as long as it runs. Close animations have no window and no surface — they
+    // draw a snapshot texture — so they're matched on a separate branch.
+    PHLMONITOR         animMonitor;
+    const std::string* pathToUse = nullptr;
+
+    if (pWindow)
+        pathToUse = resolveOpenAnim(pWindow);
+    else if (elem && !elem->m_data.surface && elem->m_data.tex)
+        pathToUse = resolveCloseAnim(elem->m_data.tex, animMonitor);
+
+    const bool animActive = pathToUse != nullptr;
 
     // Resolve the path once and stash it. Then do a single lookup-or-compile
     // on g_mCompiledCShaders and stash the resulting pointer for hkUseShader
     // to consume — saves the second find that used to happen down there.
-    const std::string* pathToUse = resolveShaderPath(pWindow, pLS);
-    g_pCurrentShaderPath         = pathToUse;
-    g_pCurrentCompiledShader     = pathToUse && !pathToUse->empty()
-                                       ? getOrCompileShader(*pathToUse)
-                                       : nullptr;
+    if (!animActive)
+        pathToUse = resolveShaderPath(pWindow, pLS);
 
-    // Schedule continuous redraw if the resolved shader uses `time`.
-    if (g_pCurrentCompiledShader && g_pCurrentCompiledShader->usesTime) {
+    g_pCurrentShaderPath     = pathToUse;
+    g_pCurrentCompiledShader = pathToUse && !pathToUse->empty()
+                                   ? getOrCompileShader(*pathToUse)
+                                   : nullptr;
+
+    // Schedule continuous redraw if the resolved shader uses `time`, or while a
+    // one-shot animation is mid-flight — an animation shader drives itself off
+    // `progress` and may never bind `time`, so it needs frames either way.
+    if (animActive || (g_pCurrentCompiledShader && g_pCurrentCompiledShader->usesTime)) {
         if (pWindow)
             g_pHyprRenderer->damageWindow(pWindow);
         else if (pLS) {
             if (auto mon = pLS->m_monitor.lock())
                 mon->scheduleFrame();
-        }
+        } else if (animMonitor)
+            animMonitor->scheduleFrame();
     }
 
     ((TGLDrawTex)g_pGLDrawTexHook->m_original)(thisptr, element, damage);
@@ -121,6 +288,8 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
     g_pCurrentRenderLayer.reset();
     g_pCurrentShaderPath     = nullptr;
     g_pCurrentCompiledShader = nullptr;
+    g_pCurrentAnimProgress   = -1.0f;
+    g_pCurrentAnimSeed       = -1.0f;
 }
 
 // --- V0.56 HOOK: useShader ---
@@ -183,9 +352,95 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
             const float v = (contextWindow && Fullscreen::controller()->isFullscreen(contextWindow)) ? 1.0f : 0.0f;
             glUniform1f(activeEntry->isFullscreenLoc, v);
         }
+        if (activeEntry->progressLoc >= 0) {
+            // 1.0 outside an animation, so a shader written against `progress`
+            // still renders its finished state if bound as a normal shader.
+            glUniform1f(activeEntry->progressLoc, g_pCurrentAnimProgress >= 0.0f ? g_pCurrentAnimProgress : 1.0f);
+        }
+        if (activeEntry->seedLoc >= 0) {
+            float s = g_pCurrentAnimSeed;
+            if (s < 0.0f) {
+                // Not an animation — derive from whatever we're drawing so the
+                // seed stays stable for the life of the window or layer.
+                if (contextWindow)
+                    s = animSeedFor(contextWindow.get());
+                else if (auto l = g_pCurrentRenderLayer.lock())
+                    s = animSeedFor(l.get());
+                else
+                    s = 0.5f;
+            }
+            glUniform1f(activeEntry->seedLoc, s);
+        }
     }
 
     return result;
+}
+
+// --- V0.56 HOOK: Desktop::CWindowFadeout::create ---
+// The one place where a fadeout and the window it came from are both in scope.
+// We tag the fadeout with that window's close shader; everything afterwards keys
+// off the fadeout, because the window is already gone.
+typedef Hyprutils::Memory::CSharedPointer<Desktop::CWindowFadeout> (*TFadeoutCreate)(PHLWINDOW, Hyprutils::Memory::CSharedPointer<Render::IFramebuffer>, float);
+
+Hyprutils::Memory::CSharedPointer<Desktop::CWindowFadeout>
+hkFadeoutCreate(PHLWINDOW window, Hyprutils::Memory::CSharedPointer<Render::IFramebuffer> snapshot, float sourceAlpha) {
+    auto result = ((TFadeoutCreate)g_pFadeoutCreateHook->m_original)(window, snapshot, sourceAlpha);
+
+    pruneFadeoutAnims();
+
+    if (!result || !window) return result;
+
+    auto it = g_mWindowRuleShaders.find(window.get());
+    if (it == g_mWindowRuleShaders.end() || it->second.closeAnim.empty()) return result;
+
+    // Derived-to-base conversion, not a reinterpret: IFadeout has a virtual base,
+    // so the compiler has to apply the right offset for the key to match what
+    // fadeouts() hands back.
+    Desktop::IFadeout* key = result.get();
+
+    FadeoutAnim anim;
+    anim.path     = it->second.closeAnim;
+    anim.start    = std::chrono::steady_clock::now();
+    anim.duration = it->second.closeAnimDuration; // <0 -> resolved from the shader on first draw
+    anim.seed     = animSeedFor(window.get());
+    g_mFadeoutAnims[key] = std::move(anim);
+
+    return result;
+}
+
+// --- V0.56 HOOK: Desktop::CWindowFadeout::done ---
+// Hyprland drops a fadeout as soon as its own fade-out animation finishes, which
+// can be well before the close shader is done. Holding `done` false keeps the
+// snapshot alive for exactly as long as the shader asked for.
+typedef bool (*TFadeoutDone)(void* thisptr);
+
+bool hkFadeoutDone(void* thisptr) {
+    const bool origDone = ((TFadeoutDone)g_pFadeoutDoneHook->m_original)(thisptr);
+
+    if (g_mFadeoutAnims.empty()) return origDone;
+
+    Desktop::IFadeout* key = static_cast<Desktop::CWindowFadeout*>(thisptr);
+    auto               it  = g_mFadeoutAnims.find(key);
+    if (it == g_mFadeoutAnims.end()) return origDone;
+
+    // Deliberately no getOrCompileShader here: `done` is called from fadeout
+    // bookkeeping, which isn't guaranteed to run with a GL context current, and
+    // compiling without one would fail (and poison the failure cache). The draw
+    // path resolves the real duration; until it has, assume the default.
+    const FadeoutAnim& anim = it->second;
+    const float        dur  = anim.duration > 0.0f ? anim.duration : DEFAULT_ANIM_DURATION;
+
+    if (secondsSince(anim.start) < std::min(dur, MAX_ANIM_DURATION)) {
+        // Keep frames coming ourselves: once Hyprland's fade animation is over it
+        // has no reason left to tick this monitor, and without a frame the
+        // animation would freeze mid-way instead of playing out.
+        if (auto mon = key->monitor().lock())
+            mon->scheduleFrame();
+        return false;
+    }
+
+    if (origDone) g_mFadeoutAnims.erase(it);
+    return origDone;
 }
 
 void applyShaderRulesSafe(PHLWINDOW pWindow) {
@@ -211,12 +466,36 @@ void applyShaderRulesSafe(PHLWINDOW pWindow) {
             hasRules = true;
         };
 
+        // Animation rules additionally accept an optional `@<seconds>` suffix to
+        // override the duration the shader declares. rfind, so a path that
+        // happens to contain '@' still works; and the suffix is only stripped if
+        // it actually parsed as a number.
+        const auto assignAnim = [&](std::string& dst, float& dur, size_t prefixLen) {
+            std::string_view rest = sv.substr(prefixLen);
+            dur                   = -1.0f;
+
+            if (const size_t at = rest.rfind('@'); at != std::string_view::npos) {
+                try {
+                    const float d = std::stof(std::string(rest.substr(at + 1)));
+                    if (d > 0.0f && d <= MAX_ANIM_DURATION) {
+                        dur  = d;
+                        rest = rest.substr(0, at);
+                    }
+                } catch (...) {}
+            }
+
+            dst.assign(rest);
+            hasRules = true;
+        };
+
         if      (sv.substr(0, 7)  == "shader:")            assign(state.fallback,   7);
         else if (sv.substr(0, 14) == "shader_active:")     assign(state.active,     14);
         else if (sv.substr(0, 16) == "shader_inactive:")   assign(state.inactive,   16);
         else if (sv.substr(0, 16) == "shader_floating:")   assign(state.floating,   16);
         else if (sv.substr(0, 13) == "shader_tiled:")      assign(state.tiled,      13);
         else if (sv.substr(0, 18) == "shader_fullscreen:") assign(state.fullscreen, 18);
+        else if (sv.substr(0, 12) == "shader_open:")       assignAnim(state.openAnim,  state.openAnimDuration,  12);
+        else if (sv.substr(0, 13) == "shader_close:")      assignAnim(state.closeAnim, state.closeAnimDuration, 13);
     }
 
     if (hasRules) {

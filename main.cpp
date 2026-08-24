@@ -13,8 +13,13 @@ std::map<std::string, std::string>                    g_mLayerNamespaceShaderMap
 std::map<std::string, std::string>                    g_mWindowClassShaderMap;
 std::map<std::string, CompiledShader>                 g_mCompiledCShaders;
 std::map<std::string, time_t>                         g_mFailedShaderMtimes;
-CFunctionHook*                                        g_pGLDrawTexHook  = nullptr;
-CFunctionHook*                                        g_pUseShaderHook  = nullptr;
+std::map<std::string, time_t>                         g_mDurationWarnedMtimes;
+std::unordered_map<Desktop::View::CWindow*, std::chrono::steady_clock::time_point> g_mWindowOpenTimes;
+std::unordered_map<Desktop::IFadeout*, FadeoutAnim>   g_mFadeoutAnims;
+CFunctionHook*                                        g_pGLDrawTexHook     = nullptr;
+CFunctionHook*                                        g_pUseShaderHook     = nullptr;
+CFunctionHook*                                        g_pFadeoutCreateHook = nullptr;
+CFunctionHook*                                        g_pFadeoutDoneHook   = nullptr;
 
 // Tracks the most recently activated window so togglewindowshader doesn't have
 // to linear-scan Desktop::windowState()->windows() asking isWindowActive on each.
@@ -112,6 +117,9 @@ namespace shadeActions {
     static void reloadShaders() {
         g_mCompiledCShaders.clear();
         g_mFailedShaderMtimes.clear();
+        // Same intent as the failure cache: an explicit reload means "report
+        // everything again", including animation shaders missing a duration.
+        g_mDurationWarnedMtimes.clear();
         for (auto& w : Desktop::windowState()->windows()) if (w) g_pHyprRenderer->damageWindow(w);
         for (auto& m : State::monitorState()->monitors()) if (m) m->scheduleFrame();
         HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] Shaders Reloaded from Disk!", CHyprColor(0.2f, 1.0f, 0.2f, 1.0f), 3000.0f);
@@ -188,9 +196,49 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] FATAL: useShader not found!", CHyprColor(1.0f, 0.0f, 0.0f, 1.0f), 10000.0f);
     }
 
+    // --- V0.56 HOOK 3+4: close animations (optional) ---
+    // Both live on Desktop::CWindowFadeout. If either is missing we simply don't
+    // do close animations — everything else keeps working.
+    auto methodsCreate = HyprlandAPI::findFunctionsByName(PHANDLE, "create");
+    void* fadeoutCreateAddr = nullptr;
+    for (auto& m : methodsCreate) {
+        if (m.demangled.find("CWindowFadeout::create") != std::string::npos) {
+            fadeoutCreateAddr = m.address;
+            break;
+        }
+    }
+
+    auto methodsDone = HyprlandAPI::findFunctionsByName(PHANDLE, "done");
+    void* fadeoutDoneAddr = nullptr;
+    for (auto& m : methodsDone) {
+        if (m.demangled.find("CWindowFadeout::done") != std::string::npos) {
+            fadeoutDoneAddr = m.address;
+            break;
+        }
+    }
+
+    if (fadeoutCreateAddr && fadeoutDoneAddr) {
+        g_pFadeoutCreateHook = HyprlandAPI::createFunctionHook(PHANDLE, fadeoutCreateAddr, (void*)&hkFadeoutCreate);
+        g_pFadeoutDoneHook   = HyprlandAPI::createFunctionHook(PHANDLE, fadeoutDoneAddr,   (void*)&hkFadeoutDone);
+        g_pFadeoutCreateHook->hook();
+        g_pFadeoutDoneHook->hook();
+    } else {
+        HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] CWindowFadeout hooks not found — shader_close: disabled.",
+                                     CHyprColor(1.0f, 0.7f, 0.2f, 1.0f), 8000.0f);
+    }
+
     // --- LISTENERS ---
     g_Listeners.push_back(Event::bus()->m_events.window.updateRules.listen([](PHLWINDOW window) {
         try { applyShaderRulesSafe(window); } catch (...) {}
+    }));
+
+    // Record only WHEN the window opened. The shader itself is resolved at first
+    // draw, because window.open and updateRules have no guaranteed ordering and
+    // reading the rule here would silently miss whenever open fires first.
+    g_Listeners.push_back(Event::bus()->m_events.window.open.listen([](PHLWINDOW window) {
+        if (!window) return;
+        g_mWindowOpenTimes[window.get()] = std::chrono::steady_clock::now();
+        g_pHyprRenderer->damageWindow(window);
     }));
 
     g_Listeners.push_back(Event::bus()->m_events.window.active.listen([](auto window, auto reason) {
@@ -216,6 +264,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         Desktop::View::CWindow* rawWin = window.get();
         g_mWindowManualShaders.erase(rawWin);
         g_mWindowRuleShaders.erase(rawWin);
+        g_mWindowOpenTimes.erase(rawWin);
     }));
 
     // --- DISPATCHERS (.conf-style — Hyprland's native bind path) ---
@@ -269,7 +318,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "toggleclassshader",  &luaToggleClassShader);
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "reloadshaders",      &luaReloadShaders);
 
-    return {"HyprWindowShade", "Native CShader Injection (v0.56)", "ManofJELLO", "1.4"};
+    return {"HyprWindowShade", "Native CShader Injection (v0.56)", "ManofJELLO", "1.5"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
@@ -280,6 +329,11 @@ APICALL EXPORT void PLUGIN_EXIT() {
     g_mLayerNamespaceShaderMap.clear();
     g_mWindowClassShaderMap.clear();
     g_mFailedShaderMtimes.clear();
+    g_mDurationWarnedMtimes.clear();
+    g_mWindowOpenTimes.clear();
+    // Any fadeout we were holding open falls back to Hyprland's own `done` as
+    // soon as the hooks come off below.
+    g_mFadeoutAnims.clear();
 
     // Intentionally leak compiled shaders: their CShader destructors call into
     // GL state owned by Hyprland, which may already be torn down at this point.
@@ -287,8 +341,10 @@ APICALL EXPORT void PLUGIN_EXIT() {
     auto leak = new std::map<std::string, CompiledShader>(std::move(g_mCompiledCShaders));
     (void)leak;
 
-    if (g_pGLDrawTexHook)  HyprlandAPI::removeFunctionHook(PHANDLE, g_pGLDrawTexHook);
-    if (g_pUseShaderHook)  HyprlandAPI::removeFunctionHook(PHANDLE, g_pUseShaderHook);
+    if (g_pGLDrawTexHook)      HyprlandAPI::removeFunctionHook(PHANDLE, g_pGLDrawTexHook);
+    if (g_pUseShaderHook)      HyprlandAPI::removeFunctionHook(PHANDLE, g_pUseShaderHook);
+    if (g_pFadeoutCreateHook)  HyprlandAPI::removeFunctionHook(PHANDLE, g_pFadeoutCreateHook);
+    if (g_pFadeoutDoneHook)    HyprlandAPI::removeFunctionHook(PHANDLE, g_pFadeoutDoneHook);
 
     HyprlandAPI::removeDispatcher(PHANDLE, "layershader");
     HyprlandAPI::removeDispatcher(PHANDLE, "togglelayershader");

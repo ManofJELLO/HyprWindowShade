@@ -38,7 +38,7 @@ exec-once = hyprctl plugin load /home/USERNAME/.local/share/hyprland/plugins/Hyp
 
 ## Window shaders
 
-Apply a shader to a window via a `tag` on a `windowrule`. Six tags are supported:
+Apply a shader to a window via a `tag` on a `windowrule`. Eight tags are supported:
 
 | Tag | Behavior |
 |---|---|
@@ -48,8 +48,10 @@ Apply a shader to a window via a `tag` on a `windowrule`. Six tags are supported
 | `+shader_inactive:/path.glsl` | Applies only when the window is not focused |
 | `+shader_floating:/path.glsl` | Applies only when floating |
 | `+shader_tiled:/path.glsl` | Applies only when tiled |
+| `+shader_open:/path.glsl` | Plays once when the window opens, then reverts to the window's normal shader |
+| `+shader_close:/path.glsl` | Plays once as the window closes |
 
-> **Priority:** floating rules take precedence over active rules. If a window has both, the floating shader wins while the window is floating.
+> **Priority:** floating rules take precedence over active rules. If a window has both, the floating shader wins while the window is floating. An open or close animation outranks all of them while it's running.
 
 ### Example
 
@@ -208,8 +210,99 @@ Declare any of these in your fragment shader and the plugin will populate them e
 | `is_active` | `float` | 1.0 if focused, else 0.0 |
 | `is_floating` | `float` | 1.0 if floating, else 0.0 |
 | `is_fullscreen` | `float` | 1.0 if fullscreen, else 0.0 |
+| `progress` | `float` | 0.0 → 1.0 across an open/close animation; 1.0 otherwise |
+| `seed` | `float` | stable per-window random value in 0..1 |
 
 To add a new uniform: register its location in `ShaderEngine.cpp` (the `glGetUniformLocation` block, ~line 78) and push the value from `Hooks.cpp` in `hkUseShader` (~line 120).
+
+---
+
+## Open and close animations
+
+A shader tagged with `+shader_open:` or `+shader_close:` runs **once**, driven by the
+`progress` uniform rather than looping on `time`.
+
+### The shader declares its own duration
+
+How long the effect should run is a property of the effect, not of the keybind or the
+window rule, so the shader says it directly:
+
+```glsl
+// @duration 0.35
+```
+
+Put that anywhere in the file. It's a comment, not GLSL — GLSL ES forbids initializers on
+uniforms, so there's no in-language way to declare a value the plugin can read *before*
+the shader ever runs, and the plugin needs it on the CPU side to know when the animation
+is over. Range is `0` to `5.0` seconds; if it's absent the plugin uses **0.3s**.
+
+A window rule can override it for a one-off, with an `@<seconds>` suffix:
+
+```
+windowrule = match:class kitty, tag +shader_open:/path/dissolve.glsl@0.6
+```
+
+Precedence is **rule `@sec` → shader `// @duration` → 0.3s default**.
+
+If a shader declares the `progress` uniform but no `// @duration`, the plugin falls back
+to 0.3s *and* toasts once to tell you — a shader written as an animation that never says
+how long it should run is almost always an oversight. Like compile errors, the warning is
+keyed to the file's mtime: one notification per edit, not one per frame, and it clears
+itself as soon as you save a fix. Shaders that don't use `progress` never warn, and an
+explicit `@sec` on the rule suppresses it too, since that's unambiguous.
+
+### Example
+
+```glsl
+#version 320 es
+precision highp float;
+// @duration 0.4
+
+in  vec2 v_texcoord;
+out vec4 fragColor;
+uniform sampler2D tex;
+uniform float progress;   // 0 -> 1 over the animation
+uniform float seed;       // differs per window
+
+void main() {
+    // Dissolve in from noise, scaled so each window breaks up differently.
+    float n = fract(sin(dot(v_texcoord + seed, vec2(12.9898, 78.233))) * 43758.5453);
+    fragColor = texture(tex, v_texcoord);
+    fragColor *= step(n, progress);
+}
+```
+
+Use the same shape for a close shader, but end at **fully transparent** when
+`progress` reaches 1.0 — see the note below.
+
+### How close animations work
+
+There's an obvious-looking way to do this that doesn't work well: intercept the close
+keybind, play the animation, and only then ask the client to quit. That delays every
+close by the length of the animation, does nothing when the window is closed by its own
+X button or by `killactive`, and strands the window on screen if the app answers with an
+"unsaved changes" dialog instead of exiting.
+
+Instead, close animations ride Hyprland's own fadeout. When a window closes, Hyprland
+snapshots it into a framebuffer and renders that snapshot for the duration of the fadeout
+animation. The plugin tags that snapshot with the window's `shader_close:` shader and
+shades it on the way out. So:
+
+- The close request is never delayed — window close semantics are completely unchanged.
+- **Every** close path animates: keybind, X button, `killactive`, the app quitting itself.
+- An app that refuses to close simply never fades out, so nothing animates. Correct by
+  construction, with no revert timer to get wrong.
+
+Two consequences worth knowing:
+
+- **Your close shader should reach full transparency at `progress == 1.0`.** The plugin
+  replaces Hyprland's texture shader, so Hyprland's own fade-out alpha isn't applied to
+  the snapshot — your shader has sole control of how it disappears. If it ends opaque,
+  the snapshot pops rather than fades.
+- Hyprland normally drops the fadeout when *its* animation finishes, which can be sooner
+  than your shader wants. The plugin holds it open for exactly the declared duration, so
+  you don't have to match `animation = fadeOut` in `hyprland.conf`. If Hyprland's fadeout
+  animation is disabled entirely, no snapshot is created and close animations won't run.
 
 ---
 

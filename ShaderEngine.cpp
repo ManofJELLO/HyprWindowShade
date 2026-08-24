@@ -15,6 +15,28 @@ static time_t fileMtime(const std::string& path) {
 // getOrCompileShader, not per draw).
 static const std::regex MAIN_RE(R"(\bvoid\s+main\s*\(\s*(?:void\s*)?\))");
 
+// A shader used as an open/close animation declares how long it wants to run:
+//
+//     // @duration 0.35
+//
+// A comment rather than a real GLSL construct on purpose — GLSL ES forbids
+// initializers on uniforms, so there's no in-language way to declare a value
+// the CPU can read back before the shader ever runs. The plugin needs the
+// number on the CPU side to know when the animation is over.
+static const std::regex DURATION_RE(R"(//[ \t]*@duration[ \t]+([0-9]*\.?[0-9]+))");
+
+// Reads the `// @duration` directive out of shader source. Returns <0 if absent
+// or out of range, meaning "caller picks".
+static float parseDeclaredDuration(const std::string& src) {
+    std::smatch m;
+    if (!std::regex_search(src, m, DURATION_RE)) return -1.0f;
+    try {
+        const float d = std::stof(m[1].str());
+        if (d > 0.0f && d <= MAX_ANIM_DURATION) return d;
+    } catch (...) {}
+    return -1.0f;
+}
+
 // Compile the fragment shader standalone purely to capture glGetShaderInfoLog
 // text. Only called after CShader::createProgram has already failed, so the
 // extra compile cost is paid once per broken edit, not per draw.
@@ -79,6 +101,10 @@ CompiledShader* getOrCompileShader(const std::string& shaderPath) {
     buffer << shaderFile.rdbuf();
     std::string shaderCode = buffer.str();
 
+    // Read the animation duration off the ORIGINAL source, before the auto-alpha
+    // wrapper appends anything.
+    const float declaredDuration = parseDeclaredDuration(shaderCode);
+
     // --- SHADER WRAPPING (AUTO-ALPHA) ---
     // Tolerant `void main()` matcher — handles whitespace, newlines, and an
     // explicit `(void)` parameter list. If the shader has no main at all we
@@ -126,6 +152,9 @@ CompiledShader* getOrCompileShader(const std::string& shaderPath) {
     entry.isActiveLoc     = glGetUniformLocation(prog, "is_active");
     entry.isFloatingLoc   = glGetUniformLocation(prog, "is_floating");
     entry.isFullscreenLoc = glGetUniformLocation(prog, "is_fullscreen");
+    entry.progressLoc     = glGetUniformLocation(prog, "progress");
+    entry.seedLoc         = glGetUniformLocation(prog, "seed");
+    entry.animDuration    = declaredDuration;
     // Continuous redraw is needed only when the shader actually binds `time`.
     // Using the location instead of substring matching avoids false positives
     // like "lifetime" or "uniform_time_offset".
