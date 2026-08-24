@@ -57,6 +57,7 @@ using Render::GL::CHyprOpenGLImpl;
 // match the snapshot texture at draw time.
 #include <hyprland/src/desktop/state/FadingOutState.hpp>
 #include <hyprland/src/desktop/state/WindowFadeout.hpp>
+#include <hyprland/src/desktop/state/LayerFadeout.hpp>
 #include <hyprland/src/render/Framebuffer.hpp>
 
 // --- SHARED GLOBALS ---
@@ -101,6 +102,7 @@ inline constexpr float MAX_ANIM_DURATION = 5.0f;
 // order relative to window.open isn't guaranteed, so resolving lazily at first
 // draw (by which point rules are definitely applied) avoids the race entirely.
 extern std::unordered_map<Desktop::View::CWindow*, std::chrono::steady_clock::time_point> g_mWindowOpenTimes;
+extern std::unordered_map<Desktop::View::CLayerSurface*, std::chrono::steady_clock::time_point> g_mLayerOpenTimes;
 
 // Live close animations, keyed by the IFadeout that owns the snapshot. Populated
 // in hkFadeoutCreate (the only place a fadeout and its window are both visible)
@@ -134,6 +136,20 @@ struct CompiledShader {
 
 extern std::map<std::string, std::string>          g_mLayerNamespaceShaderMap;
 extern std::map<std::string, std::string>          g_mWindowClassShaderMap;
+
+// Layer surfaces (bars, notifications, rofi/wofi) have no rule tags in v0.56, so
+// their animations are keyed by namespace like the rest of the layer API rather
+// than by a windowrule tag. `duration` <0 means "ask the shader".
+struct AnimSpec {
+    std::string path;
+    float       duration = -1.0f;
+};
+extern std::map<std::string, AnimSpec>             g_mLayerOpenAnims;
+extern std::map<std::string, AnimSpec>             g_mLayerCloseAnims;
+
+// Splits "<path>[@<seconds>]". The suffix is only consumed if it parses as a
+// number in range, so a path that happens to contain '@' still works.
+AnimSpec parseAnimSpec(const std::string& arg);
 extern std::map<std::string, CompiledShader>       g_mCompiledCShaders;
 // Paths whose last compile attempt failed, keyed to the mtime at failure. Lets
 // us suppress notification spam (one toast per broken edit, not per frame) and
@@ -152,6 +168,8 @@ extern CFunctionHook* g_pUseShaderHook;
 // rather than taking the whole plugin down.
 extern CFunctionHook* g_pFadeoutCreateHook;
 extern CFunctionHook* g_pFadeoutDoneHook;
+extern CFunctionHook* g_pLayerFadeoutCreateHook;
+extern CFunctionHook* g_pLayerFadeoutDoneHook;
 
 // --- ACTIVE RENDER CONTEXT ---
 // Set by hkGLDrawTex before delegating; consumed by hkUseShader during the call.
@@ -193,6 +211,13 @@ void                                        applyShaderRulesSafe(PHLWINDOW pWind
 Hyprutils::Memory::CSharedPointer<Desktop::CWindowFadeout>
      hkFadeoutCreate(PHLWINDOW window, Hyprutils::Memory::CSharedPointer<Render::IFramebuffer> snapshot, float sourceAlpha);
 bool hkFadeoutDone(void* thisptr);
+
+// Layer-surface equivalents. CLayerFadeout mirrors CWindowFadeout exactly, and
+// both derive from IFadeout, so everything downstream of creation — the anim
+// map, the snapshot matching, the hold-open logic — is shared.
+Hyprutils::Memory::CSharedPointer<Desktop::CLayerFadeout>
+     hkLayerFadeoutCreate(PHLLS layer, Hyprutils::Memory::CSharedPointer<Render::IFramebuffer> snapshot, float sourceAlpha);
+bool hkLayerFadeoutDone(void* thisptr);
 
 // Maps a pointer to a stable 0..1 value, so each window's animation differs.
 float animSeedFor(const void* p);

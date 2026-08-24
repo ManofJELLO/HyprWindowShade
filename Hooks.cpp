@@ -78,6 +78,22 @@ float animSeedFor(const void* p) {
     return (float)(h >> 40) / (float)((1u << 24) - 1);
 }
 
+AnimSpec parseAnimSpec(const std::string& arg) {
+    AnimSpec spec;
+    spec.path = arg;
+
+    if (const size_t at = arg.rfind('@'); at != std::string::npos) {
+        try {
+            const float d = std::stof(arg.substr(at + 1));
+            if (d > 0.0f && d <= MAX_ANIM_DURATION) {
+                spec.duration = d;
+                spec.path     = arg.substr(0, at);
+            }
+        } catch (...) {}
+    }
+    return spec;
+}
+
 static float secondsSince(const std::chrono::steady_clock::time_point& t) {
     return std::chrono::duration_cast<std::chrono::duration<float>>(std::chrono::steady_clock::now() - t).count();
 }
@@ -151,6 +167,35 @@ static const std::string* resolveOpenAnim(const PHLWINDOW& pWindow) {
 
     g_pCurrentAnimProgress = elapsed / duration;
     g_pCurrentAnimSeed     = animSeedFor(rawWin);
+    return &path;
+}
+
+// Same idea for layer surfaces, but keyed by namespace rather than a rule tag —
+// layer rules carry no tags in v0.56, so this follows the existing layer API.
+static const std::string* resolveLayerOpenAnim(const PHLLS& pLS) {
+    if (g_mLayerOpenTimes.empty()) return nullptr;
+
+    Desktop::View::CLayerSurface* rawLS = pLS.get();
+    auto                          tIt   = g_mLayerOpenTimes.find(rawLS);
+    if (tIt == g_mLayerOpenTimes.end()) return nullptr;
+
+    auto sIt = g_mLayerOpenAnims.find(pLS->m_namespace);
+    if (sIt == g_mLayerOpenAnims.end() || sIt->second.path.empty()) {
+        g_mLayerOpenTimes.erase(tIt);
+        return nullptr;
+    }
+
+    const std::string& path     = sIt->second.path;
+    const float        duration = resolveAnimDuration(path, sIt->second.duration);
+    const float        elapsed  = secondsSince(tIt->second);
+
+    if (elapsed >= duration) {
+        g_mLayerOpenTimes.erase(tIt);
+        return nullptr;
+    }
+
+    g_pCurrentAnimProgress = elapsed / duration;
+    g_pCurrentAnimSeed     = animSeedFor(rawLS);
     return &path;
 }
 
@@ -253,6 +298,8 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
 
     if (pWindow)
         pathToUse = resolveOpenAnim(pWindow);
+    else if (pLS)
+        pathToUse = resolveLayerOpenAnim(pLS);
     else if (elem && !elem->m_data.surface && elem->m_data.tex)
         pathToUse = resolveCloseAnim(elem->m_data.tex, animMonitor);
 
@@ -376,51 +423,23 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
     return result;
 }
 
-// --- V0.56 HOOK: Desktop::CWindowFadeout::create ---
-// The one place where a fadeout and the window it came from are both in scope.
-// We tag the fadeout with that window's close shader; everything afterwards keys
-// off the fadeout, because the window is already gone.
-typedef Hyprutils::Memory::CSharedPointer<Desktop::CWindowFadeout> (*TFadeoutCreate)(PHLWINDOW, Hyprutils::Memory::CSharedPointer<Render::IFramebuffer>, float);
-
-Hyprutils::Memory::CSharedPointer<Desktop::CWindowFadeout>
-hkFadeoutCreate(PHLWINDOW window, Hyprutils::Memory::CSharedPointer<Render::IFramebuffer> snapshot, float sourceAlpha) {
-    auto result = ((TFadeoutCreate)g_pFadeoutCreateHook->m_original)(window, snapshot, sourceAlpha);
-
-    pruneFadeoutAnims();
-
-    if (!result || !window) return result;
-
-    auto it = g_mWindowRuleShaders.find(window.get());
-    if (it == g_mWindowRuleShaders.end() || it->second.closeAnim.empty()) return result;
-
-    // Derived-to-base conversion, not a reinterpret: IFadeout has a virtual base,
-    // so the compiler has to apply the right offset for the key to match what
-    // fadeouts() hands back.
-    Desktop::IFadeout* key = result.get();
-
+// Records the close shader for a freshly created fadeout. Everything after this
+// point keys off the IFadeout, because the window or layer is already gone.
+static void tagFadeout(Desktop::IFadeout* key, const std::string& path, float duration, const void* seedSource) {
     FadeoutAnim anim;
-    anim.path     = it->second.closeAnim;
+    anim.path     = path;
     anim.start    = std::chrono::steady_clock::now();
-    anim.duration = it->second.closeAnimDuration; // <0 -> resolved from the shader on first draw
-    anim.seed     = animSeedFor(window.get());
+    anim.duration = duration; // <0 -> resolved from the shader on first draw
+    anim.seed     = animSeedFor(seedSource);
     g_mFadeoutAnims[key] = std::move(anim);
-
-    return result;
 }
 
-// --- V0.56 HOOK: Desktop::CWindowFadeout::done ---
-// Hyprland drops a fadeout as soon as its own fade-out animation finishes, which
-// can be well before the close shader is done. Holding `done` false keeps the
-// snapshot alive for exactly as long as the shader asked for.
-typedef bool (*TFadeoutDone)(void* thisptr);
-
-bool hkFadeoutDone(void* thisptr) {
-    const bool origDone = ((TFadeoutDone)g_pFadeoutDoneHook->m_original)(thisptr);
-
+// Shared by both fadeout kinds: hold the snapshot on screen until the shader has
+// had its declared duration, then let Hyprland drop it as usual.
+static bool holdFadeoutOpen(Desktop::IFadeout* key, bool origDone) {
     if (g_mFadeoutAnims.empty()) return origDone;
 
-    Desktop::IFadeout* key = static_cast<Desktop::CWindowFadeout*>(thisptr);
-    auto               it  = g_mFadeoutAnims.find(key);
+    auto it = g_mFadeoutAnims.find(key);
     if (it == g_mFadeoutAnims.end()) return origDone;
 
     // Deliberately no getOrCompileShader here: `done` is called from fadeout
@@ -441,6 +460,72 @@ bool hkFadeoutDone(void* thisptr) {
 
     if (origDone) g_mFadeoutAnims.erase(it);
     return origDone;
+}
+
+// --- V0.56 HOOK: Desktop::CWindowFadeout::create ---
+// The one place where a fadeout and the window it came from are both in scope.
+// We tag the fadeout with that window's close shader; everything afterwards keys
+// off the fadeout, because the window is already gone.
+typedef Hyprutils::Memory::CSharedPointer<Desktop::CWindowFadeout> (*TFadeoutCreate)(PHLWINDOW, Hyprutils::Memory::CSharedPointer<Render::IFramebuffer>, float);
+
+Hyprutils::Memory::CSharedPointer<Desktop::CWindowFadeout>
+hkFadeoutCreate(PHLWINDOW window, Hyprutils::Memory::CSharedPointer<Render::IFramebuffer> snapshot, float sourceAlpha) {
+    auto result = ((TFadeoutCreate)g_pFadeoutCreateHook->m_original)(window, snapshot, sourceAlpha);
+
+    pruneFadeoutAnims();
+
+    if (!result || !window) return result;
+
+    auto it = g_mWindowRuleShaders.find(window.get());
+    if (it == g_mWindowRuleShaders.end() || it->second.closeAnim.empty()) return result;
+
+    // Derived-to-base conversion, not a reinterpret: IFadeout has a virtual base,
+    // so the compiler has to apply the right offset for the key to match what
+    // fadeouts() hands back.
+    tagFadeout(result.get(), it->second.closeAnim, it->second.closeAnimDuration, window.get());
+
+    return result;
+}
+
+// --- V0.56 HOOK: Desktop::CLayerFadeout::create ---
+// Layer surfaces close the same way windows do — snapshot, then fade — so the
+// only thing that differs is where the shader comes from: a namespace lookup
+// rather than a window rule.
+typedef Hyprutils::Memory::CSharedPointer<Desktop::CLayerFadeout> (*TLayerFadeoutCreate)(PHLLS, Hyprutils::Memory::CSharedPointer<Render::IFramebuffer>, float);
+
+Hyprutils::Memory::CSharedPointer<Desktop::CLayerFadeout>
+hkLayerFadeoutCreate(PHLLS layer, Hyprutils::Memory::CSharedPointer<Render::IFramebuffer> snapshot, float sourceAlpha) {
+    auto result = ((TLayerFadeoutCreate)g_pLayerFadeoutCreateHook->m_original)(layer, snapshot, sourceAlpha);
+
+    pruneFadeoutAnims();
+
+    if (!result || !layer) return result;
+
+    auto it = g_mLayerCloseAnims.find(layer->m_namespace);
+    if (it == g_mLayerCloseAnims.end() || it->second.path.empty()) return result;
+
+    tagFadeout(result.get(), it->second.path, it->second.duration, layer.get());
+
+    return result;
+}
+
+// --- V0.56 HOOK: Desktop::CWindowFadeout::done ---
+// Hyprland drops a fadeout as soon as its own fade-out animation finishes, which
+// can be well before the close shader is done. Holding `done` false keeps the
+// snapshot alive for exactly as long as the shader asked for.
+typedef bool (*TFadeoutDone)(void* thisptr);
+
+bool hkFadeoutDone(void* thisptr) {
+    const bool origDone = ((TFadeoutDone)g_pFadeoutDoneHook->m_original)(thisptr);
+    // Cast to the concrete type first so the compiler applies the correct
+    // derived-to-base offset — IFadeout has a virtual base.
+    return holdFadeoutOpen(static_cast<Desktop::CWindowFadeout*>(thisptr), origDone);
+}
+
+// --- V0.56 HOOK: Desktop::CLayerFadeout::done ---
+bool hkLayerFadeoutDone(void* thisptr) {
+    const bool origDone = ((TFadeoutDone)g_pLayerFadeoutDoneHook->m_original)(thisptr);
+    return holdFadeoutOpen(static_cast<Desktop::CLayerFadeout*>(thisptr), origDone);
 }
 
 void applyShaderRulesSafe(PHLWINDOW pWindow) {

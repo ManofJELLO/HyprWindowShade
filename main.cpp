@@ -14,12 +14,17 @@ std::map<std::string, std::string>                    g_mWindowClassShaderMap;
 std::map<std::string, CompiledShader>                 g_mCompiledCShaders;
 std::map<std::string, time_t>                         g_mFailedShaderMtimes;
 std::map<std::string, time_t>                         g_mDurationWarnedMtimes;
+std::map<std::string, AnimSpec>                       g_mLayerOpenAnims;
+std::map<std::string, AnimSpec>                       g_mLayerCloseAnims;
 std::unordered_map<Desktop::View::CWindow*, std::chrono::steady_clock::time_point> g_mWindowOpenTimes;
+std::unordered_map<Desktop::View::CLayerSurface*, std::chrono::steady_clock::time_point> g_mLayerOpenTimes;
 std::unordered_map<Desktop::IFadeout*, FadeoutAnim>   g_mFadeoutAnims;
-CFunctionHook*                                        g_pGLDrawTexHook     = nullptr;
-CFunctionHook*                                        g_pUseShaderHook     = nullptr;
-CFunctionHook*                                        g_pFadeoutCreateHook = nullptr;
-CFunctionHook*                                        g_pFadeoutDoneHook   = nullptr;
+CFunctionHook*                                        g_pGLDrawTexHook          = nullptr;
+CFunctionHook*                                        g_pUseShaderHook          = nullptr;
+CFunctionHook*                                        g_pFadeoutCreateHook      = nullptr;
+CFunctionHook*                                        g_pFadeoutDoneHook        = nullptr;
+CFunctionHook*                                        g_pLayerFadeoutCreateHook = nullptr;
+CFunctionHook*                                        g_pLayerFadeoutDoneHook   = nullptr;
 
 // Tracks the most recently activated window so togglewindowshader doesn't have
 // to linear-scan Desktop::windowState()->windows() asking isWindowActive on each.
@@ -71,6 +76,18 @@ namespace shadeActions {
     static void setLayerShader(const std::string& ns, const std::string& path) {
         if (path == "clear" || path == "none") g_mLayerNamespaceShaderMap.erase(ns);
         else                                   g_mLayerNamespaceShaderMap[ns] = path;
+    }
+
+    // Layer open/close animations. Same "clear"/"none" convention as the layer
+    // shader setters above; the path may carry an `@<sec>` duration override.
+    static void setLayerOpenAnim(const std::string& ns, const std::string& arg) {
+        if (arg == "clear" || arg == "none") g_mLayerOpenAnims.erase(ns);
+        else                                 g_mLayerOpenAnims[ns] = parseAnimSpec(arg);
+    }
+
+    static void setLayerCloseAnim(const std::string& ns, const std::string& arg) {
+        if (arg == "clear" || arg == "none") g_mLayerCloseAnims.erase(ns);
+        else                                 g_mLayerCloseAnims[ns] = parseAnimSpec(arg);
     }
 
     static void toggleLayerShader(const std::string& ns, const std::string& path) {
@@ -151,6 +168,14 @@ static int luaToggleClassShader(lua_State* L) {
     shadeActions::toggleClassShader(luaL_checkstring(L, 1), luaL_checkstring(L, 2));
     return 0;
 }
+static int luaLayerOpenAnim(lua_State* L) {
+    shadeActions::setLayerOpenAnim(luaL_checkstring(L, 1), luaL_checkstring(L, 2));
+    return 0;
+}
+static int luaLayerCloseAnim(lua_State* L) {
+    shadeActions::setLayerCloseAnim(luaL_checkstring(L, 1), luaL_checkstring(L, 2));
+    return 0;
+}
 static int luaReloadShaders(lua_State* L) {
     (void)L;
     shadeActions::reloadShaders();
@@ -199,24 +224,34 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     // --- V0.56 HOOK 3+4: close animations (optional) ---
     // Both live on Desktop::CWindowFadeout. If either is missing we simply don't
     // do close animations — everything else keeps working.
-    auto methodsCreate = HyprlandAPI::findFunctionsByName(PHANDLE, "create");
-    void* fadeoutCreateAddr = nullptr;
+    // findFunctionsByName is documented as slow, so both symbol lists are walked
+    // once and all four addresses picked out of them.
+    auto  methodsCreate         = HyprlandAPI::findFunctionsByName(PHANDLE, "create");
+    void* fadeoutCreateAddr     = nullptr;
+    void* layerFadeoutCreateAddr = nullptr;
     for (auto& m : methodsCreate) {
-        if (m.demangled.find("CWindowFadeout::create") != std::string::npos) {
+        if (!fadeoutCreateAddr && m.demangled.find("CWindowFadeout::create") != std::string::npos)
             fadeoutCreateAddr = m.address;
-            break;
-        }
+        else if (!layerFadeoutCreateAddr && m.demangled.find("CLayerFadeout::create") != std::string::npos)
+            layerFadeoutCreateAddr = m.address;
+
+        if (fadeoutCreateAddr && layerFadeoutCreateAddr) break;
     }
 
-    auto methodsDone = HyprlandAPI::findFunctionsByName(PHANDLE, "done");
-    void* fadeoutDoneAddr = nullptr;
+    auto  methodsDone         = HyprlandAPI::findFunctionsByName(PHANDLE, "done");
+    void* fadeoutDoneAddr     = nullptr;
+    void* layerFadeoutDoneAddr = nullptr;
     for (auto& m : methodsDone) {
-        if (m.demangled.find("CWindowFadeout::done") != std::string::npos) {
+        if (!fadeoutDoneAddr && m.demangled.find("CWindowFadeout::done") != std::string::npos)
             fadeoutDoneAddr = m.address;
-            break;
-        }
+        else if (!layerFadeoutDoneAddr && m.demangled.find("CLayerFadeout::done") != std::string::npos)
+            layerFadeoutDoneAddr = m.address;
+
+        if (fadeoutDoneAddr && layerFadeoutDoneAddr) break;
     }
 
+    // Window and layer close animations are installed independently, so one
+    // missing symbol doesn't take the other down with it.
     if (fadeoutCreateAddr && fadeoutDoneAddr) {
         g_pFadeoutCreateHook = HyprlandAPI::createFunctionHook(PHANDLE, fadeoutCreateAddr, (void*)&hkFadeoutCreate);
         g_pFadeoutDoneHook   = HyprlandAPI::createFunctionHook(PHANDLE, fadeoutDoneAddr,   (void*)&hkFadeoutDone);
@@ -224,6 +259,16 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         g_pFadeoutDoneHook->hook();
     } else {
         HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] CWindowFadeout hooks not found — shader_close: disabled.",
+                                     CHyprColor(1.0f, 0.7f, 0.2f, 1.0f), 8000.0f);
+    }
+
+    if (layerFadeoutCreateAddr && layerFadeoutDoneAddr) {
+        g_pLayerFadeoutCreateHook = HyprlandAPI::createFunctionHook(PHANDLE, layerFadeoutCreateAddr, (void*)&hkLayerFadeoutCreate);
+        g_pLayerFadeoutDoneHook   = HyprlandAPI::createFunctionHook(PHANDLE, layerFadeoutDoneAddr,   (void*)&hkLayerFadeoutDone);
+        g_pLayerFadeoutCreateHook->hook();
+        g_pLayerFadeoutDoneHook->hook();
+    } else {
+        HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] CLayerFadeout hooks not found — layercloseanim disabled.",
                                      CHyprColor(1.0f, 0.7f, 0.2f, 1.0f), 8000.0f);
     }
 
@@ -239,6 +284,20 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         if (!window) return;
         g_mWindowOpenTimes[window.get()] = std::chrono::steady_clock::now();
         g_pHyprRenderer->damageWindow(window);
+    }));
+
+    // Same for layer surfaces — bars, notifications, rofi/wofi. Layers have no
+    // destroy event on the bus, so `closed` doubles as the cleanup point.
+    g_Listeners.push_back(Event::bus()->m_events.layer.opened.listen([](PHLLS layer) {
+        if (!layer) return;
+        g_mLayerOpenTimes[layer.get()] = std::chrono::steady_clock::now();
+        if (auto mon = layer->m_monitor.lock())
+            mon->scheduleFrame();
+    }));
+
+    g_Listeners.push_back(Event::bus()->m_events.layer.closed.listen([](PHLLS layer) {
+        if (!layer) return;
+        g_mLayerOpenTimes.erase(layer.get());
     }));
 
     g_Listeners.push_back(Event::bus()->m_events.window.active.listen([](auto window, auto reason) {
@@ -303,6 +362,20 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         return SDispatchResult{};
     });
 
+    HyprlandAPI::addDispatcherV2(PHANDLE, "layeropenanim", [](std::string args) -> SDispatchResult {
+        std::string ns, path;
+        if (!splitTwo(args, ns, path)) return SDispatchResult{};
+        shadeActions::setLayerOpenAnim(ns, path);
+        return SDispatchResult{};
+    });
+
+    HyprlandAPI::addDispatcherV2(PHANDLE, "layercloseanim", [](std::string args) -> SDispatchResult {
+        std::string ns, path;
+        if (!splitTwo(args, ns, path)) return SDispatchResult{};
+        shadeActions::setLayerCloseAnim(ns, path);
+        return SDispatchResult{};
+    });
+
     HyprlandAPI::addDispatcherV2(PHANDLE, "reloadshaders", [](std::string) -> SDispatchResult {
         shadeActions::reloadShaders();
         return SDispatchResult{};
@@ -316,6 +389,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "togglewindowshader", &luaToggleWindowShader);
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "classshader",        &luaClassShader);
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "toggleclassshader",  &luaToggleClassShader);
+    HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "layeropenanim",      &luaLayerOpenAnim);
+    HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "layercloseanim",     &luaLayerCloseAnim);
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "reloadshaders",      &luaReloadShaders);
 
     return {"HyprWindowShade", "Native CShader Injection (v0.56)", "ManofJELLO", "1.5"};
@@ -330,7 +405,10 @@ APICALL EXPORT void PLUGIN_EXIT() {
     g_mWindowClassShaderMap.clear();
     g_mFailedShaderMtimes.clear();
     g_mDurationWarnedMtimes.clear();
+    g_mLayerOpenAnims.clear();
+    g_mLayerCloseAnims.clear();
     g_mWindowOpenTimes.clear();
+    g_mLayerOpenTimes.clear();
     // Any fadeout we were holding open falls back to Hyprland's own `done` as
     // soon as the hooks come off below.
     g_mFadeoutAnims.clear();
@@ -343,14 +421,18 @@ APICALL EXPORT void PLUGIN_EXIT() {
 
     if (g_pGLDrawTexHook)      HyprlandAPI::removeFunctionHook(PHANDLE, g_pGLDrawTexHook);
     if (g_pUseShaderHook)      HyprlandAPI::removeFunctionHook(PHANDLE, g_pUseShaderHook);
-    if (g_pFadeoutCreateHook)  HyprlandAPI::removeFunctionHook(PHANDLE, g_pFadeoutCreateHook);
-    if (g_pFadeoutDoneHook)    HyprlandAPI::removeFunctionHook(PHANDLE, g_pFadeoutDoneHook);
+    if (g_pFadeoutCreateHook)      HyprlandAPI::removeFunctionHook(PHANDLE, g_pFadeoutCreateHook);
+    if (g_pFadeoutDoneHook)        HyprlandAPI::removeFunctionHook(PHANDLE, g_pFadeoutDoneHook);
+    if (g_pLayerFadeoutCreateHook) HyprlandAPI::removeFunctionHook(PHANDLE, g_pLayerFadeoutCreateHook);
+    if (g_pLayerFadeoutDoneHook)   HyprlandAPI::removeFunctionHook(PHANDLE, g_pLayerFadeoutDoneHook);
 
     HyprlandAPI::removeDispatcher(PHANDLE, "layershader");
     HyprlandAPI::removeDispatcher(PHANDLE, "togglelayershader");
     HyprlandAPI::removeDispatcher(PHANDLE, "togglewindowshader");
     HyprlandAPI::removeDispatcher(PHANDLE, "classshader");
     HyprlandAPI::removeDispatcher(PHANDLE, "toggleclassshader");
+    HyprlandAPI::removeDispatcher(PHANDLE, "layeropenanim");
+    HyprlandAPI::removeDispatcher(PHANDLE, "layercloseanim");
     HyprlandAPI::removeDispatcher(PHANDLE, "reloadshaders");
 
     HyprlandAPI::removeLuaFunction(PHANDLE, "HyprWindowShade", "layershader");
@@ -358,5 +440,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
     HyprlandAPI::removeLuaFunction(PHANDLE, "HyprWindowShade", "togglewindowshader");
     HyprlandAPI::removeLuaFunction(PHANDLE, "HyprWindowShade", "classshader");
     HyprlandAPI::removeLuaFunction(PHANDLE, "HyprWindowShade", "toggleclassshader");
+    HyprlandAPI::removeLuaFunction(PHANDLE, "HyprWindowShade", "layeropenanim");
+    HyprlandAPI::removeLuaFunction(PHANDLE, "HyprWindowShade", "layercloseanim");
     HyprlandAPI::removeLuaFunction(PHANDLE, "HyprWindowShade", "reloadshaders");
 }

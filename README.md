@@ -110,6 +110,8 @@ All dispatchers are registered via `HyprlandAPI::addDispatcherV2` and can also b
 | `togglewindowshader` | `<path>` | Toggle a shader on the currently focused window only. Pass `clear`/`none` to remove. |
 | `layershader` | `<layer-namespace> <path\|clear\|none>` | Force a shader on a layer namespace (e.g. `rofi`, `mpvpaper`). |
 | `togglelayershader` | `<layer-namespace> <path>` | Toggle a layer shader on/off. |
+| `layeropenanim` | `<layer-namespace> <path[@sec]\|clear\|none>` | One-shot animation when a layer of that namespace appears. |
+| `layercloseanim` | `<layer-namespace> <path[@sec]\|clear\|none>` | One-shot animation as a layer of that namespace goes away. |
 | `reloadshaders` | — | Drop the compiled shader cache and re-read every `.glsl` from disk. Shows a green toast on success. Usually not needed — see the troubleshooting note about auto-reload. |
 
 > **Args with whitespace.** The first argument supports double-quoting, so a class name with a space works: `hyprctl dispatch classshader "Some Class" /path/to.glsl`. (Lua callers don't need this — each argument is its own string.)
@@ -131,6 +133,8 @@ Each one matches the dispatcher of the same name, but takes proper Lua arguments
 | `hl.plugin.HyprWindowShade.togglewindowshader(path)` | string; or `"clear"`/`"none"` | Toggle a shader on the currently focused window. |
 | `hl.plugin.HyprWindowShade.layershader(ns, path)` | strings; `path` can be `"clear"`/`"none"` | Force a shader on a layer namespace. |
 | `hl.plugin.HyprWindowShade.togglelayershader(ns, path)` | strings | Toggle a layer shader on/off. |
+| `hl.plugin.HyprWindowShade.layeropenanim(ns, path)` | strings; `path` may carry `@sec`, or be `"clear"`/`"none"` | One-shot animation when a layer of that namespace appears. |
+| `hl.plugin.HyprWindowShade.layercloseanim(ns, path)` | strings; `path` may carry `@sec`, or be `"clear"`/`"none"` | One-shot animation as a layer of that namespace goes away. |
 | `hl.plugin.HyprWindowShade.reloadshaders()` | — | Drop the compiled shader cache and re-read every `.glsl` from disk. |
 
 ### Calling from your binds
@@ -275,6 +279,32 @@ void main() {
 Use the same shape for a close shader, but end at **fully transparent** when
 `progress` reaches 1.0 — see the note below.
 
+### Layer surfaces (rofi/wofi, notifications, bars)
+
+Layer surfaces have no rule tags in Hyprland 0.56, so their animations are configured by
+**namespace** like the rest of the layer API rather than by a `windowrule` tag:
+
+```
+# .conf
+exec-once = hyprctl dispatch layeropenanim  rofi /path/to/open.glsl
+exec-once = hyprctl dispatch layercloseanim rofi /path/to/close.glsl
+```
+
+```lua
+-- Lua config
+hl.plugin.HyprWindowShade.layeropenanim("rofi",  shaders.openRise)
+hl.plugin.HyprWindowShade.layercloseanim("rofi", shaders.closeDissolve)
+```
+
+Pass `"clear"` or `"none"` as the path to remove one. The `@sec` duration override works
+here too (`/path/to/open.glsl@0.2`), with the same precedence as window rules.
+
+Find a namespace with `hyprctl layers`. Common ones: `rofi`, `wofi`, `notifications` (or
+`mako` / `swaync`), `waybar`, `hyprlock`.
+
+Everything else behaves exactly as it does for windows — same `progress` and `seed`
+uniforms, same `// @duration`, same snapshot-based close path.
+
 ### How close animations work
 
 There's an obvious-looking way to do this that doesn't work well: intercept the close
@@ -286,7 +316,8 @@ X button or by `killactive`, and strands the window on screen if the app answers
 Instead, close animations ride Hyprland's own fadeout. When a window closes, Hyprland
 snapshots it into a framebuffer and renders that snapshot for the duration of the fadeout
 animation. The plugin tags that snapshot with the window's `shader_close:` shader and
-shades it on the way out. So:
+shades it on the way out. Layer surfaces close through the identical mechanism
+(`CLayerFadeout` mirrors `CWindowFadeout`), so both share this path. So:
 
 - The close request is never delayed — window close semantics are completely unchanged.
 - **Every** close path animates: keybind, X button, `killactive`, the app quitting itself.
