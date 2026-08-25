@@ -189,11 +189,20 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     // --- V0.56 HOOK 1: CGLElementRenderer::draw(CTexPassElement, CRegion) ---
     // The concrete, exported method that draws every textured surface element.
+    // Hyprland's findFunctionsByName matches the MANGLED `nm -D -j` dump but fills
+    // SFunctionMatch::demangled by line index into a second, demangled dump — and its
+    // `if (!address) continue;` skips the lineNo++. Every match whose dlsym() fails
+    // (any `sym@VERSION` import, which dlsym never resolves) therefore shifts the
+    // demangled field of all later matches out of alignment. Searching "create" hits
+    // timerfd_create@GLIBC_2.8 and libinput_config_accel_create@LIBINPUT_1.23, so
+    // demangled lands 2 symbols early and every fadeout lookup silently missed.
+    // Match on m.signature — the raw mangled line that matched — which is always right.
+    // The digits are Itanium ABI name lengths (13CLayerFadeout, 14CWindowFadeout...).
     auto methodsDraw = HyprlandAPI::findFunctionsByName(PHANDLE, "draw");
     void* drawAddr = nullptr;
     for (auto& m : methodsDraw) {
-        if (m.demangled.find("CGLElementRenderer::draw")  != std::string::npos &&
-            m.demangled.find("CTexPassElement")           != std::string::npos) {
+        if (m.signature.find("18CGLElementRenderer4draw") != std::string::npos &&
+            m.signature.find("15CTexPassElement")         != std::string::npos) {
             drawAddr = m.address;
             break;
         }
@@ -209,7 +218,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     auto methodsUse = HyprlandAPI::findFunctionsByName(PHANDLE, "useShader");
     void* useAddr = nullptr;
     for (auto& m : methodsUse) {
-        if (m.demangled.find("CHyprOpenGLImpl::useShader") != std::string::npos) {
+        if (m.signature.find("15CHyprOpenGLImpl9useShader") != std::string::npos) {
             useAddr = m.address;
             break;
         }
@@ -230,9 +239,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     void* fadeoutCreateAddr     = nullptr;
     void* layerFadeoutCreateAddr = nullptr;
     for (auto& m : methodsCreate) {
-        if (!fadeoutCreateAddr && m.demangled.find("CWindowFadeout::create") != std::string::npos)
+        if (!fadeoutCreateAddr && m.signature.find("14CWindowFadeout6create") != std::string::npos)
             fadeoutCreateAddr = m.address;
-        else if (!layerFadeoutCreateAddr && m.demangled.find("CLayerFadeout::create") != std::string::npos)
+        else if (!layerFadeoutCreateAddr && m.signature.find("13CLayerFadeout6create") != std::string::npos)
             layerFadeoutCreateAddr = m.address;
 
         if (fadeoutCreateAddr && layerFadeoutCreateAddr) break;
@@ -242,9 +251,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     void* fadeoutDoneAddr     = nullptr;
     void* layerFadeoutDoneAddr = nullptr;
     for (auto& m : methodsDone) {
-        if (!fadeoutDoneAddr && m.demangled.find("CWindowFadeout::done") != std::string::npos)
+        if (!fadeoutDoneAddr && m.signature.find("14CWindowFadeout4done") != std::string::npos)
             fadeoutDoneAddr = m.address;
-        else if (!layerFadeoutDoneAddr && m.demangled.find("CLayerFadeout::done") != std::string::npos)
+        else if (!layerFadeoutDoneAddr && m.signature.find("13CLayerFadeout4done") != std::string::npos)
             layerFadeoutDoneAddr = m.address;
 
         if (fadeoutDoneAddr && layerFadeoutDoneAddr) break;
