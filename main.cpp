@@ -309,6 +309,13 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         g_mLayerOpenTimes.erase(layer.get());
     }));
 
+    // Seed the cache from the current focus: window.active only fires on a
+    // CHANGE of focus, so without this a plugin loaded mid-session (i.e. every
+    // build.sh run) leaves g_lastActiveWindow empty and togglewindowshader
+    // silently does nothing until the user focuses something else.
+    if (Desktop::focusState())
+        g_lastActiveWindow = Desktop::focusState()->window();
+
     g_Listeners.push_back(Event::bus()->m_events.window.active.listen([](auto window, auto reason) {
         // Only the previously- and currently-active windows can change appearance.
         if (auto prev = g_lastActiveWindow.lock(); prev && g_mWindowRuleShaders.find(prev.get()) != g_mWindowRuleShaders.end())
@@ -337,50 +344,62 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     // --- DISPATCHERS (.conf-style — Hyprland's native bind path) ---
 
+    // A dispatcher that can't parse its arguments has to say so: SDispatchResult
+    // defaults to success = true, so returning a bare {} made `hyprctl dispatch
+    // layershader rofi` print "ok" while doing nothing at all.
+
     HyprlandAPI::addDispatcherV2(PHANDLE, "layershader", [](std::string args) -> SDispatchResult {
         std::string ns, path;
-        if (!splitTwo(args, ns, path)) return SDispatchResult{};
+        if (!splitTwo(args, ns, path))
+            return SDispatchResult{.success = false, .error = "usage: layershader <namespace> <path|clear|none>"};
         shadeActions::setLayerShader(ns, path);
         return SDispatchResult{};
     });
 
     HyprlandAPI::addDispatcherV2(PHANDLE, "togglelayershader", [](std::string args) -> SDispatchResult {
         std::string ns, path;
-        if (!splitTwo(args, ns, path)) return SDispatchResult{};
+        if (!splitTwo(args, ns, path))
+            return SDispatchResult{.success = false, .error = "usage: togglelayershader <namespace> <path>"};
         shadeActions::toggleLayerShader(ns, path);
         return SDispatchResult{};
     });
 
     HyprlandAPI::addDispatcherV2(PHANDLE, "togglewindowshader", [](std::string path) -> SDispatchResult {
         trimInPlace(path);
+        if (path.empty())
+            return SDispatchResult{.success = false, .error = "usage: togglewindowshader <path|clear|none>"};
         shadeActions::toggleWindowShader(path);
         return SDispatchResult{};
     });
 
     HyprlandAPI::addDispatcherV2(PHANDLE, "classshader", [](std::string args) -> SDispatchResult {
         std::string cls, path;
-        if (!splitTwo(args, cls, path)) return SDispatchResult{};
+        if (!splitTwo(args, cls, path))
+            return SDispatchResult{.success = false, .error = "usage: classshader <class> <path|clear|none>"};
         shadeActions::setClassShader(cls, path);
         return SDispatchResult{};
     });
 
     HyprlandAPI::addDispatcherV2(PHANDLE, "toggleclassshader", [](std::string args) -> SDispatchResult {
         std::string cls, path;
-        if (!splitTwo(args, cls, path)) return SDispatchResult{};
+        if (!splitTwo(args, cls, path))
+            return SDispatchResult{.success = false, .error = "usage: toggleclassshader <class> <path>"};
         shadeActions::toggleClassShader(cls, path);
         return SDispatchResult{};
     });
 
     HyprlandAPI::addDispatcherV2(PHANDLE, "layeropenanim", [](std::string args) -> SDispatchResult {
         std::string ns, path;
-        if (!splitTwo(args, ns, path)) return SDispatchResult{};
+        if (!splitTwo(args, ns, path))
+            return SDispatchResult{.success = false, .error = "usage: layeropenanim <namespace> <path[@sec]|clear|none>"};
         shadeActions::setLayerOpenAnim(ns, path);
         return SDispatchResult{};
     });
 
     HyprlandAPI::addDispatcherV2(PHANDLE, "layercloseanim", [](std::string args) -> SDispatchResult {
         std::string ns, path;
-        if (!splitTwo(args, ns, path)) return SDispatchResult{};
+        if (!splitTwo(args, ns, path))
+            return SDispatchResult{.success = false, .error = "usage: layercloseanim <namespace> <path[@sec]|clear|none>"};
         shadeActions::setLayerCloseAnim(ns, path);
         return SDispatchResult{};
     });

@@ -1,4 +1,5 @@
 #include "Globals.hpp"
+#include <algorithm>
 #include <regex>
 
 // Returns the file's mtime, or 0 if the file can't be stat()ed. The 0-sentinel
@@ -25,14 +26,18 @@ static const std::regex MAIN_RE(R"(\bvoid\s+main\s*\(\s*(?:void\s*)?\))");
 // number on the CPU side to know when the animation is over.
 static const std::regex DURATION_RE(R"(//[ \t]*@duration[ \t]+([0-9]*\.?[0-9]+))");
 
-// Reads the `// @duration` directive out of shader source. Returns <0 if absent
-// or out of range, meaning "caller picks".
+// Reads the `// @duration` directive out of shader source. Returns <0 only when
+// the directive is absent or unparseable, meaning "caller picks". An over-long
+// duration is CLAMPED to MAX_ANIM_DURATION rather than discarded: discarding it
+// looked identical to "no directive at all", so a shader declaring `@duration 8`
+// got the 0.3s default *and* a toast telling it to declare a duration it had
+// already declared.
 static float parseDeclaredDuration(const std::string& src) {
     std::smatch m;
     if (!std::regex_search(src, m, DURATION_RE)) return -1.0f;
     try {
         const float d = std::stof(m[1].str());
-        if (d > 0.0f && d <= MAX_ANIM_DURATION) return d;
+        if (d > 0.0f) return std::min(d, MAX_ANIM_DURATION);
     } catch (...) {}
     return -1.0f;
 }
@@ -82,8 +87,14 @@ CompiledShader* getOrCompileShader(const std::string& shaderPath) {
     // hasn't changed, so retrying would just fail identically — return nullptr
     // silently. Once the user saves a fix the mtime advances and we fall
     // through to recompile.
+    //
+    // mtime 0 (stat failed / file missing) is a value like any other here, so a
+    // path that doesn't exist stays suppressed. Guarding this on `currentMtime
+    // != 0` meant the missing-file entry cached below was erased on every
+    // lookup, costing a stat() + open() per textured surface per frame for as
+    // long as a rule pointed at a typo.
     if (auto fit = g_mFailedShaderMtimes.find(shaderPath); fit != g_mFailedShaderMtimes.end()) {
-        if (currentMtime != 0 && fit->second == currentMtime)
+        if (fit->second == currentMtime)
             return nullptr;
         g_mFailedShaderMtimes.erase(fit);
     }

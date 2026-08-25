@@ -238,7 +238,7 @@ window rule, so the shader says it directly:
 Put that anywhere in the file. It's a comment, not GLSL — GLSL ES forbids initializers on
 uniforms, so there's no in-language way to declare a value the plugin can read *before*
 the shader ever runs, and the plugin needs it on the CPU side to know when the animation
-is over. Range is `0` to `5.0` seconds; if it's absent the plugin uses **0.3s**.
+is over. If it's absent the plugin uses **0.3s**.
 
 A window rule can override it for a one-off, with an `@<seconds>` suffix:
 
@@ -247,6 +247,12 @@ windowrule = match:class kitty, tag +shader_open:/path/dissolve.glsl@0.6
 ```
 
 Precedence is **rule `@sec` → shader `// @duration` → 0.3s default**.
+
+Durations are capped at **5 seconds**, and anything longer is clamped to it rather than
+rejected — `@10` gives you a 5s animation, not the 0.3s default. The cap applies to both
+sources, so it's the ceiling for `// @duration` and for `@sec` on a rule or a layer
+dispatcher alike. It exists so a typo — `30` for `3` — can't leave a closing window's
+snapshot sitting on screen for half a minute.
 
 If a shader declares the `progress` uniform but no `// @duration`, the plugin falls back
 to 0.3s *and* toasts once to tell you — a shader written as an animation that never says

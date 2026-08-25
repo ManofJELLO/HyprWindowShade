@@ -8,7 +8,6 @@
 // live-reload; rendering is main-thread-only, so TLS bought nothing here.
 PHLWINDOWREF        g_pCurrentRenderWindow;
 PHLLSREF            g_pCurrentRenderLayer;
-const std::string*  g_pCurrentShaderPath     = nullptr;
 CompiledShader*     g_pCurrentCompiledShader = nullptr;
 float               g_pCurrentAnimProgress   = -1.0f;
 float               g_pCurrentAnimSeed       = -1.0f;
@@ -85,8 +84,10 @@ AnimSpec parseAnimSpec(const std::string& arg) {
     if (const size_t at = arg.rfind('@'); at != std::string::npos) {
         try {
             const float d = std::stof(arg.substr(at + 1));
-            if (d > 0.0f && d <= MAX_ANIM_DURATION) {
-                spec.duration = d;
+            // Clamped, not rejected: `@10` means "as long as you'll allow", and
+            // silently falling back to 0.3s is the least useful reading of it.
+            if (d > 0.0f) {
+                spec.duration = std::min(d, MAX_ANIM_DURATION);
                 spec.path     = arg.substr(0, at);
             }
         } catch (...) {}
@@ -305,13 +306,12 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
 
     const bool animActive = pathToUse != nullptr;
 
-    // Resolve the path once and stash it. Then do a single lookup-or-compile
-    // on g_mCompiledCShaders and stash the resulting pointer for hkUseShader
-    // to consume — saves the second find that used to happen down there.
+    // Resolve the path once, then do a single lookup-or-compile on
+    // g_mCompiledCShaders and stash the resulting pointer for hkUseShader to
+    // consume — saves the second find that used to happen down there.
     if (!animActive)
         pathToUse = resolveShaderPath(pWindow, pLS);
 
-    g_pCurrentShaderPath     = pathToUse;
     g_pCurrentCompiledShader = pathToUse && !pathToUse->empty()
                                    ? getOrCompileShader(*pathToUse)
                                    : nullptr;
@@ -333,7 +333,6 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
 
     g_pCurrentRenderWindow.reset();
     g_pCurrentRenderLayer.reset();
-    g_pCurrentShaderPath     = nullptr;
     g_pCurrentCompiledShader = nullptr;
     g_pCurrentAnimProgress   = -1.0f;
     g_pCurrentAnimSeed       = -1.0f;
@@ -554,7 +553,7 @@ void applyShaderRulesSafe(PHLWINDOW pWindow) {
         // Animation rules additionally accept an optional `@<seconds>` suffix to
         // override the duration the shader declares. rfind, so a path that
         // happens to contain '@' still works; and the suffix is only stripped if
-        // it actually parsed as a number.
+        // it actually parsed as a positive number (clamped to MAX_ANIM_DURATION).
         const auto assignAnim = [&](std::string& dst, float& dur, size_t prefixLen) {
             std::string_view rest = sv.substr(prefixLen);
             dur                   = -1.0f;
@@ -562,8 +561,9 @@ void applyShaderRulesSafe(PHLWINDOW pWindow) {
             if (const size_t at = rest.rfind('@'); at != std::string_view::npos) {
                 try {
                     const float d = std::stof(std::string(rest.substr(at + 1)));
-                    if (d > 0.0f && d <= MAX_ANIM_DURATION) {
-                        dur  = d;
+                    // Clamped rather than rejected — see parseAnimSpec.
+                    if (d > 0.0f) {
+                        dur  = std::min(d, MAX_ANIM_DURATION);
                         rest = rest.substr(0, at);
                     }
                 } catch (...) {}

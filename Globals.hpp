@@ -174,8 +174,6 @@ extern CFunctionHook* g_pLayerFadeoutDoneHook;
 // --- ACTIVE RENDER CONTEXT ---
 // Set by hkGLDrawTex before delegating; consumed by hkUseShader during the call.
 // Weak refs avoid lifetime hazards if Hyprland tears down a surface mid-call.
-// g_pCurrentShaderPath points into one of the maps above; valid only until the
-// hook returns (maps aren't mutated within a single draw chain).
 //
 // Deliberately NOT thread_local: rendering is main-thread-only (the shader maps
 // above are plain globals accessed from these same hooks with no locking), and a
@@ -186,7 +184,6 @@ extern CFunctionHook* g_pLayerFadeoutDoneHook;
 // code. Keep these plain globals or live-reload breaks. See build.sh.
 extern PHLWINDOWREF        g_pCurrentRenderWindow;
 extern PHLLSREF            g_pCurrentRenderLayer;
-extern const std::string*  g_pCurrentShaderPath;
 // Cached compiled-shader pointer for the current draw. Set by hkGLDrawTex (one
 // resolve+compile lookup per surface), consumed by hkUseShader so it can apply
 // the shader and push uniforms without doing a second find on g_mCompiledCShaders.
