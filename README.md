@@ -1,12 +1,52 @@
 # HyprWindowShade
 
-A Hyprland plugin that applies fragment shaders to individual windows (or layers) based on `hyprland.conf` window rules. Shaders are HyprShade-compatible — if it works in HyprShade, it should work here.
-
-You can also use a `time` uniform for glitch-style animated effects.
-
-> **`.lua` config users:** Plugin dispatchers aren't surfaced to the Lua config layer on Hyprland 0.55+, so the plugin also exposes every action as a Lua function under `hl.plugin.HyprWindowShade.*`. See [Lua config](#lua-config) below for usage.
+A Hyprland plugin that applies fragment shaders to individual windows (or layers) based on `hyprland.conf` window rules. Shaders are HyprShade-compatible — if it works in HyprShade, it should work here. A `time` uniform is available for glitch-style animated effects, and windows and layers can play one-shot shaders as they open and close.
 
 > This has not been stress-tested. It may break when Hyprland updates or simply not work on your system. Only tested on AMD graphics on Arch. Good luck, have fun, don't say I didn't warn ya.
+
+---
+
+## Contents
+
+- [Quick start](#quick-start)
+- [Requirements](#requirements) · [Install](#install)
+- [Window shaders](#window-shaders)
+- [Layer shaders](#layer-shaders)
+- [Open and close animations](#open-and-close-animations)
+- [Writing a shader](#writing-a-shader)
+- [Reference](#reference) — [dispatchers](#dispatchers) · [Lua config](#lua-config) · [shader uniforms](#shader-uniforms)
+- [How close animations work](#how-close-animations-work)
+- [Troubleshooting](#troubleshooting)
+- [Extending the plugin](#extending-the-plugin)
+
+---
+
+## Quick start
+
+Save this as `~/.config/hypr/shaders/dim.glsl`:
+
+```glsl
+#version 320 es
+precision highp float;
+
+in vec2 v_texcoord;
+out vec4 fragColor;
+uniform sampler2D tex;
+uniform float is_active;
+
+void main() {
+    fragColor = texture(tex, v_texcoord);
+    fragColor.rgb *= mix(0.6, 1.0, is_active);   // dim while unfocused
+}
+```
+
+Build and load the plugin ([Install](#install)), then add one rule to `hyprland.conf`:
+
+```
+windowrule = match:class kitty, tag +shader:/home/USERNAME/.config/hypr/shaders/dim.glsl
+```
+
+Reload the config. Every kitty window is now dimmed while unfocused and full brightness while focused. Edit `dim.glsl` and save — the change takes effect on the next frame, no reload needed.
 
 ---
 
@@ -15,7 +55,6 @@ You can also use a `time` uniform for glitch-style animated effects.
 - **Hyprland 0.56** (the plugin is built against this version's internal API).
 - Either a `.conf` config (use dispatchers) or a `.lua` config (use the `hl.plugin.HyprWindowShade.*` functions — see [Lua config](#lua-config)).
 - **GLSL ES 3.20** fragment shaders. The plugin uses Hyprland's `TEXVERTSRC320` vertex shader, so your fragment shader should start with `#version 320 es` and declare `in vec2 v_texcoord;`, `out vec4 fragColor;`, and `uniform sampler2D tex;` (same interface HyprShade uses).
-- Tested on AMD graphics, Arch Linux. Other setups may work but are unverified.
 
 ---
 
@@ -51,15 +90,17 @@ Apply a shader to a window via a `tag` on a `windowrule`. Eight tags are support
 | `+shader_open:/path.glsl` | Plays once when the window opens, then reverts to the window's normal shader |
 | `+shader_close:/path.glsl` | Plays once as the window closes |
 
-> **Priority:** floating rules take precedence over active rules. If a window has both, the floating shader wins while the window is floating. An open or close animation outranks all of them while it's running.
+If a window carries both a floating rule and an active rule, the floating shader wins while the window is floating.
 
-### Example
+### Example rule
 
 ```
 windowrule = match:class kitty, tag +shader:/home/USERNAME/.config/hypr/shaders/reading_mode.glsl
 ```
 
 ### Keybind examples
+
+These call the plugin's [dispatchers](#dispatchers) — full argument list in the reference.
 
 ```
 # Toggle a shader on every window matching a class
@@ -81,7 +122,7 @@ bind = $mainMod, R, reloadshaders
 
 ## Layer shaders
 
-Layers have a limited rule set, so layer shaders are controlled via dispatchers and `exec-once` rather than `layerrule`. For something like `rofi`, an `exec-once` at startup will re-apply the shader every time the layer appears.
+Layers have a limited rule set, so layer shaders are controlled via [dispatchers](#dispatchers) and `exec-once` rather than `layerrule`. For something like `rofi`, an `exec-once` at startup will re-apply the shader every time the layer appears.
 
 ```
 # Apply at startup
@@ -99,70 +140,95 @@ bind = $mainMod SHIFT, B, layershader, mpvpaper clear
 
 ---
 
-## Dispatchers reference
+## Open and close animations
 
-All dispatchers are registered via `HyprlandAPI::addDispatcherV2` and can also be invoked from a shell with `hyprctl dispatch <name> <args>`.
+A shader tagged with `+shader_open:` or `+shader_close:` runs **once**, driven by the
+[`progress`](#shader-uniforms) uniform rather than looping on `time`. While it runs it
+outranks every other shader rule on that window; when it finishes the window reverts to
+its normal shader.
 
-| Dispatcher | Arguments | Effect |
+### The shader declares its own duration
+
+How long the effect should run is a property of the effect, not of the keybind or the
+window rule, so the shader says it directly — but a rule can override it for a one-off.
+Three sources, highest priority first:
+
+| Source | Syntax | Where it goes |
 |---|---|---|
-| `classshader` | `<class> <path\|clear\|none>` | Force a shader on every window matching the class. `clear`/`none` removes it. |
-| `toggleclassshader` | `<class> <path>` | Toggle the class shader on/off. |
-| `togglewindowshader` | `<path>` | Toggle a shader on the currently focused window only. Pass `clear`/`none` to remove. |
-| `layershader` | `<layer-namespace> <path\|clear\|none>` | Force a shader on a layer namespace (e.g. `rofi`, `mpvpaper`). |
-| `togglelayershader` | `<layer-namespace> <path>` | Toggle a layer shader on/off. |
-| `layeropenanim` | `<layer-namespace> <path[@sec]\|clear\|none>` | One-shot animation when a layer of that namespace appears. |
-| `layercloseanim` | `<layer-namespace> <path[@sec]\|clear\|none>` | One-shot animation as a layer of that namespace goes away. |
-| `reloadshaders` | — | Drop the compiled shader cache and re-read every `.glsl` from disk. Shows a green toast on success. Usually not needed — see the troubleshooting note about auto-reload. |
+| Rule / dispatcher `@sec` | `…/dissolve.glsl@0.6` | Appended to the path in a `windowrule` tag, or in `layeropenanim` / `layercloseanim`. |
+| Shader `// @duration` | `// @duration 0.35` | Anywhere in the `.glsl` file. The effect's own natural length. |
+| Built-in default | — | **0.3s**, used when neither of the above says anything. |
 
-> **Args with whitespace.** The first argument supports double-quoting, so a class name with a space works: `hyprctl dispatch classshader "Some Class" /path/to.glsl`. (Lua callers don't need this — each argument is its own string.)
-
----
-
-## Lua config
-
-Hyprland 0.55+ doesn't surface plugin dispatchers to `.lua` configs, so the plugin also registers each action as a Lua function under `hl.plugin.HyprWindowShade.*`. Bind them by wrapping the call in a `function() ... end` (per vaxry's guidance for plugin actions on the Lua config path).
-
-### Functions
-
-Each one matches the dispatcher of the same name, but takes proper Lua arguments instead of a single space-separated string:
-
-| Function | Arguments | Effect |
-|---|---|---|
-| `hl.plugin.HyprWindowShade.classshader(class, path)` | strings; `path` can be `"clear"`/`"none"` | Force a shader on every window matching `class`. |
-| `hl.plugin.HyprWindowShade.toggleclassshader(class, path)` | strings | Toggle the class shader on/off. |
-| `hl.plugin.HyprWindowShade.togglewindowshader(path)` | string; or `"clear"`/`"none"` | Toggle a shader on the currently focused window. |
-| `hl.plugin.HyprWindowShade.layershader(ns, path)` | strings; `path` can be `"clear"`/`"none"` | Force a shader on a layer namespace. |
-| `hl.plugin.HyprWindowShade.togglelayershader(ns, path)` | strings | Toggle a layer shader on/off. |
-| `hl.plugin.HyprWindowShade.layeropenanim(ns, path)` | strings; `path` may carry `@sec`, or be `"clear"`/`"none"` | One-shot animation when a layer of that namespace appears. |
-| `hl.plugin.HyprWindowShade.layercloseanim(ns, path)` | strings; `path` may carry `@sec`, or be `"clear"`/`"none"` | One-shot animation as a layer of that namespace goes away. |
-| `hl.plugin.HyprWindowShade.reloadshaders()` | — | Drop the compiled shader cache and re-read every `.glsl` from disk. |
-
-### Calling from your binds
-
-Plugin actions can't be referenced by name in a Lua bind — wrap them in a closure, which is the pattern vaxry recommends for any plugin function on the Lua config path:
-
-```lua
--- Toggle a shader on the focused window
-function() hl.plugin.HyprWindowShade.togglewindowshader("/home/USERNAME/.config/hypr/shaders/pixelate.glsl") end
-
--- Toggle a shader on every window of a class
-function() hl.plugin.HyprWindowShade.toggleclassshader("google-chrome", "/home/USERNAME/.config/hypr/shaders/reading_mode.glsl") end
-
--- Reload all shader sources after editing a .glsl
-function() hl.plugin.HyprWindowShade.reloadshaders() end
+```
+windowrule = match:class kitty, tag +shader_open:/path/dissolve.glsl@0.6
 ```
 
-Drop those closures into whatever bind helper your Lua config uses — the closure body is the only plugin-specific piece. You can also call the functions directly at config-load time (no closure), e.g. to apply a startup layer shader:
+Both `@sec` and `// @duration` are capped at **5 seconds**, and anything longer is
+clamped rather than rejected — `@10` gives you a 5s animation, not the 0.3s default. The
+cap is there so a typo — `30` for `3` — can't leave a closing window's snapshot sitting on
+screen for half a minute.
 
-```lua
-hl.plugin.HyprWindowShade.layershader("mpvpaper", "/home/USERNAME/.config/hypr/shaders/pixelate.glsl")
+`// @duration` is a comment rather than a real GLSL construct on purpose: GLSL ES forbids
+initializers on uniforms, so there's no in-language way to declare a value the plugin can
+read *before* the shader ever runs, and it needs the number on the CPU side to know when
+the animation is over.
+
+If a shader declares the `progress` uniform but no `// @duration`, the plugin falls back
+to 0.3s *and* toasts once to tell you — a shader written as an animation that never says
+how long it should run is almost always an oversight. Like compile errors, the warning is
+keyed to the file's mtime: one notification per edit, not one per frame, and it clears
+itself as soon as you save a fix. Shaders that don't use `progress` never warn, and an
+explicit `@sec` on the rule suppresses it too, since that's unambiguous.
+
+### Example: dissolve on open
+
+```glsl
+#version 320 es
+precision highp float;
+// @duration 0.4
+
+in  vec2 v_texcoord;
+out vec4 fragColor;
+uniform sampler2D tex;
+uniform float progress;   // 0 -> 1 over the animation
+uniform float seed;       // differs per window
+
+void main() {
+    // Dissolve in from noise, scaled so each window breaks up differently.
+    float n = fract(sin(dot(v_texcoord + seed, vec2(12.9898, 78.233))) * 43758.5453);
+    fragColor = texture(tex, v_texcoord);
+    fragColor *= step(n, progress);
+}
 ```
 
-### Tips and notes
+Use the same shape for a close shader, but end at **fully transparent** when
+`progress` reaches 1.0 — see [How close animations work](#how-close-animations-work).
 
-- Functions appear under `hl.plugin.HyprWindowShade.*` only after the plugin is loaded. If `hyprctl plugin load ...` runs in your config, make sure it happens before any code that calls these functions.
-- The functions take the same `"clear"` / `"none"` sentinels that the dispatchers do for removing a shader.
-- `.conf`-style dispatchers are still registered too — you can mix them with the Lua functions if you have both kinds of configs, though there's no reason to in a Lua-only setup.
+### Layer surfaces (rofi/wofi, notifications, bars)
+
+Layer surfaces have no rule tags in Hyprland 0.56, so their animations are configured by
+**namespace** like the rest of the layer API rather than by a `windowrule` tag:
+
+```
+# .conf
+exec-once = hyprctl dispatch layeropenanim  rofi /path/to/open.glsl
+exec-once = hyprctl dispatch layercloseanim rofi /path/to/close.glsl
+```
+
+```lua
+-- Lua config
+hl.plugin.HyprWindowShade.layeropenanim("rofi",  shaders.openRise)
+hl.plugin.HyprWindowShade.layercloseanim("rofi", shaders.closeDissolve)
+```
+
+Pass `"clear"` or `"none"` as the path to remove one. The `@sec` duration override works
+here too (`/path/to/open.glsl@0.2`), with the same precedence as window rules.
+
+Find a namespace with `hyprctl layers`. Common ones: `rofi`, `wofi`, `notifications` (or
+`mako` / `swaync`), `waybar`, `hyprlock`.
+
+Everything else behaves exactly as it does for windows — same [`progress` and `seed`](#shader-uniforms)
+uniforms, same `// @duration`, same snapshot-based close path.
 
 ---
 
@@ -200,7 +266,58 @@ void main() {
 
 ---
 
-## Available shader uniforms
+## Reference
+
+### Dispatchers
+
+All dispatchers are registered via `HyprlandAPI::addDispatcherV2` and can also be invoked from a shell with `hyprctl dispatch <name> <args>`.
+
+| Dispatcher | Arguments | Effect |
+|---|---|---|
+| `classshader` | `<class> <path\|clear\|none>` | Force a shader on every window matching the class. `clear`/`none` removes it. |
+| `toggleclassshader` | `<class> <path>` | Toggle the class shader on/off. |
+| `togglewindowshader` | `<path>` | Toggle a shader on the currently focused window only. Pass `clear`/`none` to remove. |
+| `layershader` | `<layer-namespace> <path\|clear\|none>` | Force a shader on a layer namespace (e.g. `rofi`, `mpvpaper`). |
+| `togglelayershader` | `<layer-namespace> <path>` | Toggle a layer shader on/off. |
+| `layeropenanim` | `<layer-namespace> <path[@sec]\|clear\|none>` | One-shot animation when a layer of that namespace appears. |
+| `layercloseanim` | `<layer-namespace> <path[@sec]\|clear\|none>` | One-shot animation as a layer of that namespace goes away. |
+| `reloadshaders` | — | Drop the compiled shader cache and re-read every `.glsl` from disk. Shows a green toast on success. Usually not needed — see the troubleshooting note about auto-reload. |
+
+> **Args with whitespace.** The first argument supports double-quoting, so a class name with a space works: `hyprctl dispatch classshader "Some Class" /path/to.glsl`. (Lua callers don't need this — each argument is its own string.)
+
+A dispatcher that can't parse its arguments reports a usage error rather than silently doing nothing, so `hyprctl dispatch layershader rofi` tells you the path is missing.
+
+### Lua config
+
+Hyprland 0.55+ doesn't surface plugin dispatchers to `.lua` configs, so the plugin also registers every action as a Lua function under `hl.plugin.HyprWindowShade.*`.
+
+**Every dispatcher in the table above maps to a function of the same name**, taking the same arguments as separate Lua strings instead of one space-separated string — `layershader <ns> <path>` becomes `hl.plugin.HyprWindowShade.layershader(ns, path)`. The `"clear"` / `"none"` sentinels and the `@sec` suffix work identically, and `reloadshaders()` takes no arguments.
+
+Plugin actions can't be referenced by name in a Lua bind — wrap them in a closure, which is the pattern vaxry recommends for any plugin function on the Lua config path:
+
+```lua
+-- Toggle a shader on the focused window
+function() hl.plugin.HyprWindowShade.togglewindowshader("/home/USERNAME/.config/hypr/shaders/pixelate.glsl") end
+
+-- Toggle a shader on every window of a class
+function() hl.plugin.HyprWindowShade.toggleclassshader("google-chrome", "/home/USERNAME/.config/hypr/shaders/reading_mode.glsl") end
+
+-- Reload all shader sources after editing a .glsl
+function() hl.plugin.HyprWindowShade.reloadshaders() end
+```
+
+Drop those closures into whatever bind helper your Lua config uses — the closure body is the only plugin-specific piece. You can also call the functions directly at config-load time (no closure), e.g. to apply a startup layer shader:
+
+```lua
+hl.plugin.HyprWindowShade.layershader("mpvpaper", "/home/USERNAME/.config/hypr/shaders/pixelate.glsl")
+```
+
+Two notes:
+
+- Functions appear under `hl.plugin.HyprWindowShade.*` only after the plugin is loaded. If `hyprctl plugin load ...` runs in your config, make sure it happens before any code that calls these functions.
+- `.conf`-style dispatchers are still registered too — you can mix them with the Lua functions if you have both kinds of configs, though there's no reason to in a Lua-only setup.
+
+### Shader uniforms
 
 Declare any of these in your fragment shader and the plugin will populate them every frame. Uniforms you don't declare are skipped (cached `-1` location), so there's no cost to leaving them out.
 
@@ -217,101 +334,12 @@ Declare any of these in your fragment shader and the plugin will populate them e
 | `progress` | `float` | 0.0 → 1.0 across an open/close animation; 1.0 otherwise |
 | `seed` | `float` | stable per-window random value in 0..1 |
 
-To add a new uniform: register its location in `ShaderEngine.cpp` (the `glGetUniformLocation` block, ~line 78) and push the value from `Hooks.cpp` in `hkUseShader` (~line 120).
-
 ---
 
-## Open and close animations
+## How close animations work
 
-A shader tagged with `+shader_open:` or `+shader_close:` runs **once**, driven by the
-`progress` uniform rather than looping on `time`.
-
-### The shader declares its own duration
-
-How long the effect should run is a property of the effect, not of the keybind or the
-window rule, so the shader says it directly:
-
-```glsl
-// @duration 0.35
-```
-
-Put that anywhere in the file. It's a comment, not GLSL — GLSL ES forbids initializers on
-uniforms, so there's no in-language way to declare a value the plugin can read *before*
-the shader ever runs, and the plugin needs it on the CPU side to know when the animation
-is over. If it's absent the plugin uses **0.3s**.
-
-A window rule can override it for a one-off, with an `@<seconds>` suffix:
-
-```
-windowrule = match:class kitty, tag +shader_open:/path/dissolve.glsl@0.6
-```
-
-Precedence is **rule `@sec` → shader `// @duration` → 0.3s default**.
-
-Durations are capped at **5 seconds**, and anything longer is clamped to it rather than
-rejected — `@10` gives you a 5s animation, not the 0.3s default. The cap applies to both
-sources, so it's the ceiling for `// @duration` and for `@sec` on a rule or a layer
-dispatcher alike. It exists so a typo — `30` for `3` — can't leave a closing window's
-snapshot sitting on screen for half a minute.
-
-If a shader declares the `progress` uniform but no `// @duration`, the plugin falls back
-to 0.3s *and* toasts once to tell you — a shader written as an animation that never says
-how long it should run is almost always an oversight. Like compile errors, the warning is
-keyed to the file's mtime: one notification per edit, not one per frame, and it clears
-itself as soon as you save a fix. Shaders that don't use `progress` never warn, and an
-explicit `@sec` on the rule suppresses it too, since that's unambiguous.
-
-### Example
-
-```glsl
-#version 320 es
-precision highp float;
-// @duration 0.4
-
-in  vec2 v_texcoord;
-out vec4 fragColor;
-uniform sampler2D tex;
-uniform float progress;   // 0 -> 1 over the animation
-uniform float seed;       // differs per window
-
-void main() {
-    // Dissolve in from noise, scaled so each window breaks up differently.
-    float n = fract(sin(dot(v_texcoord + seed, vec2(12.9898, 78.233))) * 43758.5453);
-    fragColor = texture(tex, v_texcoord);
-    fragColor *= step(n, progress);
-}
-```
-
-Use the same shape for a close shader, but end at **fully transparent** when
-`progress` reaches 1.0 — see the note below.
-
-### Layer surfaces (rofi/wofi, notifications, bars)
-
-Layer surfaces have no rule tags in Hyprland 0.56, so their animations are configured by
-**namespace** like the rest of the layer API rather than by a `windowrule` tag:
-
-```
-# .conf
-exec-once = hyprctl dispatch layeropenanim  rofi /path/to/open.glsl
-exec-once = hyprctl dispatch layercloseanim rofi /path/to/close.glsl
-```
-
-```lua
--- Lua config
-hl.plugin.HyprWindowShade.layeropenanim("rofi",  shaders.openRise)
-hl.plugin.HyprWindowShade.layercloseanim("rofi", shaders.closeDissolve)
-```
-
-Pass `"clear"` or `"none"` as the path to remove one. The `@sec` duration override works
-here too (`/path/to/open.glsl@0.2`), with the same precedence as window rules.
-
-Find a namespace with `hyprctl layers`. Common ones: `rofi`, `wofi`, `notifications` (or
-`mako` / `swaync`), `waybar`, `hyprlock`.
-
-Everything else behaves exactly as it does for windows — same `progress` and `seed`
-uniforms, same `// @duration`, same snapshot-based close path.
-
-### How close animations work
+<details>
+<summary>Design notes — why every close path animates, and the one rule your close shader has to follow.</summary>
 
 Close animations ride Hyprland's own fadeout. When a window closes, Hyprland
 snapshots it into a framebuffer and renders that snapshot for the duration of the fadeout
@@ -335,6 +363,8 @@ Two consequences worth knowing:
   you don't have to match `animation = fadeOut` in `hyprland.conf`. If Hyprland's fadeout
   animation is disabled entirely, no snapshot is created and close animations won't run.
 
+</details>
+
 ---
 
 ## Troubleshooting
@@ -348,3 +378,10 @@ Two consequences worth knowing:
 - **Floating rule and active rule both set.** The floating rule wins while the window is floating.
 
 ---
+
+## Extending the plugin
+
+To add a new uniform: add its `GLint ...Loc` field to `CompiledShader` in `Globals.hpp`,
+register the location in the `glGetUniformLocation` block at the end of
+`getOrCompileShader` (`ShaderEngine.cpp`), and push the value from the uniform-injection
+block in `hkUseShader` (`Hooks.cpp`).
