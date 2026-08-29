@@ -533,6 +533,10 @@ void applyShaderRulesSafe(PHLWINDOW pWindow) {
 
     WindowShaderState state;
     bool              hasRules = false;
+    std::string       defaultOpenAnim;
+    float             defaultOpenAnimDuration = -1.0f;
+    std::string       defaultCloseAnim;
+    float             defaultCloseAnimDuration = -1.0f;
 
     const auto& tagsSet = pWindow->m_ruleApplicator->m_tagKeeper.getTags();
     for (const auto& tag : tagsSet) {
@@ -579,8 +583,21 @@ void applyShaderRulesSafe(PHLWINDOW pWindow) {
         else if (sv.substr(0, 16) == "shader_floating:")   assign(state.floating,   16);
         else if (sv.substr(0, 13) == "shader_tiled:")      assign(state.tiled,      13);
         else if (sv.substr(0, 18) == "shader_fullscreen:") assign(state.fullscreen, 18);
+        else if (sv.substr(0, 20) == "shader_open_default:")  assignAnim(defaultOpenAnim,  defaultOpenAnimDuration,  20);
+        else if (sv.substr(0, 21) == "shader_close_default:") assignAnim(defaultCloseAnim, defaultCloseAnimDuration, 21);
         else if (sv.substr(0, 12) == "shader_open:")       assignAnim(state.openAnim,  state.openAnimDuration,  12);
         else if (sv.substr(0, 13) == "shader_close:")      assignAnim(state.closeAnim, state.closeAnimDuration, 13);
+    }
+
+    if (state.openAnim.empty() && !defaultOpenAnim.empty()) {
+        state.openAnim = std::move(defaultOpenAnim);
+        state.openAnimDuration = defaultOpenAnimDuration;
+        hasRules = true;
+    }
+    if (state.closeAnim.empty() && !defaultCloseAnim.empty()) {
+        state.closeAnim = std::move(defaultCloseAnim);
+        state.closeAnimDuration = defaultCloseAnimDuration;
+        hasRules = true;
     }
 
     if (hasRules) {

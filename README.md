@@ -104,7 +104,7 @@ end
 
 ## Window shaders
 
-Apply a shader to a window with a `tag` on a window rule. Eight tags are supported:
+Apply a shader to a window with a `tag` on a window rule. Ten tags are supported:
 
 | Tag | Behavior |
 |---|---|
@@ -115,7 +115,9 @@ Apply a shader to a window with a `tag` on a window rule. Eight tags are support
 | `+shader_floating:/path.glsl` | Applies only when floating |
 | `+shader_tiled:/path.glsl` | Applies only when tiled |
 | `+shader_open:/path.glsl` | Plays once when the window opens, then reverts to the window's normal shader |
+| `+shader_open_default:/path.glsl` | Fallback open animation (yields to a specific `+shader_open:`) |
 | `+shader_close:/path.glsl` | Plays once as the window closes |
+| `+shader_close_default:/path.glsl` | Fallback close animation (yields to a specific `+shader_close:`) |
 
 The leading `+` means "apply this tag" — the same prefix Hyprland's tag system uses everywhere. If a window carries both a floating rule and an active rule, the floating shader wins while the window is floating.
 
