@@ -26,6 +26,19 @@ bool                                             g_bIntermediatePass = false;
 // sub-second resolution after a few days of uptime.
 static const auto g_pluginStartTime = std::chrono::steady_clock::now();
 
+// --- LAYER NAMESPACE LOOKUP ---
+// Layer entries are keyed by exact namespace, with `*` reserved as a catch-all
+// consulted only when the exact name misses. That ordering is the whole point:
+// a specific namespace always beats the catch-all, so unlike window tags — which
+// Hyprland keeps in an alphabetically sorted set — there is nothing here whose
+// precedence depends on how the shader paths happen to sort.
+template <typename Map>
+static const typename Map::mapped_type* lookupLayerEntry(const Map& map, const std::string& ns) {
+    if (auto it = map.find(ns); it != map.end()) return &it->second;
+    if (auto it = map.find(LAYER_CATCH_ALL); it != map.end()) return &it->second;
+    return nullptr;
+}
+
 // --- PATH RESOLUTION ---
 // Returns a pointer into one of the global maps, or nullptr. The pointer is
 // valid until the next mutation of the underlying map; render hooks run on the
@@ -66,8 +79,8 @@ static const std::string* resolveShaderPath(const PHLWINDOW& pWindow, const PHLL
     }
 
     if (pLS) {
-        auto it = g_mLayerNamespaceShaderMap.find(pLS->m_namespace);
-        if (it != g_mLayerNamespaceShaderMap.end()) return &it->second;
+        if (const std::string* p = lookupLayerEntry(g_mLayerNamespaceShaderMap, pLS->m_namespace))
+            return p;
     }
     return nullptr;
 }
@@ -189,14 +202,14 @@ static const std::string* resolveLayerOpenAnim(const PHLLS& pLS) {
     auto                          tIt   = g_mLayerOpenTimes.find(rawLS);
     if (tIt == g_mLayerOpenTimes.end()) return nullptr;
 
-    auto sIt = g_mLayerOpenAnims.find(pLS->m_namespace);
-    if (sIt == g_mLayerOpenAnims.end() || sIt->second.path.empty()) {
+    const AnimSpec* spec = lookupLayerEntry(g_mLayerOpenAnims, pLS->m_namespace);
+    if (!spec || spec->path.empty()) {
         g_mLayerOpenTimes.erase(tIt);
         return nullptr;
     }
 
-    const std::string& path     = sIt->second.path;
-    const float        duration = resolveAnimDuration(path, sIt->second.duration);
+    const std::string& path     = spec->path;
+    const float        duration = resolveAnimDuration(path, spec->duration);
     const float        elapsed  = secondsSince(tIt->second);
 
     if (elapsed >= duration) {
@@ -329,8 +342,8 @@ static int collectBaseLayers(const PHLWINDOW& pWindow, const PHLLS& pLS, const s
     }
 
     if (pLS) {
-        auto it = g_mLayerNamespaceShaderMap.find(pLS->m_namespace);
-        if (it != g_mLayerNamespaceShaderMap.end()) out[n++] = &it->second;
+        if (const std::string* p = lookupLayerEntry(g_mLayerNamespaceShaderMap, pLS->m_namespace))
+            out[n++] = p;
     }
 
     return n;
@@ -846,10 +859,10 @@ hkLayerFadeoutCreate(PHLLS layer, Hyprutils::Memory::CSharedPointer<Render::IFra
 
     if (!result || !layer) return result;
 
-    auto it = g_mLayerCloseAnims.find(layer->m_namespace);
-    if (it == g_mLayerCloseAnims.end() || it->second.path.empty()) return result;
+    const AnimSpec* spec = lookupLayerEntry(g_mLayerCloseAnims, layer->m_namespace);
+    if (!spec || spec->path.empty()) return result;
 
-    tagFadeout(result.get(), it->second.path, it->second.duration, layer.get());
+    tagFadeout(result.get(), spec->path, spec->duration, layer.get());
 
     return result;
 }

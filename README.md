@@ -319,6 +319,29 @@ hl.bind("SUPER + W", shade("togglewindowshader", shaders.pixelate))
 
 > Popups belonging to a layer surface — a bar's tooltip or dropdown menu — are shaded with that layer's shader too. They do not pick up the layer's open animation or rounding, which belong to the layer's own box.
 
+Pass `*` as the namespace to set a **catch-all** — it applies to any layer that has no
+entry of its own:
+
+```lua
+-- everything dims, except rofi which gets its own effect
+hl.plugin.HyprWindowShade.layershader("*",    "/home/USERNAME/.config/hypr/shaders/dim.glsl")
+hl.plugin.HyprWindowShade.layershader("rofi", "/home/USERNAME/.config/hypr/shaders/blur.glsl")
+```
+
+An exact namespace always wins; the catch-all is only consulted when the lookup misses, so
+precedence never depends on which shader path happens to sort first. It works the same way
+for `layeropenanim` and `layercloseanim`, and `("*", "clear")` removes it.
+
+This is the layer equivalent of the window rules' [`_default` suffix](#fallback-rules), but
+it exists for a different reason. Window tags *needed* `_default` because Hyprland keeps them
+in an alphabetically sorted set, so a catch-all rule and a specific one would fight and the
+winner came down to the shader's filename. Layer entries are one slot per namespace with no
+ordering to be at the mercy of — they simply had no way to express a catch-all at all.
+
+> `*` catches **every** layer, which includes your wallpaper if it is one (`mpvpaper`,
+> `swaybg`, `hyprpaper`) and your bar. Name the namespaces individually if that isn't what
+> you want — `hyprctl layers` lists them.
+
 Layers have a limited rule set — no tags — so layer shaders are set by **namespace** through
 the plugin's own functions rather than through `hl.layer_rule`. For something like `rofi`, a
 call at startup re-applies the shader every time the layer appears.

@@ -182,6 +182,11 @@ struct CompiledShader {
     time_t    sourceMtime     = 0; // mtime at compile time; lets us auto-evict on edit
 };
 
+// Reserved key: a layer entry stored under this namespace applies to any layer
+// with no entry of its own. Layers have no rule/tag system to express a
+// catch-all with, and no client would pick this as a real namespace.
+inline constexpr const char* LAYER_CATCH_ALL = "*";
+
 extern std::map<std::string, std::string>          g_mLayerNamespaceShaderMap;
 extern std::map<std::string, std::string>          g_mWindowClassShaderMap;
 
