@@ -11,6 +11,15 @@ PHLLSREF            g_pCurrentRenderLayer;
 CompiledShader*     g_pCurrentCompiledShader = nullptr;
 float               g_pCurrentAnimProgress   = -1.0f;
 float               g_pCurrentAnimSeed       = -1.0f;
+Vector2D            g_pCurrentBoxSize;
+float               g_pCurrentRound          = 0.0f;
+float               g_pCurrentRoundPower     = 2.0f;
+
+// --- SHADER STACKING STATE ---
+// Allocated on first use and never freed: see the note in Globals.hpp. These
+// destructors call into GL that Hyprland may already have torn down at unload.
+std::unordered_map<uint64_t, StageFramebuffers>* g_pStageFBs = nullptr;
+bool                                             g_bIntermediatePass = false;
 
 // Plugin-relative reference time so the `time` uniform stays in float-precision
 // range. steady_clock::now() seconds-since-epoch is in the billions and loses
@@ -251,6 +260,231 @@ static const std::string* resolveCloseAnim(const SP<Render::ITexture>& tex, PHLM
     return nullptr;
 }
 
+// --- SHADER STACKING ---
+
+// True when this window asked to opt out of stacking and back to the old
+// first-match-wins ladder.
+static bool windowReplaceMode(const PHLWINDOW& pWindow) {
+    auto it = g_mWindowRuleShaders.find(pWindow.get());
+    return it != g_mWindowRuleShaders.end() && it->second.replaceMode;
+}
+
+// Collects the shader layers for a window or layer surface, bottom first. The
+// order is the one users can reason about: the base look goes down first, then
+// the geometry-conditional layer, then the focus-conditional layer, then
+// fullscreen on top. A one-shot animation is added above all of these by the
+// caller, since it can also apply to a fadeout that has no window left.
+//
+// Returns how many entries were written. Never exceeds MAX_SHADER_STAGES - 1,
+// leaving room for the animation.
+static int collectBaseLayers(const PHLWINDOW& pWindow, const PHLLS& pLS, const std::string* out[MAX_SHADER_STAGES]) {
+    int n = 0;
+
+    if (pWindow) {
+        Desktop::View::CWindow* rawWin = pWindow.get();
+
+        // A manual `togglewindowshader` is an explicit, imperative override —
+        // it replaces the rule layers rather than joining them, which is the
+        // whole point of toggling one on. Animations still stack above it.
+        if (auto it = g_mWindowManualShaders.find(rawWin); it != g_mWindowManualShaders.end()) {
+            out[n++] = &it->second;
+            return n;
+        }
+
+        if (auto it = g_mWindowRuleShaders.find(rawWin); it != g_mWindowRuleShaders.end()) {
+            const auto& state        = it->second;
+            const bool  isActive     = Desktop::focusState()->isWindowActive(pWindow);
+            const bool  isFloating   = rawWin->m_isFloating;
+            const bool  isFullscreen = Fullscreen::controller()->isFullscreen(pWindow);
+
+            // Fullscreen drops the window's shaders by default. Someone who
+            // put a permanent effect on a browser almost certainly does not
+            // want it over a fullscreen video or game, so fullscreen is opt-in
+            // rather than opt-out: `+shader_fullscreen:` is the deliberate
+            // exception, and `+shader_fullscreen_stack:1` restores the normal
+            // stack for a window that genuinely wants it.
+            if (isFullscreen && !state.fullscreenStack) {
+                if (!state.fullscreen.empty())                  out[n++] = &state.fullscreen;
+            } else {
+                if (!state.fallback.empty())                    out[n++] = &state.fallback;
+                if (isFloating)  { if (!state.floating.empty())  out[n++] = &state.floating; }
+                else             { if (!state.tiled.empty())     out[n++] = &state.tiled; }
+                if (isActive)    { if (!state.active.empty())    out[n++] = &state.active; }
+                else             { if (!state.inactive.empty())  out[n++] = &state.inactive; }
+                if (isFullscreen && !state.fullscreen.empty())   out[n++] = &state.fullscreen;
+            }
+        }
+
+        // Class shaders are a coarser fallback than any rule, so they only speak
+        // up when no rule layer did — same as before stacking existed.
+        if (n == 0) {
+            const auto& initClass    = rawWin->m_initialClass;
+            const auto& currentClass = rawWin->m_class;
+            auto        classIt      = g_mWindowClassShaderMap.find(initClass);
+            if (classIt == g_mWindowClassShaderMap.end()) classIt = g_mWindowClassShaderMap.find(currentClass);
+            if (classIt != g_mWindowClassShaderMap.end()) out[n++] = &classIt->second;
+        }
+
+        return n;
+    }
+
+    if (pLS) {
+        auto it = g_mLayerNamespaceShaderMap.find(pLS->m_namespace);
+        if (it != g_mLayerNamespaceShaderMap.end()) out[n++] = &it->second;
+    }
+
+    return n;
+}
+
+// Runs `count` stages offscreen, each one sampling the previous stage's output
+// through its own `tex`, and returns the texture holding the result. The caller
+// then hands that texture to Hyprland's own draw with the top stage bound, so
+// geometry, rounding, damage and blending are still done by the compositor
+// exactly as they were.
+//
+// Returns nullptr when the chain can't run, in which case the caller falls back
+// to drawing the top stage alone — degraded, but never broken.
+static SP<Render::ITexture> runIntermediateStages(CompiledShader* const* stages, int count, const SP<Render::ITexture>& src) {
+    if (count <= 0 || !src || !Render::GL::g_pHyprOpenGL || !g_pHyprRenderer) return nullptr;
+
+    // A rotated or flipped source buffer would need the targets' dimensions
+    // swapped and the transform reapplied on the way back out. Rare enough that
+    // dropping to single-stage shading beats getting it subtly wrong.
+    if (src->m_transform != HYPRUTILS_TRANSFORM_NORMAL) return nullptr;
+
+    // Snapped to whole pixels up front and used everywhere below. A framebuffer
+    // can only be allocated at integer dimensions, so comparing its size against
+    // a fractional texture size would never match and would reallocate the pair
+    // on every single frame.
+    const int w = (int)src->m_size.x;
+    const int h = (int)src->m_size.y;
+    if (w < 1 || h < 1 || w > 16384 || h > 16384) return nullptr;
+    const Vector2D size((double)w, (double)h);
+
+    if (!g_pStageFBs) g_pStageFBs = new std::unordered_map<uint64_t, StageFramebuffers>();
+
+    // One entry per distinct on-screen window size, so this stays small on its
+    // own. The clear is a backstop for pathological cases (a window being
+    // resized continuously allocates a bucket per intermediate size); dropping
+    // the pool costs one reallocation on the next frame and nothing else.
+    if (g_pStageFBs->size() > 8) g_pStageFBs->clear();
+
+    const uint64_t key = ((uint64_t)(uint32_t)w << 32) | (uint32_t)h;
+    auto&          fbs = (*g_pStageFBs)[key];
+
+    for (auto& fb : fbs.fb) {
+        if (!fb.isAllocated() || fb.m_size != size) {
+            fb.release();
+            if (!fb.alloc(w, h)) return nullptr;
+        }
+        // Carry the source's color description down the chain, so a stage reads
+        // the previous stage's output in the same color space the window's own
+        // texture was in. Without this a wide-gamut or HDR surface picks up a
+        // conversion at every hop.
+        fb.setImageDescription(src->m_imageDescription);
+    }
+
+    auto& R = g_pHyprRenderer->m_renderData;
+
+    // Coordinate space of the projection currently in force. A rotated monitor
+    // would need the box transformed to match; bail to single-stage instead of
+    // guessing, the same way a rotated source buffer does above.
+    // Monitors carry a wl_output_transform, textures a Hyprutils eTransform.
+    // The two NORMAL constants are both 0, so mixing them up still behaves —
+    // it just isn't the same enum, and -Wenum-compare is right to say so.
+    const auto mon = R.pMonitor.lock();
+    if (!mon || mon->m_transform != WL_OUTPUT_TRANSFORM_NORMAL) return nullptr;
+    const Vector2D projSpace = mon->m_pixelSize;
+    if (projSpace.x < 1 || projSpace.y < 1) return nullptr;
+
+    // Everything here describes where and how the *window* is being drawn on the
+    // monitor. An intermediate stage is a 1:1 blit into an offscreen target, so
+    // all of it has to be neutralised and put back afterwards.
+    const auto      savedFB       = R.currentFB;
+    const CRegion   savedDamage   = R.damage;
+    const auto      savedModif    = R.renderModif;
+    const CBox      savedClipBox  = R.clipBox;
+    const Vector2D  savedUVTL     = R.primarySurfaceUVTopLeft;
+    const Vector2D  savedUVBR     = R.primarySurfaceUVBottomRight;
+    GLint           savedViewport[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_VIEWPORT, savedViewport);
+    // Read the real GL state rather than trusting a cache, but put it back
+    // through Hyprland's setters — it caches enable/disable per capability and
+    // skips redundant calls, so a raw glEnable behind its back leaves it
+    // convinced the state is something it isn't for the rest of the frame.
+    const bool      savedScissor = glIsEnabled(GL_SCISSOR_TEST) == GL_TRUE;
+    const bool      savedBlend   = glIsEnabled(GL_BLEND) == GL_TRUE;
+    // The framebuffer is restored by raw id: m_renderData.currentFB is the
+    // tracker, not necessarily what is actually bound, and getting this wrong
+    // means drawing the rest of the frame into our scratch target.
+    GLint           savedFBO = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &savedFBO);
+
+    R.renderModif = {};
+    R.clipBox     = {};
+    R.damage      = CRegion(0.0, 0.0, projSpace.x, projSpace.y);
+    // A surface drawn from a sub-rect of its buffer must not have that crop
+    // applied twice — the intermediate pass copies the whole texture, and the
+    // final on-screen draw re-applies the real UVs to the result.
+    R.primarySurfaceUVTopLeft     = Vector2D(-1, -1);
+    R.primarySurfaceUVBottomRight = Vector2D(-1, -1);
+
+    // The projection in force belongs to the monitor and was built back in
+    // begin(); it cannot be swapped out this late (projectionType is only read
+    // there, and overwriting targetProjection renders nothing at all). So
+    // rather than fighting it, the blit is expressed in its coordinate space: a
+    // box covering the whole monitor maps to the whole target, and since the
+    // viewport is the framebuffer, that lands the source texture on the
+    // framebuffer 1:1 whatever its own size is.
+    const CBox box(0.0, 0.0, projSpace.x, projSpace.y);
+
+    // Intermediate stages render their finished state: `progress` belongs to the
+    // animation on top of the stack, not to the layers it's animating.
+    const float savedProgress = g_pCurrentAnimProgress;
+    g_pCurrentAnimProgress = -1.0f;
+    g_bIntermediatePass    = true;
+
+    SP<Render::ITexture> cur = src;
+    for (int i = 0; i < count; ++i) {
+        auto& fb = fbs.fb[i % 2];
+
+        fb.bind();
+        Render::GL::g_pHyprOpenGL->setViewport(0, 0, (GLsizei)w, (GLsizei)h);
+        Render::GL::g_pHyprOpenGL->setCapStatus(GL_SCISSOR_TEST, false);
+        // Overwrite rather than blend: the stage output *is* the new texture,
+        // not something composited over what the target happened to hold.
+        Render::GL::g_pHyprOpenGL->blend(false);
+
+        g_pCurrentCompiledShader = stages[i];
+
+        CHyprOpenGLImpl::STextureRenderData data;
+        data.a        = 1.0f;
+        data.damage   = &R.damage;
+        data.allowDim = false;
+        Render::GL::g_pHyprOpenGL->renderTexture(cur, box, data);
+
+        cur = fb.getTexture();
+    }
+
+    g_bIntermediatePass    = false;
+    g_pCurrentAnimProgress = savedProgress;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)savedFBO);
+
+    R.currentFB                   = savedFB;
+    R.damage                      = savedDamage;
+    R.renderModif                 = savedModif;
+    R.clipBox                     = savedClipBox;
+    R.primarySurfaceUVTopLeft     = savedUVTL;
+    R.primarySurfaceUVBottomRight = savedUVBR;
+
+    Render::GL::g_pHyprOpenGL->setViewport(savedViewport[0], savedViewport[1], savedViewport[2], savedViewport[3]);
+    Render::GL::g_pHyprOpenGL->setCapStatus(GL_SCISSOR_TEST, savedScissor);
+    Render::GL::g_pHyprOpenGL->blend(savedBlend);
+
+    return cur;
+}
+
 // --- V0.56 HOOK: CGLElementRenderer::draw(CTexPassElement, CRegion) ---
 typedef void (*TGLDrawTex)(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement> element, const CRegion& damage);
 
@@ -264,6 +498,16 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
 
     PHLWINDOW pWindow;
     PHLLS     pLS;
+    // A popup whose owner is a layer surface rather than a window — a bar's
+    // tooltip or menu. Kept apart from pLS, which means "this element *is* a
+    // layer surface": the owner supplies a shader to inherit, but the popup must
+    // not also inherit the layer's open animation or its corner rounding, both
+    // of which belong to the layer's own box.
+    PHLLS     pOwnerLS;
+    // Only a window's own surface is rounded. A subsurface or popup carries its
+    // own box, so masking its corners would cut notches out of the middle of
+    // the window instead of following its outline.
+    bool      isMainSurface = false;
 
     if (elem && elem->m_data.surface) {
         // V0.56: CCompositor::getWindowFromSurface is gone. Resolve the owning
@@ -280,50 +524,134 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
                     const auto type = view->type();
                     if (type == Desktop::View::VIEW_TYPE_SUBSURFACE || type == Desktop::View::VIEW_TYPE_POPUP)
                         pWindow = g_pHyprRenderer->m_renderData.currentWindow.lock();
-                }
+
+                    // The renderer only publishes currentWindow while it is
+                    // walking a window's own tree. A popup snapshotted for its
+                    // close fade is drawn outside that walk, so the fallback
+                    // above comes back empty and the snapshot gets captured
+                    // unshaded — the shader then visibly drops off the popup for
+                    // the whole closing animation. Ask the popup who owns it
+                    // instead, which holds no matter who is driving the draw.
+                    if (!pWindow && type == Desktop::View::VIEW_TYPE_POPUP) {
+                        if (auto popup = Desktop::View::CPopup::fromView(view)) {
+                            if (auto owner = popup->getT1Owner()) {
+                                if (auto ownerView = owner->view())
+                                    pWindow = Desktop::View::CWindow::fromView(ownerView);
+                            }
+
+                            // Not every popup hangs off a window. A bar's
+                            // tooltip or menu is owned by a layer surface, which
+                            // has no window rules to match, so it inherits that
+                            // layer's namespace shader instead.
+                            if (!pWindow)
+                                pOwnerLS = popup->layerOwner();
+                        }
+                    }
+                } else
+                    isMainSurface = true;
             }
         }
         pLS = elem->m_data.currentLS.lock();
     }
 
     g_pCurrentRenderWindow = pWindow;
-    g_pCurrentRenderLayer  = pLS;
+    g_pCurrentRenderLayer  = pLS ? pLS : pOwnerLS;
     g_pCurrentAnimProgress = -1.0f;
     g_pCurrentAnimSeed     = -1.0f;
 
-    // A one-shot open/close animation overrides the window's normal shader for
-    // as long as it runs. Close animations have no window and no surface — they
-    // draw a snapshot texture — so they're matched on a separate branch.
+    // Taken straight off the pass element rather than recomputed from the
+    // window, so a shaded surface rounds exactly the way Hyprland was about to
+    // round it — including the cases where it had already decided not to.
+    if (elem && (isMainSurface || pLS)) {
+        g_pCurrentBoxSize    = elem->m_data.box.size();
+        g_pCurrentRound      = (float)elem->m_data.round;
+        g_pCurrentRoundPower = elem->m_data.roundingPower;
+    } else {
+        g_pCurrentBoxSize    = Vector2D(0, 0);
+        g_pCurrentRound      = 0.0f;
+        g_pCurrentRoundPower = 2.0f;
+    }
+
+    // --- BUILD THE STACK ---
+    // A one-shot animation always sits on top of whatever the window normally
+    // looks like. Close animations have no window and no surface — they draw a
+    // snapshot texture, which already has the window's own shaders baked in —
+    // so they're matched on a separate branch and end up as the only stage.
     PHLMONITOR         animMonitor;
-    const std::string* pathToUse = nullptr;
+    const std::string* stack[MAX_SHADER_STAGES];
+    int                nPaths = 0;
 
+    const std::string* animPath = nullptr;
     if (pWindow)
-        pathToUse = resolveOpenAnim(pWindow);
+        animPath = resolveOpenAnim(pWindow);
     else if (pLS)
-        pathToUse = resolveLayerOpenAnim(pLS);
+        animPath = resolveLayerOpenAnim(pLS);
     else if (elem && !elem->m_data.surface && elem->m_data.tex)
-        pathToUse = resolveCloseAnim(elem->m_data.tex, animMonitor);
+        animPath = resolveCloseAnim(elem->m_data.tex, animMonitor);
 
-    const bool animActive = pathToUse != nullptr;
+    // The resolvers above set the progress/seed globals as a side effect. Hold
+    // them aside: only the animation stage should see a real `progress`.
+    const float animProgress = g_pCurrentAnimProgress;
+    const float animSeed     = g_pCurrentAnimSeed;
 
-    // Resolve the path once, then do a single lookup-or-compile on
-    // g_mCompiledCShaders and stash the resulting pointer for hkUseShader to
-    // consume — saves the second find that used to happen down there.
-    if (!animActive)
-        pathToUse = resolveShaderPath(pWindow, pLS);
+    if (pWindow && windowReplaceMode(pWindow)) {
+        // Opt-out: first match wins, exactly as it did before stacking existed.
+        if (const std::string* p = animPath ? animPath : resolveShaderPath(pWindow, pLS ? pLS : pOwnerLS))
+            stack[nPaths++] = p;
+    } else {
+        nPaths = collectBaseLayers(pWindow, pLS ? pLS : pOwnerLS, stack);
+        if (animPath) stack[nPaths++] = animPath;
+    }
 
-    g_pCurrentCompiledShader = pathToUse && !pathToUse->empty()
-                                   ? getOrCompileShader(*pathToUse)
-                                   : nullptr;
+    // --- COMPILE THE STACK ---
+    // A stage that won't compile drops out and the rest still render. Losing one
+    // layer of a stack is a much better failure than losing the window's shading
+    // entirely, and getOrCompileShader has already toasted the reason.
+    CompiledShader* stages[MAX_SHADER_STAGES];
+    int             nStages      = 0;
+    bool            topIsAnim    = false;
+    bool            stackUsesTime = false;
 
-    // Schedule continuous redraw if the resolved shader uses `time`, or while a
-    // one-shot animation is mid-flight — an animation shader drives itself off
-    // `progress` and may never bind `time`, so it needs frames either way.
-    if (animActive || (g_pCurrentCompiledShader && g_pCurrentCompiledShader->usesTime)) {
+    for (int i = 0; i < nPaths; ++i) {
+        if (stack[i]->empty()) continue;
+        CompiledShader* cs = getOrCompileShader(*stack[i]);
+        if (!cs) continue;
+        stages[nStages++] = cs;
+        stackUsesTime     = stackUsesTime || cs->usesTime;
+        topIsAnim         = (animPath && stack[i] == animPath);
+    }
+
+    // --- RUN THE OFFSCREEN STAGES ---
+    // Everything below the top stage renders into an offscreen target; the top
+    // stage is left for Hyprland's own draw, with the composed texture swapped
+    // in underneath it, so geometry/rounding/damage stay entirely theirs.
+    SP<Render::ITexture> originalTex;
+    if (nStages >= 2 && elem && elem->m_data.tex) {
+        if (auto composed = runIntermediateStages(stages, nStages - 1, elem->m_data.tex)) {
+            originalTex       = elem->m_data.tex;
+            elem->m_data.tex  = composed;
+        }
+        // If the chain couldn't run we fall through with the top stage only,
+        // which is the pre-stacking behaviour rather than a broken frame.
+    }
+
+    g_pCurrentCompiledShader = nStages > 0 ? stages[nStages - 1] : nullptr;
+    // Only the animation stage gets the live progress. If the animation shader
+    // failed to compile, the top stage is an ordinary layer and must render its
+    // finished state, not be dragged through an animation it never asked for.
+    g_pCurrentAnimProgress   = topIsAnim ? animProgress : -1.0f;
+    g_pCurrentAnimSeed       = animSeed;
+
+    // Schedule continuous redraw if any stage uses `time`, or while a one-shot
+    // animation is mid-flight — an animation shader drives itself off `progress`
+    // and may never bind `time`, so it needs frames either way. Keyed on the
+    // animation being *resolved* rather than compiled, so a broken animation
+    // shader still ticks down and clears itself instead of stranding the window.
+    if (animPath || stackUsesTime) {
         if (pWindow)
             g_pHyprRenderer->damageWindow(pWindow);
-        else if (pLS) {
-            if (auto mon = pLS->m_monitor.lock())
+        else if (auto ls = pLS ? pLS : pOwnerLS) {
+            if (auto mon = ls->m_monitor.lock())
                 mon->scheduleFrame();
         } else if (animMonitor)
             animMonitor->scheduleFrame();
@@ -331,11 +659,16 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
 
     ((TGLDrawTex)g_pGLDrawTexHook->m_original)(thisptr, element, damage);
 
+    // The element belongs to the pass, not to us — put its texture back before
+    // anything else in the frame looks at it.
+    if (originalTex) elem->m_data.tex = originalTex;
+
     g_pCurrentRenderWindow.reset();
     g_pCurrentRenderLayer.reset();
     g_pCurrentCompiledShader = nullptr;
     g_pCurrentAnimProgress   = -1.0f;
     g_pCurrentAnimSeed       = -1.0f;
+    g_pCurrentRound          = 0.0f;
 }
 
 // --- V0.56 HOOK: useShader ---
@@ -363,7 +696,11 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
             glUniform1f(activeEntry->timeLoc, t);
         }
         if (activeEntry->alphaLoc >= 0) {
-            const float currentAlpha = contextWindow ? contextWindow->alphaTotal() : 1.0f;
+            // Offscreen stages always render fully opaque. Window opacity is a
+            // property of putting the finished result on screen, so it is
+            // applied once by the top stage — folding it into every layer would
+            // compound it (0.5 opacity over three stages would land at 0.125).
+            const float currentAlpha = g_bIntermediatePass ? 1.0f : (contextWindow ? contextWindow->alphaTotal() : 1.0f);
             glUniform1f(activeEntry->alphaLoc, currentAlpha);
         }
         if (activeEntry->resolutionLoc >= 0) {
@@ -403,6 +740,15 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
             // still renders its finished state if bound as a normal shader.
             glUniform1f(activeEntry->progressLoc, g_pCurrentAnimProgress >= 0.0f ? g_pCurrentAnimProgress : 1.0f);
         }
+        if (activeEntry->boxSizeLoc >= 0)
+            glUniform2f(activeEntry->boxSizeLoc, (float)g_pCurrentBoxSize.x, (float)g_pCurrentBoxSize.y);
+        if (activeEntry->roundLoc >= 0) {
+            // Offscreen stages never round: the mask is the last thing applied,
+            // by the stage that actually reaches the screen.
+            glUniform1f(activeEntry->roundLoc, g_bIntermediatePass ? 0.0f : g_pCurrentRound);
+        }
+        if (activeEntry->roundPowerLoc >= 0)
+            glUniform1f(activeEntry->roundPowerLoc, g_pCurrentRoundPower);
         if (activeEntry->seedLoc >= 0) {
             float s = g_pCurrentAnimSeed;
             if (s < 0.0f) {
@@ -532,6 +878,10 @@ void applyShaderRulesSafe(PHLWINDOW pWindow) {
     Desktop::View::CWindow* rawWin = pWindow.get();
 
     WindowShaderState state;
+    // Values from `<tag>_default:` tags. Kept apart from `state` for the whole
+    // parse and merged in afterwards, so a fallback can never overwrite a
+    // specific rule no matter which order the tags are visited in.
+    WindowShaderState defaults;
     bool              hasRules = false;
 
     const auto& tagsSet = pWindow->m_ruleApplicator->m_tagKeeper.getTags();
@@ -542,20 +892,49 @@ void applyShaderRulesSafe(PHLWINDOW pWindow) {
         if (end == std::string_view::npos) continue;
         sv = sv.substr(0, end + 1);
 
-        // Fast reject: every recognized prefix starts with "shader".
+        // Fast reject: every recognized tag starts with "shader".
         if (sv.size() < 7 || sv.substr(0, 6) != "shader") continue;
 
-        const auto assign = [&](std::string& dst, size_t prefixLen) {
-            dst.assign(sv.substr(prefixLen));
-            hasRules = true;
+        // Split once into key and value rather than testing a hardcoded offset
+        // per prefix. The offsets were easy to get wrong when adding a tag, and
+        // the suffix handling below needs the key on its own anyway.
+        const size_t colon = sv.find(':');
+        if (colon == std::string_view::npos) continue;
+
+        std::string_view key = sv.substr(0, colon);
+        std::string_view val = sv.substr(colon + 1);
+
+        // `<tag>_default:` marks a fallback — it applies only when no tag of the
+        // same kind without the suffix is on this window.
+        //
+        // This exists because Hyprland stores tags in an alphabetically sorted
+        // std::set. A catch-all rule and a per-app rule that both set, say,
+        // `shader_close:` land two tags on the same window, and the loop below
+        // would resolve them by whichever shader *path* sorts later — so
+        // `smoke_close.glsl` would beat `matrix_close.glsl` for no reason the
+        // user can see, and renaming a file would flip the result. Reported as
+        // GitHub PR #4, which fixed it for the two animation tags; the suffix is
+        // handled here for every tag instead, since the same collision hits
+        // `shader:` and the state-conditional tags identically.
+        const bool isDefault = key.ends_with("_default");
+        if (isDefault) key.remove_suffix(8);
+
+        WindowShaderState& dst = isDefault ? defaults : state;
+
+        // A default tag on its own doesn't mark the window as having rules —
+        // that's decided in the merge below, once it's known whether the
+        // fallback was actually needed.
+        const auto assign = [&](std::string& field) {
+            field.assign(val);
+            if (!isDefault) hasRules = true;
         };
 
-        // Animation rules additionally accept an optional `@<seconds>` suffix to
+        // Animation tags additionally accept an optional `@<seconds>` suffix to
         // override the duration the shader declares. rfind, so a path that
         // happens to contain '@' still works; and the suffix is only stripped if
         // it actually parsed as a positive number (clamped to MAX_ANIM_DURATION).
-        const auto assignAnim = [&](std::string& dst, float& dur, size_t prefixLen) {
-            std::string_view rest = sv.substr(prefixLen);
+        const auto assignAnim = [&](std::string& field, float& dur) {
+            std::string_view rest = val;
             dur                   = -1.0f;
 
             if (const size_t at = rest.rfind('@'); at != std::string_view::npos) {
@@ -569,18 +948,57 @@ void applyShaderRulesSafe(PHLWINDOW pWindow) {
                 } catch (...) {}
             }
 
-            dst.assign(rest);
-            hasRules = true;
+            field.assign(rest);
+            if (!isDefault) hasRules = true;
         };
 
-        if      (sv.substr(0, 7)  == "shader:")            assign(state.fallback,   7);
-        else if (sv.substr(0, 14) == "shader_active:")     assign(state.active,     14);
-        else if (sv.substr(0, 16) == "shader_inactive:")   assign(state.inactive,   16);
-        else if (sv.substr(0, 16) == "shader_floating:")   assign(state.floating,   16);
-        else if (sv.substr(0, 13) == "shader_tiled:")      assign(state.tiled,      13);
-        else if (sv.substr(0, 18) == "shader_fullscreen:") assign(state.fullscreen, 18);
-        else if (sv.substr(0, 12) == "shader_open:")       assignAnim(state.openAnim,  state.openAnimDuration,  12);
-        else if (sv.substr(0, 13) == "shader_close:")      assignAnim(state.closeAnim, state.closeAnimDuration, 13);
+        if      (key == "shader")            assign(dst.fallback);
+        else if (key == "shader_active")     assign(dst.active);
+        else if (key == "shader_inactive")   assign(dst.inactive);
+        else if (key == "shader_floating")   assign(dst.floating);
+        else if (key == "shader_tiled")      assign(dst.tiled);
+        else if (key == "shader_fullscreen") assign(dst.fullscreen);
+        else if (key == "shader_open")       assignAnim(dst.openAnim,  dst.openAnimDuration);
+        else if (key == "shader_close")      assignAnim(dst.closeAnim, dst.closeAnimDuration);
+        // Not a shader, and deliberately has no `_default` form: "unset" and
+        // "explicitly false" are the same value for a bool, so a default could
+        // never be overridden back off by a more specific rule. Also does not
+        // set hasRules — on its own it has nothing to apply, and a window
+        // carrying only this tag should fall out of the map entirely rather
+        // than being kept alive with an empty state.
+        else if (!isDefault && key == "shader_replace")
+            state.replaceMode = (val != "0" && val != "false" && val != "no" && val != "off");
+        // Same shape, and the same reason for having no `_default` form.
+        else if (!isDefault && key == "shader_fullscreen_stack")
+            state.fullscreenStack = (val != "0" && val != "false" && val != "no" && val != "off");
+    }
+
+    // Promote each fallback the window didn't override. A promoted default is a
+    // rule like any other, so it marks the window as shaded.
+    const auto fill = [&](std::string& specific, std::string& fallback) {
+        if (!specific.empty() || fallback.empty()) return;
+        specific = std::move(fallback);
+        hasRules = true;
+    };
+
+    fill(state.fallback,   defaults.fallback);
+    fill(state.active,     defaults.active);
+    fill(state.inactive,   defaults.inactive);
+    fill(state.floating,   defaults.floating);
+    fill(state.tiled,      defaults.tiled);
+    fill(state.fullscreen, defaults.fullscreen);
+
+    // The animation tags carry a duration alongside the path, so they promote as
+    // a pair rather than through `fill`.
+    if (state.openAnim.empty() && !defaults.openAnim.empty()) {
+        state.openAnim         = std::move(defaults.openAnim);
+        state.openAnimDuration = defaults.openAnimDuration;
+        hasRules               = true;
+    }
+    if (state.closeAnim.empty() && !defaults.closeAnim.empty()) {
+        state.closeAnim         = std::move(defaults.closeAnim);
+        state.closeAnimDuration = defaults.closeAnimDuration;
+        hasRules                = true;
     }
 
     if (hasRules) {

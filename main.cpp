@@ -447,6 +447,11 @@ APICALL EXPORT void PLUGIN_EXIT() {
     auto leak = new std::map<std::string, CompiledShader>(std::move(g_mCompiledCShaders));
     (void)leak;
 
+    // Same reasoning for the stacking render targets: CGLFramebuffer's
+    // destructor deletes GL objects. Drop the pointer and let the pool leak
+    // rather than tearing them down against a context that may be gone.
+    g_pStageFBs = nullptr;
+
     if (g_pGLDrawTexHook)      HyprlandAPI::removeFunctionHook(PHANDLE, g_pGLDrawTexHook);
     if (g_pUseShaderHook)      HyprlandAPI::removeFunctionHook(PHANDLE, g_pUseShaderHook);
     if (g_pFadeoutCreateHook)      HyprlandAPI::removeFunctionHook(PHANDLE, g_pFadeoutCreateHook);

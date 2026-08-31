@@ -26,6 +26,10 @@ static const std::regex MAIN_RE(R"(\bvoid\s+main\s*\(\s*(?:void\s*)?\))");
 // number on the CPU side to know when the animation is over.
 static const std::regex DURATION_RE(R"(//[ \t]*@duration[ \t]+([0-9]*\.?[0-9]+))");
 
+// The rounding mask appended below needs `v_texcoord` to locate the fragment
+// within the box. Shaders that don't declare it keep the plain wrapper.
+static const std::regex TEXCOORD_RE(R"(\bin\s+vec2\s+v_texcoord\s*;)");
+
 // Reads the `// @duration` directive out of shader source. Returns <0 only when
 // the directive is absent or unparseable, meaning "caller picks". An over-long
 // duration is CLAMPED to MAX_ANIM_DURATION rather than discarded: discarding it
@@ -124,11 +128,71 @@ CompiledShader* getOrCompileShader(const std::string& shaderPath) {
         shaderCode.replace(m.position(0), m.length(0), "void user_main()");
         shaderCode += R"(
             uniform float plugin_alpha;
+        )";
+
+        // Corner rounding lives in the fragment program Hyprland would have
+        // bound here, so replacing that program squares off every shaded
+        // window. Redo the mask in the wrapper instead.
+        //
+        // Only when the shader declares `v_texcoord`, which the mask needs to
+        // know where in the box it is. Every shader following the documented
+        // interface does; one that works purely off gl_FragCoord would fail to
+        // compile if we referenced it anyway, and losing rounding is a much
+        // smaller problem than losing the shader.
+        if (std::regex_search(shaderCode, TEXCOORD_RE)) {
+            shaderCode += R"(
+            uniform vec2  plugin_box_size;
+            uniform float plugin_round;
+            uniform float plugin_round_power;
             void main() {
                 user_main();
+                // Normalise to premultiplied alpha. Surface colours are
+                // premultiplied, and the compositor blends with
+                // `src.rgb + dst * (1 - src.a)`, so a fragment carrying more
+                // colour than its alpha allows is *added* to whatever is behind
+                // it instead of covering it — a shader that returns full-
+                // intensity colour at a low alpha paints a pale slab over
+                // popups and shadows. Clamping fixes the colour channel without
+                // touching alpha, so shaders that drive an effect through alpha
+                // (every open/close animation) are unaffected.
+                fragColor.rgb = min(fragColor.rgb, vec3(fragColor.a));
+                fragColor *= plugin_alpha;
+                if (plugin_round > 0.0 && plugin_box_size.x > 0.0) {
+                    // Distance past the corner's rounding square, measured as a
+                    // superellipse so `roundingPower` behaves as it does in
+                    // Hyprland's own shader.
+                    vec2  p = v_texcoord * plugin_box_size;
+                    vec2  c = min(p, plugin_box_size - p);
+                    vec2  d = max(vec2(plugin_round) - c, vec2(0.0));
+                    float e = pow(pow(d.x, plugin_round_power) + pow(d.y, plugin_round_power), 1.0 / plugin_round_power);
+                    // discard, not just a zero alpha. Zeroing alpha alone was
+                    // measured not to cut the corner at all on a shader that
+                    // writes its own alpha; discard does, and is what Hyprland's
+                    // own rounding uses. The alpha ramp after it softens the
+                    // edge on top of that.
+                    if (e > plugin_round) discard;
+                    fragColor *= 1.0 - smoothstep(plugin_round - 1.0, plugin_round, e);
+                }
+            }
+        )";
+        } else {
+            shaderCode += R"(
+            void main() {
+                user_main();
+                // Normalise to premultiplied alpha. Surface colours are
+                // premultiplied, and the compositor blends with
+                // `src.rgb + dst * (1 - src.a)`, so a fragment carrying more
+                // colour than its alpha allows is *added* to whatever is behind
+                // it instead of covering it — a shader that returns full-
+                // intensity colour at a low alpha paints a pale slab over
+                // popups and shadows. Clamping fixes the colour channel without
+                // touching alpha, so shaders that drive an effect through alpha
+                // (every open/close animation) are unaffected.
+                fragColor.rgb = min(fragColor.rgb, vec3(fragColor.a));
                 fragColor *= plugin_alpha;
             }
         )";
+        }
     }
 
     CompiledShader entry;
@@ -165,6 +229,9 @@ CompiledShader* getOrCompileShader(const std::string& shaderPath) {
     entry.isFullscreenLoc = glGetUniformLocation(prog, "is_fullscreen");
     entry.progressLoc     = glGetUniformLocation(prog, "progress");
     entry.seedLoc         = glGetUniformLocation(prog, "seed");
+    entry.boxSizeLoc      = glGetUniformLocation(prog, "plugin_box_size");
+    entry.roundLoc        = glGetUniformLocation(prog, "plugin_round");
+    entry.roundPowerLoc   = glGetUniformLocation(prog, "plugin_round_power");
     entry.animDuration    = declaredDuration;
     // Continuous redraw is needed only when the shader actually binds `time`.
     // Using the location instead of substring matching avoids false positives

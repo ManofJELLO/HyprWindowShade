@@ -12,7 +12,7 @@ Configuration is shown in Hyprland's Lua config format (`hyprland.lua`). The old
 
 - [Quick start](#quick-start)
 - [Requirements](#requirements) · [Install](#install)
-- [Window shaders](#window-shaders)
+- [Window shaders](#window-shaders) — [stacking](#stacking) · [fullscreen](#fullscreen) · [fallback rules](#fallback-rules)
 - [Layer shaders](#layer-shaders)
 - [Open and close animations](#open-and-close-animations)
 - [Writing a shader](#writing-a-shader)
@@ -104,20 +104,28 @@ end
 
 ## Window shaders
 
-Apply a shader to a window with a `tag` on a window rule. Eight tags are supported:
+Apply a shader to a window with a `tag` on a window rule. Ten tags are supported:
 
 | Tag | Behavior |
 |---|---|
 | `+shader:/path.glsl` | Always applied, regardless of focus |
-| `+shader_fullscreen:/path.glsl` | Applies on fullscreen apps (default is to disable shaders when fullscreen) |
+| `+shader_fullscreen:/path.glsl` | The one shader that applies while the window is fullscreen |
 | `+shader_active:/path.glsl` | Applies only when the window is focused |
 | `+shader_inactive:/path.glsl` | Applies only when the window is not focused |
 | `+shader_floating:/path.glsl` | Applies only when floating |
 | `+shader_tiled:/path.glsl` | Applies only when tiled |
-| `+shader_open:/path.glsl` | Plays once when the window opens, then reverts to the window's normal shader |
+| `+shader_open:/path.glsl` | Plays once when the window opens, on top of the window's normal shader |
 | `+shader_close:/path.glsl` | Plays once as the window closes |
+| `+shader_replace:1` | Opts this window out of [stacking](#stacking) |
+| `+shader_fullscreen_stack:1` | Keeps this window's shaders while it is [fullscreen](#fullscreen) |
 
-The leading `+` means "apply this tag" — the same prefix Hyprland's tag system uses everywhere. If a window carries both a floating rule and an active rule, the floating shader wins while the window is floating.
+Any of the eight shader tags also accepts a `_default` suffix
+(`+shader_close_default:`) marking it as a [fallback](#fallback-rules) that yields
+to a rule setting the same tag without the suffix.
+
+The leading `+` means "apply this tag" — the same prefix Hyprland's tag system uses everywhere. A window can carry as many of these as you like; see [stacking](#stacking) for how they combine.
+
+A window's shaders also cover its subsurfaces and its popups — menus, dropdowns, tooltips — including while a popup plays its closing fade. A popup belonging to a *layer surface* instead of a window inherits that [layer's shader](#layer-shaders).
 
 ### Example rule
 
@@ -128,6 +136,129 @@ hl.window_rule({
     tag   = "+shader:/home/USERNAME/.config/hypr/shaders/reading_mode.glsl",
 })
 ```
+
+### Stacking
+
+Every tag that matches contributes a layer, and the layers are rendered on top of
+each other. A window can wear a permanent look, a focus-dependent effect, and an
+open animation at the same time:
+
+```lua
+hl.window_rule({
+    match = { class = "google-chrome" },
+    tag   = "+shader:/home/USERNAME/.config/hypr/shaders/reading_mode.glsl",
+})
+hl.window_rule({
+    match = { class = "google-chrome" },
+    tag   = "+shader_inactive:/home/USERNAME/.config/hypr/shaders/crt.glsl",
+})
+```
+
+Focused, Chrome renders through `reading_mode`. Unfocused, it renders through
+`reading_mode` **and then** `crt` — the CRT effect operates on the reading-mode
+image rather than throwing it away. The same applies to open and close
+animations, so an animation no longer snaps to a different-looking window when it
+finishes.
+
+Layers are applied bottom-to-top in this order:
+
+| Order | Layer |
+|---|---|
+| 1 | `+shader:` |
+| 2 | `+shader_floating:` or `+shader_tiled:` |
+| 3 | `+shader_active:` or `+shader_inactive:` |
+| 4 | `+shader_fullscreen:` |
+| 5 | `+shader_open:` / `+shader_close:` |
+
+Nothing about the shaders themselves has to change for this to work. Each layer
+is a separate GL program that reads the layer below it through its own `tex`
+sampler, exactly as if that layer's output were the window — so shaders written
+by different people compose without being edited or renamed.
+
+Two notes on what stacking changed:
+
+- **Fullscreen is the exception.** Going fullscreen drops a window's shaders by
+  default — see [fullscreen](#fullscreen) below.
+- **`togglewindowshader` still replaces.** A manually toggled shader is an
+  explicit override, so it takes the place of the rule layers rather than joining
+  them. Animations still play on top of it.
+
+To get the old behavior back on a given window — the first matching tag wins and
+the rest are ignored — tag it `+shader_replace:1`.
+
+#### Cost
+
+Each layer beyond the first costs one offscreen pass over the window's texture,
+per frame that window is drawn. Two or three layers on a handful of windows is
+not something you will notice; a `time`-driven shader stacked under another one
+on every window on screen is, since `time` forces a continuous redraw. If you
+only want the effect while a window is unfocused, tag it `+shader_inactive:`
+rather than `+shader:` and it costs nothing while you are using the window.
+
+### Fullscreen
+
+A fullscreen window gets **no shaders at all** by default. Someone who put a paper
+or CRT effect on a browser almost certainly does not want it over a fullscreen
+video, and a game is the last place a permanent post-process effect belongs — so
+fullscreen is opt-in rather than opt-out.
+
+Two ways to opt in:
+
+| Want | Tag |
+|---|---|
+| One specific shader, only while fullscreen | `+shader_fullscreen:/path.glsl` |
+| The window's normal stack, kept while fullscreen | `+shader_fullscreen_stack:1` |
+
+```lua
+-- mpv keeps its colour grade fullscreen, nothing else does
+hl.window_rule({
+    match = { class = "mpv" },
+    tag   = "+shader_fullscreen_stack:1",
+})
+```
+
+With `+shader_fullscreen_stack:1` the [stack](#stacking) resolves exactly as it
+does windowed, with `+shader_fullscreen:` added as the top layer if present.
+Without it, `+shader_fullscreen:` is the *only* layer that applies, and if that
+tag is absent the window renders unshaded.
+
+`+shader_fullscreen_stack:` has no `_default` form, for the same reason
+`+shader_replace:` doesn't.
+
+### Fallback rules
+
+Stacking combines *different* tags. Two rules setting the **same** tag on one
+window is a different problem: Hyprland keeps a window's tags in an
+alphabetically sorted set, so a catch-all rule and a per-app rule that both set
+`+shader_close:` resolve by whichever shader *path* sorts later. Renaming a file
+can flip which one wins.
+
+Append `_default` to any of the eight shader tags to mark it as a fallback. A
+fallback applies only when the same tag without the suffix is absent from that
+window, whatever the paths happen to be called:
+
+```lua
+-- every window closes with smoke...
+hl.window_rule({
+    match = { class = ".*" },
+    tag   = "+shader_close_default:/home/USERNAME/.config/hypr/shaders/smoke_close.glsl@1.0",
+})
+
+-- ...except kitty, which closes with matrix
+hl.window_rule({
+    match = { class = "^(kitty)$" },
+    tag   = "+shader_close:/home/USERNAME/.config/hypr/shaders/matrix_close.glsl@0.8",
+})
+```
+
+This works for `+shader_default:`, `+shader_active_default:`,
+`+shader_inactive_default:`, `+shader_floating_default:`, `+shader_tiled_default:`,
+`+shader_fullscreen_default:`, `+shader_open_default:` and `+shader_close_default:`.
+`+shader_replace:` has no `_default` form — a bool can't tell "unset" apart from
+"explicitly off", so a default could never be overridden back off.
+
+Two rules setting the same tag at the *same* level are still resolved by path
+order. One rule per tag per window, plus a `_default` for the catch-all.
 
 ### Keybind examples
 
@@ -186,6 +317,8 @@ hl.bind("SUPER + W", shade("togglewindowshader", shaders.pixelate))
 
 ## Layer shaders
 
+> Popups belonging to a layer surface — a bar's tooltip or dropdown menu — are shaded with that layer's shader too. They do not pick up the layer's open animation or rounding, which belong to the layer's own box.
+
 Layers have a limited rule set — no tags — so layer shaders are set by **namespace** through
 the plugin's own functions rather than through `hl.layer_rule`. For something like `rofi`, a
 call at startup re-applies the shader every time the layer appears.
@@ -219,9 +352,10 @@ Find a namespace with `hyprctl layers`.
 ## Open and close animations
 
 A shader tagged with `+shader_open:` or `+shader_close:` runs **once**, driven by the
-[`progress`](#shader-uniforms) uniform rather than looping on `time`. While it runs it
-outranks every other shader rule on that window; when it finishes the window reverts to
-its normal shader.
+[`progress`](#shader-uniforms) uniform rather than looping on `time`. It renders on top of
+whatever the window's other shader rules resolve to (see [stacking](#stacking)), so when
+it finishes the window's normal appearance is already there underneath it and there is no
+visible switch.
 
 ### The shader declares its own duration
 
@@ -307,7 +441,13 @@ uniforms, same `// @duration`, same snapshot-based close path.
 
 ## Writing a shader
 
-The plugin auto-wraps your shader: it renames your `void main()` to `void user_main()` and appends a `main()` that calls it and multiplies `fragColor` by `plugin_alpha`. You only need to write a normal HyprShade-style fragment shader.
+The plugin auto-wraps your shader: it renames your `void main()` to `void user_main()` and appends a `main()` that calls it, multiplies `fragColor` by `plugin_alpha`, and re-applies the window's corner rounding. You only need to write a normal HyprShade-style fragment shader.
+
+The wrapper also clamps your colour to what its alpha permits (`fragColor.rgb = min(fragColor.rgb, vec3(fragColor.a))`). Surface colours are premultiplied and the compositor blends with `src.rgb + dst * (1 - src.a)`, so a fragment carrying more colour than its alpha is *added* to what is behind it rather than covering it — which is why a shader returning full-intensity colour at a low alpha paints a pale slab over popups and shadows. The clamp only ever touches the colour channel, so shaders that drive an effect through alpha — every [open/close animation](#open-and-close-animations) — are unaffected, and a shader that already premultiplies correctly is left exactly as it was.
+
+The clamp is a safety net, not a substitute for premultiplying properly: it bounds the colour rather than scaling it, so for partial alpha it lands close to the right answer but not on it. Premultiply in your own shader and the wrapper becomes a no-op. It also overrides the one legitimate reason to emit colour above alpha — deliberate additive glow — which is rare enough to be worth the trade.
+
+Rounding is part of the wrapper because Hyprland rounds corners *inside* the fragment program your shader replaces. Without it, any shader that writes its own alpha — `fragColor = vec4(color, 1.0)` is the common shape — would fill in the rounded corners and leave the window square. The wrapper `discard`s fragments outside the rounded outline rather than only zeroing alpha, since an opaque window is drawn with blending off and a zero alpha there would simply be ignored. It applies only to a window's own surface, and only when your shader declares `in vec2 v_texcoord;` — a shader working purely off `gl_FragCoord` keeps the plain wrapper and the old square-corner behavior.
 
 Minimal example using three uniforms — focused windows ripple slightly, unfocused windows are dimmed:
 
@@ -403,6 +543,11 @@ Declare any of these in your fragment shader and the plugin will populate them e
 | `progress` | `float` | 0.0 → 1.0 across an open/close animation; 1.0 otherwise |
 | `seed` | `float` | stable per-window random value in 0..1 |
 
+Names beginning with `plugin_` are reserved by the wrapper. Besides `plugin_alpha` it
+injects `plugin_box_size`, `plugin_round` and `plugin_round_power` to re-apply corner
+rounding — don't declare those names yourself, and don't write to `fragColor` expecting
+them to be absent.
+
 ---
 
 ## How close animations work
@@ -443,8 +588,20 @@ Two consequences worth knowing:
 - **Plugin doesn't seem to be loaded.** Run `hyprctl plugins list` to confirm `HyprWindowShade` is present. If it isn't, check the path in your `hl.plugin.load(...)` line and rebuild with `./build.sh`.
 - **`attempt to index a nil value (field 'HyprWindowShade')`.** The plugin isn't loaded yet when the config evaluates this line. Make sure `hl.plugin.load(...)` runs first, or move the call inside a bind closure / `hl.on("hyprland.start", ...)`.
 - **Dispatchers do nothing from a Lua bind.** Hyprland 0.55+ doesn't surface plugin dispatchers to Lua configs — use the `hl.plugin.HyprWindowShade.*` functions instead (see [Lua API](#lua-api)). `hyprctl dispatch` from a shell still works.
-- **Shader doesn't show on a fullscreen window.** The default is to disable shaders on fullscreen. Use the `+shader_fullscreen:` tag or add it alongside your existing tag.
-- **Floating rule and active rule both set.** The floating rule wins while the window is floating.
+- **Shader doesn't show on a fullscreen window.** That is the default: fullscreen drops a window's shaders so games and videos are left alone. Add `+shader_fullscreen:/path.glsl` for a shader that applies only while fullscreen, or `+shader_fullscreen_stack:1` to keep the window's normal stack. See [fullscreen](#fullscreen).
+- **A catch-all rule is overriding a per-app rule.** Hyprland keeps tags in an alphabetically sorted set, so two rules setting the same tag on one window resolve by whichever *path* sorts later, not by which rule is more specific. Stacking doesn't help — both tags write the same layer. Mark the catch-all as a [fallback](#fallback-rules) with the `_default` suffix.
+- **A shader stopped applying after adding another.** Stacking runs each layer through the one below it, so a layer that ignores `tex` and writes a solid color will hide everything beneath it. That is the shader's doing, not the plugin's.
+- **A menu, tooltip or popup over a shaded window shows as a pale or dark rectangular slab.** Popups and subsurfaces are shaded along with the window they belong to, and surface colors are **premultiplied**: RGB is already scaled by alpha, so a fragment must never emit more color than its alpha allows. Compositing is `result = src.rgb + dst * (1 - src.a)`, which means a fragment with alpha 0 and non-zero RGB is *added* to whatever is behind it. A popup's transparent margin — the part its shadow shows through — then picks up the shader's color as a visible haze in the shape of the popup's box.
+
+  Both common mistakes cause it. `fragColor = vec4(color, 1.0)` throws the shape away entirely. `fragColor = vec4(color, src.a)` keeps the shape but forgets the premultiplication, so transparent pixels still emit full-intensity color. The correct form scales the color by the alpha it is paired with:
+
+  ```glsl
+  vec4 src = texture(tex, v_texcoord);
+  vec3 col = /* your effect, from src.rgb */;
+  fragColor = vec4(col * src.a, src.a);   // premultiplied
+  ```
+
+  A shader that also displaces its coordinates must sample alpha at the coordinate it actually read, not at `v_texcoord`. Corner rounding is restored by the wrapper regardless, but the margin cannot be — a shader is entitled to set alpha, and that is how the [dissolve animations](#example-dissolve-on-open) work.
 
 ---
 
@@ -516,6 +673,20 @@ exec-once = hyprctl dispatch layercloseanim rofi /path/to/close.glsl
 
 ## Extending the plugin
 
+Popups are matched to their owner in `hkGLDrawTex`. The renderer's `currentWindow` is only
+published while it is walking a window's own tree, so it comes back empty for a popup being
+snapshotted for its close fade — which used to capture that snapshot unshaded. The owner is
+therefore resolved directly, via `CPopup::getT1Owner()` for a window and `CPopup::layerOwner()`
+for a layer surface. The layer owner is kept in its own variable rather than reusing `pLS`,
+so a popup inherits the layer's shader without also inheriting its open animation or its
+corner rounding.
+
+The offscreen stages used by [stacking](#stacking) render through the projection Hyprland
+set up for the monitor — it is built in `begin()` and cannot be swapped out mid-pass, so
+`runIntermediateStages` expresses its blit in that projection's coordinate space rather
+than building its own matrix. Changing this is the first thing to check if a stacked window
+ever renders at the wrong size or position.
+
 To add a new uniform: add its `GLint ...Loc` field to `CompiledShader` in `Globals.hpp`,
 register the location in the `glGetUniformLocation` block at the end of
 `getOrCompileShader` (`ShaderEngine.cpp`), and push the value from the uniform-injection
@@ -524,3 +695,12 @@ block in `hkUseShader` (`Hooks.cpp`).
 When adding a new *action*, register it both as a dispatcher (`addDispatcherV2`) and as a
 Lua function (`addLuaFunction`), delegating to a shared helper in the `shadeActions::`
 namespace — see the parallel registration blocks in `main.cpp`.
+
+To add a new *conditional shader tag*: add the field to `WindowShaderState` (`Globals.hpp`),
+parse it in the tag loop in `applyShaderRulesSafe` (`Hooks.cpp`), and add it to the layer
+order in `collectBaseLayers`. If the total number of possible layers grows past five, bump
+`MAX_SHADER_STAGES` — the stack arrays are fixed-size and sized from it. Also add it to
+`resolveShaderPath`, which is the first-match-wins ladder kept for `+shader_replace:1`, and
+to the merge block at the end of `applyShaderRulesSafe` so the tag's `_default` form works.
+The `_default` suffix itself needs no per-tag handling: it is stripped off the key before
+the tag is matched.

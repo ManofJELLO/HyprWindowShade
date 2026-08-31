@@ -30,6 +30,7 @@ using Render::GL::CHyprOpenGLImpl;
 #include <hyprland/src/desktop/view/LayerSurface.hpp>
 #include <hyprland/src/desktop/view/View.hpp>
 #include <hyprland/src/desktop/view/WLSurface.hpp>
+#include <hyprland/src/desktop/view/Popup.hpp>
 #include <hyprland/src/event/EventBus.hpp>
 #include <hyprutils/memory/UniquePtr.hpp>
 #include <hyprland/src/Compositor.hpp>
@@ -59,6 +60,7 @@ using Render::GL::CHyprOpenGLImpl;
 #include <hyprland/src/desktop/state/WindowFadeout.hpp>
 #include <hyprland/src/desktop/state/LayerFadeout.hpp>
 #include <hyprland/src/render/Framebuffer.hpp>
+#include <hyprland/src/render/gl/GLFramebuffer.hpp>
 
 // --- SHARED GLOBALS ---
 extern HANDLE PHANDLE;
@@ -88,8 +90,48 @@ struct WindowShaderState {
     float       openAnimDuration  = -1.0f;
     std::string closeAnim;
     float       closeAnimDuration = -1.0f;
+    // `shader_replace:1` opts this window out of stacking and back to the
+    // first-match-wins ladder the plugin used before stacking existed.
+    bool        replaceMode       = false;
+    // `shader_fullscreen_stack:1` opts this window into stacking *while
+    // fullscreen*. Off by default: a game or a video is the one place a
+    // permanent effect is least likely to be wanted.
+    bool        fullscreenStack   = false;
 };
 extern std::unordered_map<Desktop::View::CWindow*, WindowShaderState> g_mWindowRuleShaders;
+
+// --- SHADER STACKING ---
+// Every matching rule contributes a layer instead of the first match winning
+// outright, so a window can carry a base look AND a state-specific effect AND
+// an open/close animation at once.
+//
+// Each stage keeps its own GL program and renders offscreen into the next
+// stage's input, rather than being spliced into one combined source. Splicing
+// would be cheaper, but two shaders from different authors routinely both
+// define `rand`/`noise`/the Ashima `mod289` boilerplate, and the combined
+// program would fail to link — unusable for shaders users download rather than
+// write. Separate programs compose without touching the source at all.
+inline constexpr int MAX_SHADER_STAGES = 5; // base + geometry + focus + fullscreen + anim
+
+// Ping-pong render targets for the intermediate stages, keyed by texture size.
+// An intermediate result is consumed by the very next stage in the same draw
+// call and never outlives it, so one pair per size serves every window on
+// screen rather than needing per-window targets.
+//
+// Heap-allocated behind a pointer and deliberately leaked at unload, for the
+// same reason g_mCompiledCShaders is: these destructors call into GL state
+// owned by Hyprland, which may already be torn down by the time a global's
+// destructor would run.
+struct StageFramebuffers {
+    Render::GL::CGLFramebuffer fb[2];
+};
+extern std::unordered_map<uint64_t, StageFramebuffers>* g_pStageFBs;
+
+// True only while an offscreen stage is being drawn. Window opacity has to be
+// applied exactly once, by the final on-screen stage — if every layer
+// underneath multiplied it in too, a 50%-opacity window with three stages would
+// come out at 12.5%.
+extern bool g_bIntermediatePass;
 
 // Fallback when neither the shader nor the rule declares a duration.
 inline constexpr float DEFAULT_ANIM_DURATION = 0.3f;
@@ -127,6 +169,12 @@ struct CompiledShader {
     GLint     isFullscreenLoc = -1; // float 0/1
     GLint     progressLoc     = -1; // float 0..1 across a one-shot open/close animation
     GLint     seedLoc         = -1; // float 0..1, stable per window, so instances differ
+    // Corner rounding, re-applied by the wrapper. Hyprland rounds inside the
+    // fragment program this shader replaces, so without these a shaded window
+    // comes out with square corners.
+    GLint     boxSizeLoc      = -1; // vec2: size in px of the box being drawn
+    GLint     roundLoc        = -1; // float: corner radius in px, 0 = no rounding
+    GLint     roundPowerLoc   = -1; // float: superellipse exponent
     bool      usesTime        = false;
     // Seconds the one-shot animation should run for, declared in the shader as
     // `// @duration 0.35`. <0 means the shader didn't say.
@@ -195,6 +243,13 @@ extern float               g_pCurrentAnimProgress;
 // render context. Carried explicitly because a closing window's fadeout has no
 // window pointer left to hash.
 extern float               g_pCurrentAnimSeed;
+// Rounding parameters for the element being drawn, taken from the pass element
+// so they match exactly what Hyprland would have applied. Zeroed for offscreen
+// stages: the mask belongs to the final on-screen draw, applying it per layer
+// would cut the corners repeatedly and leave them ragged.
+extern Vector2D            g_pCurrentBoxSize;
+extern float               g_pCurrentRound;
+extern float               g_pCurrentRoundPower;
 
 // --- FUNCTION DECLARATIONS ---
 CompiledShader*                             getOrCompileShader(const std::string& shaderPath);
