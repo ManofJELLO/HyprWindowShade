@@ -1,0 +1,32 @@
+# hyprpm manifest. Lets anyone install with:
+#
+#   hyprpm add https://github.com/ManofJELLO/HyprWindowShade
+#   hyprpm enable HyprWindowShade
+#
+# hyprpm clones this repo, runs the `build` steps below with PKG_CONFIG_PATH
+# pointed at a header tree matching the user's running Hyprland, and loads the
+# `output` artifact. See Makefile for why the compile flags are what they are.
+
+[repository]
+name = "HyprWindowShade"
+authors = ["ManofJELLO"]
+
+# commit_pins maps a Hyprland commit to the commit of THIS repo known to build
+# against it, as ["<hyprland commit>", "<plugin commit>"]. hyprpm uses it to
+# check out a working revision instead of whatever HEAD happens to be, which is
+# what makes `hyprpm update` safe across Hyprland releases.
+#
+# Intentionally empty until the first pinned release: an entry has to name a
+# commit of this repo, which cannot be known until that commit exists. Add the
+# pair in a follow-up commit once this one has a hash.
+# commit_pins = [
+#     ["efb50993780079460b0cbed1363e2166a2de1d9f", "<this repo's commit>"], # 0.56.2
+# ]
+
+[HyprWindowShade]
+description = "Per-window, per-layer and per-class fragment shaders, with open and close animations"
+authors = ["ManofJELLO"]
+output = "HyprWindowShade.so"
+build = [
+    "make all",
+]

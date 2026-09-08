@@ -43,7 +43,7 @@ void main() {
 }
 ```
 
-Build and load the plugin ([Install](#install)), then add one rule to `hyprland.lua`:
+Install the plugin ([Install](#install)), then add one rule to `hyprland.lua`:
 
 ```lua
 hl.window_rule({
@@ -62,43 +62,68 @@ Reload the config. Every kitty window is now dimmed while unfocused and full bri
 - **Hyprland 0.56** (the plugin is built against this version's internal API).
 - A **Lua config** (`~/.config/hypr/hyprland.lua`). A `.conf` config still works in 0.56 — see [Legacy: hyprland.conf](#legacy-hyprlandconf) — but Hyprland drops it in 0.57.
 - **GLSL ES 3.20** fragment shaders. The plugin uses Hyprland's `TEXVERTSRC320` vertex shader, so your fragment shader should start with `#version 320 es` and declare `in vec2 v_texcoord;`, `out vec4 fragColor;`, and `uniform sampler2D tex;` (same interface HyprShade uses).
+- To build it — whether through hyprpm or from source — a C++23 toolchain and the deps hyprpm itself needs: `cmake`, `cpio`, `pkg-config`, `git`, `g++`, `gcc`, plus `make`.
 
 ---
 
 ## Install
 
-Unzip the files to a directory, `cd` into it, then:
+### With hyprpm (recommended)
 
 ```sh
-chmod +x build.sh
+hyprpm add https://github.com/ManofJELLO/HyprWindowShade
+hyprpm enable HyprWindowShade
+```
+
+Then have hyprpm load your plugins at session start, in `hyprland.lua`:
+
+```lua
+hl.on("hyprland.start", function()
+    hl.exec_cmd("hyprpm reload -n")
+end)
+```
+
+hyprpm builds the plugin against headers matching your running Hyprland, so after a
+Hyprland upgrade `hyprpm update` is all you need.
+
+### From source
+
+```sh
+git clone https://github.com/ManofJELLO/HyprWindowShade
+cd HyprWindowShade
 ./build.sh
 ```
 
-Then load the plugin from `hyprland.lua` (replace `USERNAME`):
+`build.sh` compiles, verifies the result, installs it, and hot-loads it into the running
+session. Use `./build.sh --build-only` to compile and verify without touching a live
+session — worth preferring while you're changing anything, since a misbehaving plugin
+takes the whole compositor with it.
+
+Then load it **at session start**:
 
 ```lua
--- Loaded at parse time, so hl.plugin.HyprWindowShade.* is resolvable by the
--- time any bind or startup call below it runs.
-hl.plugin.load("/home/USERNAME/.local/share/hyprland/plugins/HyprWindowShade.so")
+hl.on("hyprland.start", function()
+    hl.exec_cmd("hyprctl plugin load /home/USERNAME/.local/share/hyprland/plugins/HyprWindowShade.so")
+end)
 ```
 
-A plugin built against a different Hyprland commit is rejected on ABI grounds, and an
-uncaught error there aborts the *rest* of your config — binds, rules and all. Wrapping the
-load in `pcall` costs you only shaders when it fails:
+> **Load at session start, not at config-parse time.**
+>
+> `hl.plugin.load(...)` at the top level of your config runs before the compositor has
+> finished starting. If the `.so` is corrupt or truncated — an unclean shutdown mid-write
+> is enough — it does not fail cleanly. It segfaults inside `ld.so` during relocation,
+> which kills Hyprland before it starts, on **every** boot. With no other desktop
+> installed, that means a rescue USB.
+>
+> Wrapping it in `pcall` does not help. `pcall` catches Lua errors, not signals, and
+> Hyprland's plugin safe-mode sits above the dynamic linker — neither one ever sees it.
+>
+> Loading from `hyprland.start` means the session is already up, so a bad plugin costs you
+> shaders for one session instead of your desktop. This is also exactly what hyprpm does
+> (`hyprpm reload` runs at session start), so both paths above are the same shape.
 
-```lua
-local ok, err = pcall(hl.plugin.load,
-    "/home/USERNAME/.local/share/hyprland/plugins/HyprWindowShade.so")
-if not ok then
-    hl.on("hyprland.start", function()
-        hl.notification.create({
-            text    = "[HyprWindowShade] failed to load: " .. tostring(err),
-            timeout = 8000,
-            color   = "rgb(ff5555)",
-        })
-    end)
-end
-```
+The shader keybinds look up `hl.plugin.HyprWindowShade` at keypress time rather than at
+parse time, so loading late costs nothing.
 
 ---
 
@@ -523,9 +548,10 @@ Lua string.
 
 Two notes:
 
-- Functions appear under `hl.plugin.HyprWindowShade.*` only after the plugin is loaded. Make
-  sure `hl.plugin.load(...)` runs before any code that calls them, and prefer looking the
-  table up inside a bind closure (see [Keybind examples](#keybind-examples)).
+- Functions appear under `hl.plugin.HyprWindowShade.*` only after the plugin is loaded, and
+  it loads at session start rather than at config-parse time (see [Install](#install)). So
+  look the table up *inside* a bind closure rather than at the top level — the closure runs
+  at keypress time, long after the load. See [Keybind examples](#keybind-examples).
 - Class names or namespaces containing spaces need no special treatment here — each argument
   is a separate Lua string.
 
@@ -608,8 +634,12 @@ Two consequences worth knowing:
 
 - **Shader compile errors.** A failed compile shows a red Hyprland notification for 15 seconds with the first ~200 characters of the GLSL error log. The plugin remembers the failure's mtime and won't re-toast every frame — it just sits silent until the file changes on disk, then automatically retries the compile.
 - **Edits to a `.glsl` file aren't taking effect.** Edits are picked up automatically on the next draw — the cache is keyed by file mtime, so saving the file is enough. `reloadshaders()` is still available as a force-reload, but you shouldn't need it for ordinary edits.
-- **Plugin doesn't seem to be loaded.** Run `hyprctl plugins list` to confirm `HyprWindowShade` is present. If it isn't, check the path in your `hl.plugin.load(...)` line and rebuild with `./build.sh`.
-- **`attempt to index a nil value (field 'HyprWindowShade')`.** The plugin isn't loaded yet when the config evaluates this line. Make sure `hl.plugin.load(...)` runs first, or move the call inside a bind closure / `hl.on("hyprland.start", ...)`.
+- **Plugin doesn't seem to be loaded.** Run `hyprctl plugin list` to confirm `HyprWindowShade` is present. If it isn't: on hyprpm, run `hyprpm list` and check it's enabled; from source, check the path in your `hyprctl plugin load` line and rebuild with `./build.sh`. If the plugin was fine and suddenly isn't, verify the binary wasn't truncated by an unclean shutdown — `build.sh` leaves a `.md5` next to it for exactly this:
+  ```sh
+  P=~/.local/share/hyprland/plugins/HyprWindowShade.so
+  [ "$(md5sum < "$P")" = "$(cat "$P.md5")" ] && echo intact || echo CORRUPT — rebuild
+  ```
+- **`attempt to index a nil value (field 'HyprWindowShade')`.** The plugin isn't loaded yet when the config evaluates this line. Expected — the plugin loads at session start, so anything touching `hl.plugin.HyprWindowShade` at parse time runs too early. Move the call inside a bind closure or into your `hl.on("hyprland.start", ...)` block, after the load.
 - **Dispatchers do nothing from a Lua bind.** Hyprland 0.55+ doesn't surface plugin dispatchers to Lua configs — use the `hl.plugin.HyprWindowShade.*` functions instead (see [Lua API](#lua-api)). `hyprctl dispatch` from a shell still works.
 - **Shader doesn't show on a fullscreen window.** That is the default: fullscreen drops a window's shaders so games and videos are left alone. Add `+shader_fullscreen:/path.glsl` for a shader that applies only while fullscreen, or `+shader_fullscreen_stack:1` to keep the window's normal stack. See [fullscreen](#fullscreen).
 - **A catch-all rule is overriding a per-app rule.** Hyprland keeps tags in an alphabetically sorted set, so two rules setting the same tag on one window resolve by whichever *path* sorts later, not by which rule is more specific. Stacking doesn't help — both tags write the same layer. Mark the catch-all as a [fallback](#fallback-rules) with the `_default` suffix.

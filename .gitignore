@@ -1,0 +1,7 @@
+# Build artifacts. `make all` writes the .so into the repo root, and build.sh
+# writes an intermediate one next to it — hyprpm builds in a clone of this repo,
+# so neither should ever be committed.
+HyprWindowShade.so
+*.so
+*.so.build
+*.so.md5
