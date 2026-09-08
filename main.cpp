@@ -20,6 +20,7 @@ std::unordered_map<Desktop::View::CWindow*, std::chrono::steady_clock::time_poin
 std::unordered_map<Desktop::View::CLayerSurface*, std::chrono::steady_clock::time_point> g_mLayerOpenTimes;
 std::unordered_map<Desktop::IFadeout*, FadeoutAnim>   g_mFadeoutAnims;
 std::unordered_map<Desktop::View::CWindow*, MotionRecord> g_mWindowMotion;
+std::unordered_map<Desktop::View::CWindow*, OneShotAnim>  g_mWindowOneShots;
 CFunctionHook*                                        g_pGLDrawTexHook          = nullptr;
 CFunctionHook*                                        g_pUseShaderHook          = nullptr;
 CFunctionHook*                                        g_pFadeoutCreateHook      = nullptr;
@@ -319,11 +320,21 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     g_Listeners.push_back(Event::bus()->m_events.window.active.listen([](auto window, auto reason) {
         // Only the previously- and currently-active windows can change appearance.
-        if (auto prev = g_lastActiveWindow.lock(); prev && g_mWindowRuleShaders.find(prev.get()) != g_mWindowRuleShaders.end())
+        if (auto prev = g_lastActiveWindow.lock(); prev && g_mWindowRuleShaders.find(prev.get()) != g_mWindowRuleShaders.end()) {
+            latchOneShot(prev.get(), ONESHOT_UNFOCUS);
             g_pHyprRenderer->damageWindow(prev);
-        if (window && g_mWindowRuleShaders.find(window.get()) != g_mWindowRuleShaders.end())
+        }
+        if (window && g_mWindowRuleShaders.find(window.get()) != g_mWindowRuleShaders.end()) {
+            latchOneShot(window.get(), ONESHOT_FOCUS);
             g_pHyprRenderer->damageWindow(window);
+        }
         g_lastActiveWindow = window;
+    }));
+
+    g_Listeners.push_back(Event::bus()->m_events.window.urgent.listen([](PHLWINDOW window) {
+        if (!window) return;
+        latchOneShot(window.get(), ONESHOT_URGENT);
+        g_pHyprRenderer->damageWindow(window);
     }));
 
     // Both listeners read the state AFTER the flip — measured, these events fire
@@ -364,6 +375,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         g_mWindowRuleShaders.erase(rawWin);
         g_mWindowOpenTimes.erase(rawWin);
         g_mWindowMotion.erase(rawWin);
+        g_mWindowOneShots.erase(rawWin);
     }));
 
     // --- DISPATCHERS (.conf-style — Hyprland's native bind path) ---
@@ -462,6 +474,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
     g_mWindowOpenTimes.clear();
     g_mLayerOpenTimes.clear();
     g_mWindowMotion.clear();
+    g_mWindowOneShots.clear();
     // Any fadeout we were holding open falls back to Hyprland's own `done` as
     // soon as the hooks come off below.
     g_mFadeoutAnims.clear();

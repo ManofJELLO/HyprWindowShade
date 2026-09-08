@@ -149,6 +149,9 @@ Apply a shader to a window with a `tag` on a window rule. Ten tags are supported
 | `+shader_fullscreen_exit:/path.glsl` | Plays when leaving fullscreen |
 | `+shader_float:/path.glsl` | Plays when a window becomes floating |
 | `+shader_tile:/path.glsl` | Plays when a window becomes tiled |
+| `+shader_urgent:/path.glsl` | Plays once when the window is marked urgent |
+| `+shader_focus:/path.glsl` | Plays once when the window gains focus |
+| `+shader_unfocus:/path.glsl` | Plays once when the window loses focus |
 | `+shader_replace:1` | Opts this window out of [stacking](#stacking) |
 | `+shader_fullscreen_stack:1` | Keeps this window's shaders while it is [fullscreen](#fullscreen) |
 
@@ -627,6 +630,38 @@ window already has, and `+shader_fullscreen_exit:` overrides it.
 Float and tile both animate by default and fall through to the generic shader when no
 specific tag is set.
 
+### One-shot cues: urgent and focus
+
+These ride no compositor animation at all — nothing is moving — so they work like
+`shader_open:`: the shader declares its own `// @duration` and `progress` runs 0 → 1
+across it. An `@<sec>` suffix on these tags therefore overrides the **duration**, not a
+settle tail.
+
+```lua
+hl.window_rule({
+    name  = "pulse-on-urgent",
+    match = { class = ".*" },
+    tag   = "+shader_urgent:/home/USERNAME/.config/hypr/shaders/pulse.glsl",
+})
+```
+
+`shader_focus:` / `shader_unfocus:` fire on the *transition*, and are distinct from
+`shader_active:` / `shader_inactive:`, which describe the steady state.
+
+**Priority.** Only one animation plays at a time, resolved in this order:
+
+1. **open / close** — a window appearing or leaving outranks everything
+2. **urgent** — an alert; rare, and worth seeing even mid-motion
+3. **transforms** — move, resize, workspace, fullscreen, float
+4. **focus / unfocus** — last, deliberately
+
+Focus is last because `window.active` fires on *every workspace switch*. Ranked above
+transforms it would fight the workspace shader on every single switch. A focus pulse
+whose duration outlives the transform will still play out its remainder afterwards.
+
+Give a one-shot shader an envelope that returns to where it started — `sin(progress *
+PI)` rises and falls — or the window will step back to its normal appearance at the end.
+
 ### Measured velocity ranges
 
 Worth knowing before picking constants, because these are far apart and a single gain
@@ -769,7 +804,7 @@ Declare any of these in your fragment shader and the plugin will populate them e
 | `is_moving` | `float` | 1.0 while the position is animating |
 | `is_resizing` | `float` | 1.0 while the size is animating |
 | `is_dragging` | `float` | 1.0 while the user is physically dragging this window |
-| `anim_kind` | `float` | 0 none, 1 move, 2 resize, 3 workspace switch |
+| `anim_kind` | `float` | 0 none, 1 move, 2 resize, 3 workspace, 4 urgent, 5 focus, 6 unfocus |
 | `curve` | `float` | eased progress; **can go below 0.0 or above 1.0** — an overshoot bezier anticipates backwards before moving (measured range −0.04 … 1.02) |
 | `duration` | `float` | seconds the transform will take; −1 when the curve has none |
 | `settle` | `float` | 0 → 1 across the post-motion tail; 0 while still moving |

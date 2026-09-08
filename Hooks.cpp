@@ -20,6 +20,7 @@ float               g_pCurrentAnimProgress   = -1.0f;
 float               g_pCurrentAnimSeed       = -1.0f;
 const MotionRecord* g_pCurrentMotion         = nullptr;
 float               g_pCurrentSettle         = -1.0f;
+uint8_t             g_pCurrentOneShotKind    = TRANSFORM_NONE;
 Vector2D            g_pCurrentBoxSize;
 float               g_pCurrentRound          = 0.0f;
 float               g_pCurrentRoundPower     = 2.0f;
@@ -332,6 +333,63 @@ static float animVarDuration(const CAnimatedVariable<Vector2D>* av) {
 // of animating it, isBeingAnimated() stays false, and no transform shader runs.
 // The user's per-operation preference is inherited for free, with no config
 // reads and no branching.
+void latchOneShot(Desktop::View::CWindow* raw, uint8_t kind) {
+    if (!raw) return;
+    // Cheap gate: only windows that actually carry a one-shot rule get an
+    // entry, so focus changes on ordinary windows cost one map lookup and
+    // nothing else. Focus events fire constantly.
+    auto rIt = g_mWindowRuleShaders.find(raw);
+    if (rIt == g_mWindowRuleShaders.end()) return;
+    const auto& st = rIt->second;
+    const bool  wanted = (kind == ONESHOT_URGENT  && !st.urgentAnim.empty())
+                      || (kind == ONESHOT_FOCUS   && !st.focusAnim.empty())
+                      || (kind == ONESHOT_UNFOCUS && !st.unfocusAnim.empty());
+    if (!wanted) return;
+
+    g_mWindowOneShots[raw] = OneShotAnim{kind, std::chrono::steady_clock::now()};
+}
+
+// One-shot animation for a live window: an attention pulse or a focus
+// transition. Mirrors resolveOpenAnim exactly — there is no compositor
+// animation to ride, so the shader declares its own duration and this runs it
+// down and clears itself.
+static const std::string* resolveOneShotAnim(const PHLWINDOW& pWindow, bool urgentOnly) {
+    if (g_mWindowOneShots.empty()) return nullptr;
+
+    Desktop::View::CWindow* raw = pWindow.get();
+    auto oIt = g_mWindowOneShots.find(raw);
+    if (oIt == g_mWindowOneShots.end()) return nullptr;
+
+    // Urgency is an alert and outranks motion; a focus flicker does not, and is
+    // asked for separately once the transform paths have declined.
+    if (urgentOnly && oIt->second.kind != ONESHOT_URGENT) return nullptr;
+
+    auto rIt = g_mWindowRuleShaders.find(raw);
+    if (rIt == g_mWindowRuleShaders.end()) { g_mWindowOneShots.erase(oIt); return nullptr; }
+    const auto& state = rIt->second;
+
+    const std::string* path = nullptr;
+    float              dur  = -1.0f;
+    uint8_t            kind = TRANSFORM_NONE;
+    switch (oIt->second.kind) {
+        case ONESHOT_URGENT:  path = &state.urgentAnim;  dur = state.urgentDuration;  kind = TRANSFORM_URGENT;  break;
+        case ONESHOT_FOCUS:   path = &state.focusAnim;   dur = state.focusDuration;   kind = TRANSFORM_FOCUS;   break;
+        case ONESHOT_UNFOCUS: path = &state.unfocusAnim; dur = state.unfocusDuration; kind = TRANSFORM_UNFOCUS; break;
+        default: break;
+    }
+    if (!path || path->empty()) { g_mWindowOneShots.erase(oIt); return nullptr; }
+
+    const float duration = resolveAnimDuration(*path, dur);
+    const float elapsed  = secondsSince(oIt->second.start);
+    if (elapsed >= duration) { g_mWindowOneShots.erase(oIt); return nullptr; }
+
+    g_pCurrentAnimProgress = elapsed / duration;
+    g_pCurrentSettle       = -1.0f;
+    g_pCurrentAnimSeed     = animSeedFor(raw);
+    g_pCurrentOneShotKind  = kind;
+    return path;
+}
+
 // Records what kind of change is about to cause a motion. Called from the
 // fullscreen/floating listeners, which fire once at the toggle; the motion they
 // cause starts on this frame or the next.
@@ -957,6 +1015,7 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
     g_pCurrentAnimProgress = -1.0f;
     g_pCurrentAnimSeed     = -1.0f;
     g_pCurrentSettle       = -1.0f;
+    g_pCurrentOneShotKind  = TRANSFORM_NONE;
 
     // Motion is published to every stage, not just a `shader_move:` one — a
     // permanent shader is entitled to react to its window being thrown around.
@@ -994,10 +1053,17 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
     const std::string* animPath = nullptr;
     if (pWindow) {
         animPath = resolveOpenAnim(pWindow);
-        // An open animation outranks a transform. A window animating into place
-        // on map is genuinely "moving", so without this a window carrying both
-        // rules would try to play two one-shot shaders into the same slot.
+        // Priority, and the ordering is deliberate:
+        //   open/close  — a window appearing or leaving outranks everything.
+        //   urgent      — an alert. Rare, and the user needs to see it even
+        //                 while the window happens to be moving.
+        //   transform   — move/resize/workspace.
+        //   focus       — LAST, because window.active fires on every workspace
+        //                 switch. Ranked above transforms it would fight the
+        //                 workspace shader on every single switch.
+        if (!animPath) animPath = resolveOneShotAnim(pWindow, /* urgentOnly */ true);
         if (!animPath) animPath = resolveTransformAnim(pWindow);
+        if (!animPath) animPath = resolveOneShotAnim(pWindow, /* urgentOnly */ false);
     } else if (pLS)
         animPath = resolveLayerOpenAnim(pLS);
     else if (elem && !elem->m_data.surface && elem->m_data.tex)
@@ -1005,9 +1071,10 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
 
     // The resolvers above set the progress/seed globals as a side effect. Hold
     // them aside: only the animation stage should see a real `progress`.
-    const float animProgress = g_pCurrentAnimProgress;
-    const float animSeed     = g_pCurrentAnimSeed;
-    const float animSettle   = g_pCurrentSettle;
+    const float   animProgress = g_pCurrentAnimProgress;
+    const float   animSeed     = g_pCurrentAnimSeed;
+    const float   animSettle   = g_pCurrentSettle;
+    const uint8_t animOneShot  = g_pCurrentOneShotKind;
 
     if (pWindow && windowReplaceMode(pWindow)) {
         // Opt-out: first match wins, exactly as it did before stacking existed.
@@ -1059,6 +1126,7 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
     // `settle` is scoped to the animation stage for the same reason: the tail's
     // length is a property of the transform shader, and a base layer has none.
     g_pCurrentSettle         = topIsAnim ? animSettle : -1.0f;
+    g_pCurrentOneShotKind    = topIsAnim ? animOneShot : TRANSFORM_NONE;
 
     // Schedule continuous redraw if any stage uses `time`, or while a one-shot
     // animation is mid-flight — an animation shader drives itself off `progress`
@@ -1087,6 +1155,7 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
     g_pCurrentAnimProgress   = -1.0f;
     g_pCurrentAnimSeed       = -1.0f;
     g_pCurrentSettle         = -1.0f;
+    g_pCurrentOneShotKind    = TRANSFORM_NONE;
     g_pCurrentMotion         = nullptr;
     g_pCurrentRound          = 0.0f;
 }
@@ -1211,8 +1280,13 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
             glUniform1f(activeEntry->isResizingLoc, (g_pCurrentMotion && g_pCurrentMotion->resizing) ? 1.0f : 0.0f);
         if (activeEntry->isDraggingLoc >= 0)
             glUniform1f(activeEntry->isDraggingLoc, (g_pCurrentMotion && g_pCurrentMotion->dragging) ? 1.0f : 0.0f);
-        if (activeEntry->animKindLoc >= 0)
-            glUniform1f(activeEntry->animKindLoc, g_pCurrentMotion ? (float)g_pCurrentMotion->kind : 0.0f);
+        if (activeEntry->animKindLoc >= 0) {
+            // A one-shot has no motion record, so it reports its kind through
+            // its own global; motion supplies it otherwise.
+            const float k = g_pCurrentOneShotKind != TRANSFORM_NONE ? (float)g_pCurrentOneShotKind
+                          : (g_pCurrentMotion ? (float)g_pCurrentMotion->kind : 0.0f);
+            glUniform1f(activeEntry->animKindLoc, k);
+        }
         if (activeEntry->curveLoc >= 0) {
             // Matches `progress`: a shader bound as an ordinary layer, outside
             // any transform, should render its finished state rather than its
@@ -1462,6 +1536,9 @@ void applyShaderRulesSafe(PHLWINDOW pWindow) {
         else if (key == "shader_fullscreen_exit")  assignAnim(dst.fsExitAnim,  dst.fsExitSettle);
         else if (key == "shader_float")      assignAnim(dst.floatAnim, dst.floatSettle);
         else if (key == "shader_tile")       assignAnim(dst.tileAnim,  dst.tileSettle);
+        else if (key == "shader_urgent")     assignAnim(dst.urgentAnim,  dst.urgentDuration);
+        else if (key == "shader_focus")      assignAnim(dst.focusAnim,   dst.focusDuration);
+        else if (key == "shader_unfocus")    assignAnim(dst.unfocusAnim, dst.unfocusDuration);
         // Not a shader, and deliberately has no `_default` form: "unset" and
         // "explicitly false" are the same value for a bool, so a default could
         // never be overridden back off by a more specific rule. Also does not
@@ -1508,6 +1585,9 @@ void applyShaderRulesSafe(PHLWINDOW pWindow) {
     fillAnim(state.fsExitAnim,  state.fsExitSettle,  defaults.fsExitAnim,  defaults.fsExitSettle);
     fillAnim(state.floatAnim,   state.floatSettle,   defaults.floatAnim,   defaults.floatSettle);
     fillAnim(state.tileAnim,    state.tileSettle,    defaults.tileAnim,    defaults.tileSettle);
+    fillAnim(state.urgentAnim,  state.urgentDuration,  defaults.urgentAnim,  defaults.urgentDuration);
+    fillAnim(state.focusAnim,   state.focusDuration,   defaults.focusAnim,   defaults.focusDuration);
+    fillAnim(state.unfocusAnim, state.unfocusDuration, defaults.unfocusAnim, defaults.unfocusDuration);
 
     if (hasRules) {
         g_mWindowRuleShaders[rawWin] = std::move(state);

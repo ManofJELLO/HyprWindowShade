@@ -116,6 +116,13 @@ struct WindowShaderState {
     float       floatSettle       = -1.0f;
     std::string tileAnim;
     float       tileSettle        = -1.0f;
+    // One-shots. `@<sec>` here overrides the DURATION, as with open/close.
+    std::string urgentAnim;
+    float       urgentDuration    = -1.0f;
+    std::string focusAnim;
+    float       focusDuration     = -1.0f;
+    std::string unfocusAnim;
+    float       unfocusDuration   = -1.0f;
     // `shader_replace:1` opts this window out of stacking and back to the
     // first-match-wins ladder the plugin used before stacking existed.
     bool        replaceMode       = false;
@@ -197,6 +204,11 @@ enum eTransformKind : uint8_t {
     // the monitor. Measured: during a switch the window's own animvars stay
     // idle and only CWorkspace::m_renderOffset animates.
     TRANSFORM_WORKSPACE = 3,
+    // One-shots share the same `anim_kind` numbering so a single shader can
+    // branch on everything it might be invoked for.
+    TRANSFORM_URGENT    = 4,
+    TRANSFORM_FOCUS     = 5,
+    TRANSFORM_UNFOCUS   = 6,
 };
 
 // What KIND of change caused the motion, as opposed to which animation is
@@ -214,6 +226,29 @@ enum eTransformFlavour : uint8_t {
     FLAVOUR_FLOAT, // became floating
     FLAVOUR_TILE,  // became tiled
 };
+
+// One-shot animations that ride no compositor animation at all. Unlike a
+// transform there is nothing moving to take progress from, so these declare a
+// duration exactly the way shader_open:/shader_close: do — and an `@<sec>`
+// suffix on these tags means a DURATION, not a settle tail.
+enum eOneShotKind : uint8_t {
+    ONESHOT_NONE = 0,
+    ONESHOT_URGENT,
+    ONESHOT_FOCUS,
+    ONESHOT_UNFOCUS,
+};
+
+struct OneShotAnim {
+    uint8_t                               kind = ONESHOT_NONE;
+    std::chrono::steady_clock::time_point start{};
+};
+// At most one in flight per window: a newer event replaces an older one rather
+// than queueing, since these are all sub-second attention cues and stacking
+// them would just look like a stutter.
+extern std::unordered_map<Desktop::View::CWindow*, OneShotAnim> g_mWindowOneShots;
+
+// Records a one-shot for this window, replacing any already running.
+void latchOneShot(Desktop::View::CWindow* raw, uint8_t kind);
 
 // Per-window motion state, sampled once per frame from the window's own
 // animated variables rather than from the pass element's box.
@@ -429,6 +464,9 @@ extern const MotionRecord* g_pCurrentMotion;
 // apart from the record because the tail's length belongs to the *shader*,
 // which isn't known until the draw path has resolved and compiled it.
 extern float               g_pCurrentSettle;
+// Which one-shot is playing for the current draw, or TRANSFORM_NONE. A one-shot
+// has no motion record to carry `anim_kind`, so it rides here instead.
+extern uint8_t             g_pCurrentOneShotKind;
 extern Vector2D            g_pCurrentBoxSize;
 extern float               g_pCurrentRound;
 extern float               g_pCurrentRoundPower;
