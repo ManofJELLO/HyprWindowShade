@@ -326,8 +326,20 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         g_lastActiveWindow = window;
     }));
 
+    // Both listeners read the state AFTER the flip — measured, these events fire
+    // once the toggle has already taken effect, so the direction is whatever the
+    // window now reports rather than something that has to be tracked.
     g_Listeners.push_back(Event::bus()->m_events.window.fullscreen.listen([](auto window) {
-        if (window) g_pHyprRenderer->damageWindow(window);
+        if (!window) return;
+        latchTransformFlavour(window.get(), Fullscreen::controller()->isFullscreen(window)
+                                                ? FLAVOUR_FULLSCREEN_ENTER : FLAVOUR_FULLSCREEN_EXIT);
+        g_pHyprRenderer->damageWindow(window);
+    }));
+
+    g_Listeners.push_back(Event::bus()->m_events.window.floating.listen([](PHLWINDOW window) {
+        if (!window) return;
+        latchTransformFlavour(window.get(), window->m_isFloating ? FLAVOUR_FLOAT : FLAVOUR_TILE);
+        g_pHyprRenderer->damageWindow(window);
     }));
 
     // Sample window motion once per frame, before anything is drawn, so every

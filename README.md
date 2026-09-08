@@ -145,6 +145,10 @@ Apply a shader to a window with a `tag` on a window rule. Ten tags are supported
 | `+shader_move:/path.glsl` | Plays while the window is being moved |
 | `+shader_resize:/path.glsl` | Plays while the window is being resized |
 | `+shader_workspace:/path.glsl` | Plays while the window's workspace slides in or out |
+| `+shader_fullscreen_enter:/path.glsl` | Plays when entering fullscreen — **opt-in**, see below |
+| `+shader_fullscreen_exit:/path.glsl` | Plays when leaving fullscreen |
+| `+shader_float:/path.glsl` | Plays when a window becomes floating |
+| `+shader_tile:/path.glsl` | Plays when a window becomes tiled |
 | `+shader_replace:1` | Opts this window out of [stacking](#stacking) |
 | `+shader_fullscreen_stack:1` | Keeps this window's shaders while it is [fullscreen](#fullscreen) |
 
@@ -603,6 +607,25 @@ covers moves, drags and workspace switches, and `move_delta` reports the full sl
 `anim_kind` reads 3 so a shader can tell a workspace slide from an ordinary move. A
 workspace slide is matched **before** `shader_move:`, so a window carrying both rules
 plays the workspace one for a switch rather than both competing.
+
+### Fullscreen and float toggles
+
+Toggling fullscreen, or float↔tile, is *mechanically* just a move and a resize, so
+`+shader_move:` / `+shader_resize:` already fire for them. The tags above exist so you
+can give those particular transitions a different look, and they take precedence over
+the generic ones.
+
+**Entering fullscreen is silent by default.** If no `+shader_fullscreen_enter:` is set,
+the generic move/resize shader is *suppressed* rather than played — a window going
+fullscreen is usually a game or a video, which is the least welcome place for an
+effect. This is the same reasoning that makes `+shader_fullscreen:` opt-in for the
+steady state.
+
+**Leaving fullscreen animates by default**, using whatever move/resize shader the
+window already has, and `+shader_fullscreen_exit:` overrides it.
+
+Float and tile both animate by default and fall through to the generic shader when no
+specific tag is set.
 
 ### Measured velocity ranges
 

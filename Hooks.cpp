@@ -297,6 +297,11 @@ static constexpr float MIN_VELOCITY_DT = 0.002f; // 2ms — well under any real 
 // without visibly lagging the cursor.
 static constexpr float DRAG_VELOCITY_TAU = 0.045f;
 
+// How long a latched flavour survives without a motion starting. Long enough to
+// bridge the gap between the toggle event and the first animated frame, short
+// enough that a toggle which animates nothing does not leave a stale record.
+static constexpr float FLAVOUR_GRACE = 0.25f;
+
 // How long one run of an animated variable lasts, in seconds.
 static float animVarDuration(const CAnimatedVariable<Vector2D>* av) {
     // A spring has no duration — it runs until it settles — so there is no
@@ -327,6 +332,16 @@ static float animVarDuration(const CAnimatedVariable<Vector2D>* av) {
 // of animating it, isBeingAnimated() stays false, and no transform shader runs.
 // The user's per-operation preference is inherited for free, with no config
 // reads and no branching.
+// Records what kind of change is about to cause a motion. Called from the
+// fullscreen/floating listeners, which fire once at the toggle; the motion they
+// cause starts on this frame or the next.
+void latchTransformFlavour(Desktop::View::CWindow* raw, uint8_t flavour) {
+    if (!raw) return;
+    auto& rec     = g_mWindowMotion[raw];
+    rec.flavour   = flavour;
+    rec.flavourAt = std::chrono::steady_clock::now();
+}
+
 // The window the user is physically dragging right now, or nullptr. Asked once
 // per frame rather than per window: the drag controller is global state, and a
 // drag involves exactly one target.
@@ -531,7 +546,11 @@ void updateMotionRecords() {
 
         if (!inMotion) {
             const float since = std::chrono::duration_cast<std::chrono::duration<float>>(now - rec.motionEnd).count();
-            if (!rec.settling || since > MAX_ANIM_DURATION)
+            // A flavour latched moments ago has not had its motion start yet;
+            // dropping the record here would lose it before it is ever used.
+            const float sinceFlavour = std::chrono::duration_cast<std::chrono::duration<float>>(now - rec.flavourAt).count();
+            const bool  freshFlavour = rec.flavour != FLAVOUR_NONE && sinceFlavour < FLAVOUR_GRACE;
+            if (!freshFlavour && (!rec.settling || since > MAX_ANIM_DURATION))
                 g_mWindowMotion.erase(it);
         }
     }
@@ -566,11 +585,41 @@ static const std::string* resolveTransformAnim(const PHLWINDOW& pWindow) {
     // for a workspace switch.
     const std::string* path       = nullptr;
     float              ruleSettle = -1.0f;
-    if (wantWs && !state.workspaceAnim.empty()) {
+
+    // Flavour-specific tags outrank the generic move/resize ones: a fullscreen
+    // toggle IS a move and a resize, so without this it is indistinguishable
+    // from any other motion.
+    bool suppressGeneric = false;
+    switch (rec.flavour) {
+        case FLAVOUR_FULLSCREEN_ENTER:
+            // Silent unless explicitly asked for. A window going fullscreen is
+            // usually a game or a video, which is the least welcome place for
+            // an effect — the same reason `shader_fullscreen:` is opt-in for
+            // the steady state. Note this SUPPRESSES the generic move/resize
+            // shader rather than falling through to it; entering fullscreen is
+            // mechanically a move and a resize, so without this it would
+            // animate by default.
+            if (!state.fsEnterAnim.empty()) { path = &state.fsEnterAnim; ruleSettle = state.fsEnterSettle; }
+            else                            suppressGeneric = true;
+            break;
+        case FLAVOUR_FULLSCREEN_EXIT:
+            if (!state.fsExitAnim.empty()) { path = &state.fsExitAnim; ruleSettle = state.fsExitSettle; }
+            break;
+        case FLAVOUR_FLOAT:
+            if (!state.floatAnim.empty())  { path = &state.floatAnim;  ruleSettle = state.floatSettle; }
+            break;
+        case FLAVOUR_TILE:
+            if (!state.tileAnim.empty())   { path = &state.tileAnim;   ruleSettle = state.tileSettle; }
+            break;
+        default: break;
+    }
+    if (suppressGeneric) return nullptr;
+
+    if (!path && wantWs && !state.workspaceAnim.empty()) {
         path = &state.workspaceAnim; ruleSettle = state.workspaceSettle;
-    } else if (wantMove && !state.moveAnim.empty()) {
+    } else if (!path && wantMove && !state.moveAnim.empty()) {
         path = &state.moveAnim;   ruleSettle = state.moveSettle;
-    } else if (wantResize && !state.resizeAnim.empty()) {
+    } else if (!path && wantResize && !state.resizeAnim.empty()) {
         path = &state.resizeAnim; ruleSettle = state.resizeSettle;
     }
     if (!path) return nullptr;
@@ -1409,6 +1458,10 @@ void applyShaderRulesSafe(PHLWINDOW pWindow) {
         else if (key == "shader_move")       assignAnim(dst.moveAnim,   dst.moveSettle);
         else if (key == "shader_resize")     assignAnim(dst.resizeAnim,    dst.resizeSettle);
         else if (key == "shader_workspace")  assignAnim(dst.workspaceAnim, dst.workspaceSettle);
+        else if (key == "shader_fullscreen_enter") assignAnim(dst.fsEnterAnim, dst.fsEnterSettle);
+        else if (key == "shader_fullscreen_exit")  assignAnim(dst.fsExitAnim,  dst.fsExitSettle);
+        else if (key == "shader_float")      assignAnim(dst.floatAnim, dst.floatSettle);
+        else if (key == "shader_tile")       assignAnim(dst.tileAnim,  dst.tileSettle);
         // Not a shader, and deliberately has no `_default` form: "unset" and
         // "explicitly false" are the same value for a bool, so a default could
         // never be overridden back off by a more specific rule. Also does not
@@ -1451,6 +1504,10 @@ void applyShaderRulesSafe(PHLWINDOW pWindow) {
     fillAnim(state.moveAnim,   state.moveSettle,        defaults.moveAnim,   defaults.moveSettle);
     fillAnim(state.resizeAnim, state.resizeSettle,      defaults.resizeAnim, defaults.resizeSettle);
     fillAnim(state.workspaceAnim, state.workspaceSettle, defaults.workspaceAnim, defaults.workspaceSettle);
+    fillAnim(state.fsEnterAnim, state.fsEnterSettle, defaults.fsEnterAnim, defaults.fsEnterSettle);
+    fillAnim(state.fsExitAnim,  state.fsExitSettle,  defaults.fsExitAnim,  defaults.fsExitSettle);
+    fillAnim(state.floatAnim,   state.floatSettle,   defaults.floatAnim,   defaults.floatSettle);
+    fillAnim(state.tileAnim,    state.tileSettle,    defaults.tileAnim,    defaults.tileSettle);
 
     if (hasRules) {
         g_mWindowRuleShaders[rawWin] = std::move(state);

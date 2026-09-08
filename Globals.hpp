@@ -103,6 +103,19 @@ struct WindowShaderState {
     float       resizeSettle      = -1.0f;
     std::string workspaceAnim;
     float       workspaceSettle   = -1.0f;
+    // Entering fullscreen is silent unless this is set: a window going
+    // fullscreen is usually a game or a video, and that is the least welcome
+    // place for an effect. Same reasoning as `shader_fullscreen:` being opt-in
+    // for the steady state. Leaving fullscreen animates with the window's
+    // ordinary move/resize shader unless overridden here.
+    std::string fsEnterAnim;
+    float       fsEnterSettle     = -1.0f;
+    std::string fsExitAnim;
+    float       fsExitSettle      = -1.0f;
+    std::string floatAnim;
+    float       floatSettle       = -1.0f;
+    std::string tileAnim;
+    float       tileSettle        = -1.0f;
     // `shader_replace:1` opts this window out of stacking and back to the
     // first-match-wins ladder the plugin used before stacking existed.
     bool        replaceMode       = false;
@@ -186,6 +199,22 @@ enum eTransformKind : uint8_t {
     TRANSFORM_WORKSPACE = 3,
 };
 
+// What KIND of change caused the motion, as opposed to which animation is
+// driving it. Fullscreen and float toggles are mechanically just a move and a
+// resize, so without this they are indistinguishable from any other move — and
+// they are the two cases where a user most often wants different treatment.
+//
+// Latched from the window.fullscreen / window.floating events, which were
+// measured to fire AFTER the state flips, so the new state read inside the
+// handler gives the direction directly.
+enum eTransformFlavour : uint8_t {
+    FLAVOUR_NONE = 0,
+    FLAVOUR_FULLSCREEN_ENTER,
+    FLAVOUR_FULLSCREEN_EXIT,
+    FLAVOUR_FLOAT, // became floating
+    FLAVOUR_TILE,  // became tiled
+};
+
 // Per-window motion state, sampled once per frame from the window's own
 // animated variables rather than from the pass element's box.
 //
@@ -250,6 +279,13 @@ struct MotionRecord {
     // `is_dragging` to tell the two regimes apart.
     bool     dragging     = false;
     bool     wasDragging  = false;
+
+    // Latched when the toggle fires, held for the motion that follows it, and
+    // cleared with the record. The grace stamp keeps a freshly latched flavour
+    // alive across the frame or two before the motion actually starts, which
+    // would otherwise let the prune drop it first.
+    uint8_t  flavour      = FLAVOUR_NONE;
+    std::chrono::steady_clock::time_point flavourAt{};
     // Last time this window's animation was actually running, used to bridge
     // the brief gaps between mouse events without inventing motion for a user
     // who turned drag animation off.
@@ -402,6 +438,7 @@ CompiledShader*                             getOrCompileShader(const std::string
 void                                        hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement> element, const CRegion& damage);
 Hyprutils::Memory::CWeakPointer<CShader>    hkUseShader(CHyprOpenGLImpl* thisptr, Hyprutils::Memory::CWeakPointer<CShader> prog);
 void                                        applyShaderRulesSafe(PHLWINDOW pWindow);
+void                                        latchTransformFlavour(Desktop::View::CWindow* raw, uint8_t flavour);
 
 // Close-animation hooks. hkFadeoutCreate tags a new fadeout with the closing
 // window's shader; hkFadeoutDone holds that fadeout open until the shader has
