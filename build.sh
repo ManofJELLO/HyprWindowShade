@@ -90,7 +90,18 @@ if [ "$BUILD_ONLY" -eq 1 ]; then
 fi
 
 echo "[Plugin] Unloading previous version from memory..."
-hyprctl plugin unload "$PLUGIN_PATH" 2>/dev/null
+# Unload by whatever path is actually mapped, not just ours. Once the plugin is
+# installed through hyprpm the running copy lives in hyprpm's cache, so
+# unloading "$PLUGIN_PATH" is a no-op and the load below then collides with an
+# already-registered plugin name.
+HYPR_PID=$(pidof Hyprland 2>/dev/null | awk '{print $1}')
+if [ -n "$HYPR_PID" ]; then
+    awk '/HyprWindowShade.*\.so/ {print $NF}' "/proc/$HYPR_PID/maps" 2>/dev/null | sort -u | while read -r p; do
+        [ -n "$p" ] && echo "          unloading $p" && hyprctl plugin unload "$p" >/dev/null 2>&1
+    done
+fi
+# Belt and braces for the case where /proc was unreadable.
+hyprctl plugin unload "$PLUGIN_PATH" >/dev/null 2>&1
 sleep 2
 
 # Confirm the old module actually left the compositor's address space. If glibc
@@ -164,3 +175,15 @@ if echo "$LOAD_OUT" | grep -qiE "could not be loaded|error"; then
 fi
 
 echo -e "${GREEN}[Success] HyprWindowShade is now live!${NC}"
+
+# If this plugin is also installed through hyprpm, the copy in hyprpm's cache is
+# what loads at the next login — not the one just built. Say so, rather than
+# letting a change appear to survive a reboot when it will not.
+HYPRPM_SO="/var/cache/hyprpm/$USER/HyprWindowShade/HyprWindowShade.so"
+if [ -f "$HYPRPM_SO" ] && ! cmp -s "$HYPRPM_SO" "$PLUGIN_PATH"; then
+    echo -e "${RED}[Note] hyprpm has a DIFFERENT build cached at${NC}"
+    echo "       $HYPRPM_SO"
+    echo "       That copy is what loads at your next login; this build is live"
+    echo "       for the current session only. To make it stick: commit, then"
+    echo "       run 'hyprpm update'."
+fi
