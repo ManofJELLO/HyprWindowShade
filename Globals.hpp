@@ -101,6 +101,8 @@ struct WindowShaderState {
     float       moveSettle        = -1.0f;
     std::string resizeAnim;
     float       resizeSettle      = -1.0f;
+    std::string workspaceAnim;
+    float       workspaceSettle   = -1.0f;
     // `shader_replace:1` opts this window out of stacking and back to the
     // first-match-wins ladder the plugin used before stacking existed.
     bool        replaceMode       = false;
@@ -178,6 +180,10 @@ enum eTransformKind : uint8_t {
     TRANSFORM_NONE   = 0,
     TRANSFORM_MOVE   = 1,
     TRANSFORM_RESIZE = 2,
+    // The window itself is not moving; its whole workspace is sliding across
+    // the monitor. Measured: during a switch the window's own animvars stay
+    // idle and only CWorkspace::m_renderOffset animates.
+    TRANSFORM_WORKSPACE = 3,
 };
 
 // Per-window motion state, sampled once per frame from the window's own

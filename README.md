@@ -144,6 +144,7 @@ Apply a shader to a window with a `tag` on a window rule. Ten tags are supported
 | `+shader_close:/path.glsl` | Plays once as the window closes |
 | `+shader_move:/path.glsl` | Plays while the window is being moved |
 | `+shader_resize:/path.glsl` | Plays while the window is being resized |
+| `+shader_workspace:/path.glsl` | Plays while the window's workspace slides in or out |
 | `+shader_replace:1` | Opts this window out of [stacking](#stacking) |
 | `+shader_fullscreen_stack:1` | Keeps this window's shaders while it is [fullscreen](#fullscreen) |
 
@@ -580,6 +581,29 @@ float ripple = sin(acrs * TAU + time * 6.5 * TAU);
 vec2  uv     = v_texcoord - dir * ripple * amplitude / surface_size;
 ```
 
+### Workspace transitions
+
+`+shader_workspace:` plays while the window's workspace slides across the monitor.
+
+```lua
+hl.window_rule({
+    name  = "wobble-on-workspace",
+    match = { class = "kitty" },
+    tag   = "+shader_workspace:/home/USERNAME/.config/hypr/shaders/slide.glsl",
+})
+```
+
+During a switch the window itself **does not move at all** — measured, its own
+animated variables stay completely idle and only `CWorkspace::m_renderOffset`
+animates, sliding the whole workspace. The plugin folds that offset into the position
+it differentiates, so `velocity` is always true *on-screen* velocity: one formula
+covers moves, drags and workspace switches, and `move_delta` reports the full slide.
+
+`is_moving` reads 1.0, because the window genuinely is traversing the screen, and
+`anim_kind` reads 3 so a shader can tell a workspace slide from an ordinary move. A
+workspace slide is matched **before** `shader_move:`, so a window carrying both rules
+plays the workspace one for a switch rather than both competing.
+
 ### Measured velocity ranges
 
 Worth knowing before picking constants, because these are far apart and a single gain
@@ -722,8 +746,8 @@ Declare any of these in your fragment shader and the plugin will populate them e
 | `is_moving` | `float` | 1.0 while the position is animating |
 | `is_resizing` | `float` | 1.0 while the size is animating |
 | `is_dragging` | `float` | 1.0 while the user is physically dragging this window |
-| `anim_kind` | `float` | 0 none, 1 move, 2 resize |
-| `curve` | `float` | eased progress; **can exceed 1.0** on an overshoot/spring curve |
+| `anim_kind` | `float` | 0 none, 1 move, 2 resize, 3 workspace switch |
+| `curve` | `float` | eased progress; **can go below 0.0 or above 1.0** — an overshoot bezier anticipates backwards before moving (measured range −0.04 … 1.02) |
 | `duration` | `float` | seconds the transform will take; −1 when the curve has none |
 | `settle` | `float` | 0 → 1 across the post-motion tail; 0 while still moving |
 

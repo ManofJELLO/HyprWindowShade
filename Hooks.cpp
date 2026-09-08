@@ -3,6 +3,8 @@
 #include <hyprland/src/layout/supplementary/DragController.hpp>
 #include <algorithm>
 #include <cmath>
+#include <hyprland/src/desktop/Workspace.hpp>
+#include <hyprland/src/desktop/Workspace.hpp>
 #include <string_view>
 
 #include <cstdio>
@@ -355,22 +357,37 @@ void updateMotionRecords() {
 
         auto&      posAnim  = w->positionAnimation();
         auto&      sizeAnim = w->sizeAnimation();
+        const auto ws       = w->m_workspace;
         const bool moving   = posAnim  && posAnim->isBeingAnimated();
         const bool resizing = sizeAnim && sizeAnim->isBeingAnimated();
+        const bool wsMoving = ws && ws->m_renderOffset && ws->m_renderOffset->isBeingAnimated();
 
         auto it = g_mWindowMotion.find(raw);
 
         // Fast path: on any given frame nearly every window is neither moving
         // nor settling. Two bool reads and a miss, then out.
-        if (!moving && !resizing && it == g_mWindowMotion.end()) continue;
+        if (!moving && !resizing && !wsMoving && it == g_mWindowMotion.end()) continue;
 
         if (it == g_mWindowMotion.end())
             it = g_mWindowMotion.emplace(raw, MotionRecord{}).first;
 
         MotionRecord&  rec  = it->second;
         rec.dragging        = (raw == draggedRaw);
-        const Vector2D pos  = posAnim  ? posAnim->value()  : Vector2D(0, 0);
-        const Vector2D size = sizeAnim ? sizeAnim->value() : Vector2D(0, 0);
+
+        // A window's on-screen position is its own position PLUS its
+        // workspace's render offset — during a switch the window does not move
+        // at all, the whole workspace slides. Folding the offset in here means
+        // velocity is always the true on-screen velocity, with one formula
+        // covering moves, drags and workspace transitions alike. Outside a
+        // switch the offset is (0,0), so nothing changes for the other paths.
+        //
+        // m_workspace is frequently null — measured, 56 of 60 sampled windows
+        // (unmapped Steam surfaces) had none — so this is not a defensive
+        // maybe, it is the common case.
+        const Vector2D wsOff  = (ws && ws->m_renderOffset) ? ws->m_renderOffset->value() : Vector2D(0, 0);
+        const Vector2D ownPos = posAnim ? posAnim->value() : Vector2D(0, 0);
+        const Vector2D pos    = ownPos + wsOff;
+        const Vector2D size   = sizeAnim ? sizeAnim->value() : Vector2D(0, 0);
 
         if (!rec.haveSample) {
             rec.pos        = pos;
@@ -406,7 +423,7 @@ void updateMotionRecords() {
         const bool wasInMotion = rec.moving || rec.resizing || rec.wasDragging;
         rec.moving             = moving;
         rec.resizing           = resizing;
-        if (moving || resizing) rec.lastAnimated = now;
+        if (moving || resizing || wsMoving) rec.lastAnimated = now;
 
         // Hyprland WARPS an interactive drag — measured: goal == value on every
         // frame of a 240-frame capture, and isBeingAnimated() never true, even
@@ -415,7 +432,7 @@ void updateMotionRecords() {
         // duration to report for it; velocity is the whole signal.
         const bool dragMoving   = rec.dragging && dragMode == MBIND_MOVE;
         const bool dragResizing = rec.dragging && dragMode != MBIND_MOVE && dragMode != MBIND_INVALID;
-        const bool inMotion     = moving || resizing || rec.dragging;
+        const bool inMotion     = moving || resizing || wsMoving || rec.dragging;
 
         if (inMotion) {
             // A new gesture starts its own peak; carrying the previous one over
@@ -433,11 +450,15 @@ void updateMotionRecords() {
             // travel across the screen is the more visible of the two. Both
             // `is_moving` and `is_resizing` are still reported truthfully, so a
             // shader that cares about the other one can still see it.
+            // A workspace switch outranks the window's own animation: the whole
+            // surface is travelling, which is the more visible motion, and
+            // measured the window's own animvars stay idle through one anyway.
             const CAnimatedVariable<Vector2D>* driver =
-                moving ? posAnim.get() : (resizing ? sizeAnim.get() : nullptr);
+                wsMoving ? ws->m_renderOffset.get()
+                         : (moving ? posAnim.get() : (resizing ? sizeAnim.get() : nullptr));
 
             if (driver) {
-                rec.kind     = moving ? TRANSFORM_MOVE : TRANSFORM_RESIZE;
+                rec.kind     = wsMoving ? TRANSFORM_WORKSPACE : (moving ? TRANSFORM_MOVE : TRANSFORM_RESIZE);
                 rec.progress = driver->getPercent();
                 rec.curve    = driver->getCurveValue();
                 rec.duration = animVarDuration(driver);
@@ -455,7 +476,7 @@ void updateMotionRecords() {
 
             // Reported truthfully during a drag as well: the window really is
             // moving or resizing, even though no animation is driving it.
-            rec.moving   = moving   || dragMoving;
+            rec.moving   = moving   || dragMoving || wsMoving;
             rec.resizing = resizing || dragResizing;
 
 
@@ -469,7 +490,13 @@ void updateMotionRecords() {
             // A drag has no trip at all: measured, begun/goal are one mouse
             // event apart, so reporting them as move_delta would hand the
             // shader a few pixels of jitter dressed up as a whole gesture.
-            if (moving && posAnim && !rec.dragging) { rec.begun = posAnim->begun(); rec.goal = posAnim->goal(); }
+            // Expressed in the same on-screen space as rec.pos, which already
+            // has the offset folded in — otherwise move_remaining (goal - pos)
+            // would subtract a window position from a workspace offset and
+            // produce a number in no coordinate space at all.
+            if (wsMoving)                           { rec.begun = ownPos + ws->m_renderOffset->begun();
+                                                      rec.goal  = ownPos + ws->m_renderOffset->goal(); }
+            else if (moving && posAnim && !rec.dragging) { rec.begun = posAnim->begun(); rec.goal = posAnim->goal(); }
             else                                    { rec.begun = rec.goal = rec.pos; }
 
             if (resizing && sizeAnim && !rec.dragging) { rec.sizeBegun = sizeAnim->begun(); rec.sizeGoal = sizeAnim->goal(); }
@@ -528,13 +555,20 @@ static const std::string* resolveTransformAnim(const PHLWINDOW& pWindow) {
 
     // While settling there is no live animation to ask, so `kind` carries which
     // one it was — the tail has to play the same shader the motion did.
-    const bool idle       = !rec.moving && !rec.resizing;
-    const bool wantMove   = rec.moving   || (idle && rec.kind == TRANSFORM_MOVE);
-    const bool wantResize = rec.resizing || (idle && rec.kind == TRANSFORM_RESIZE);
+    const bool idle      = !rec.moving && !rec.resizing;
+    const bool isWs      = rec.kind == TRANSFORM_WORKSPACE;
+    const bool wantWs    = isWs && (rec.moving || idle);
+    const bool wantMove  = !isWs && (rec.moving   || (idle && rec.kind == TRANSFORM_MOVE));
+    const bool wantResize = !isWs && (rec.resizing || (idle && rec.kind == TRANSFORM_RESIZE));
 
+    // A workspace slide is checked first: it is reported through is_moving too,
+    // so without this a window carrying both rules would play its move shader
+    // for a workspace switch.
     const std::string* path       = nullptr;
     float              ruleSettle = -1.0f;
-    if (wantMove && !state.moveAnim.empty()) {
+    if (wantWs && !state.workspaceAnim.empty()) {
+        path = &state.workspaceAnim; ruleSettle = state.workspaceSettle;
+    } else if (wantMove && !state.moveAnim.empty()) {
         path = &state.moveAnim;   ruleSettle = state.moveSettle;
     } else if (wantResize && !state.resizeAnim.empty()) {
         path = &state.resizeAnim; ruleSettle = state.resizeSettle;
@@ -1373,7 +1407,8 @@ void applyShaderRulesSafe(PHLWINDOW pWindow) {
         else if (key == "shader_open")       assignAnim(dst.openAnim,  dst.openAnimDuration);
         else if (key == "shader_close")      assignAnim(dst.closeAnim, dst.closeAnimDuration);
         else if (key == "shader_move")       assignAnim(dst.moveAnim,   dst.moveSettle);
-        else if (key == "shader_resize")     assignAnim(dst.resizeAnim, dst.resizeSettle);
+        else if (key == "shader_resize")     assignAnim(dst.resizeAnim,    dst.resizeSettle);
+        else if (key == "shader_workspace")  assignAnim(dst.workspaceAnim, dst.workspaceSettle);
         // Not a shader, and deliberately has no `_default` form: "unset" and
         // "explicitly false" are the same value for a bool, so a default could
         // never be overridden back off by a more specific rule. Also does not
@@ -1415,6 +1450,7 @@ void applyShaderRulesSafe(PHLWINDOW pWindow) {
     fillAnim(state.closeAnim,  state.closeAnimDuration, defaults.closeAnim,  defaults.closeAnimDuration);
     fillAnim(state.moveAnim,   state.moveSettle,        defaults.moveAnim,   defaults.moveSettle);
     fillAnim(state.resizeAnim, state.resizeSettle,      defaults.resizeAnim, defaults.resizeSettle);
+    fillAnim(state.workspaceAnim, state.workspaceSettle, defaults.workspaceAnim, defaults.workspaceSettle);
 
     if (hasRules) {
         g_mWindowRuleShaders[rawWin] = std::move(state);
