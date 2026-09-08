@@ -1,5 +1,7 @@
 #include "Globals.hpp"
+#include <algorithm>
 #include <string_view>
+
 #include <cstdio>
 
 // --- ACTIVE RENDER CONTEXT ---
@@ -11,6 +13,8 @@ PHLLSREF            g_pCurrentRenderLayer;
 CompiledShader*     g_pCurrentCompiledShader = nullptr;
 float               g_pCurrentAnimProgress   = -1.0f;
 float               g_pCurrentAnimSeed       = -1.0f;
+const MotionRecord* g_pCurrentMotion         = nullptr;
+float               g_pCurrentSettle         = -1.0f;
 Vector2D            g_pCurrentBoxSize;
 float               g_pCurrentRound          = 0.0f;
 float               g_pCurrentRoundPower     = 2.0f;
@@ -271,6 +275,211 @@ static const std::string* resolveCloseAnim(const SP<Render::ITexture>& tex, PHLM
         return &anim.path;
     }
     return nullptr;
+}
+
+// --- WINDOW TRANSFORMS (move / resize) ---
+
+// Below this, two ticks landed close enough together that differentiating over
+// the gap would amplify noise instead of measuring anything. The render stage
+// this is driven from fires once per *monitor*, so a two-monitor frame ticks
+// every window twice microseconds apart; without this the second tick would
+// overwrite a good velocity with a meaningless one.
+static constexpr float MIN_VELOCITY_DT = 0.002f; // 2ms — well under any real frame
+
+// How long one run of an animated variable lasts, in seconds.
+static float animVarDuration(const CAnimatedVariable<Vector2D>* av) {
+    // A spring has no duration — it runs until it settles — so there is no
+    // honest number to report. Shaders are handed -1 rather than a
+    // plausible-looking lie they might divide by.
+    if (!av || av->isSpringCurve()) return -1.0f;
+
+    // The node itself carries only overrides; the resolved values live behind
+    // pValues, which is how the config tree does inheritance. Both are weak refs
+    // over shared-owned config objects, so lock() is safe here — unlike the
+    // animated variables themselves, which are UP-owned and would abort.
+    const auto cfg = av->getConfig().lock();
+    if (!cfg) return -1.0f;
+    const auto vals = cfg->pValues.lock();
+    if (!vals) return -1.0f;
+
+    // Hyprland's `animation = <name>, <enabled>, <speed>, ...` is in deciseconds.
+    return vals->internalSpeed > 0.0f ? vals->internalSpeed / 10.0f : -1.0f;
+}
+
+// Samples every window's motion once per frame. Driven from RENDER_PRE_WINDOWS,
+// before any window is drawn, so all surfaces in the frame read one consistent
+// snapshot rather than each re-deriving its own.
+//
+// Everything here keys off the window's own animated variables, never off the
+// config. That is deliberate: when `misc:animate_manual_resizes` or
+// `misc:animate_mouse_windowdragging` is off, Hyprland warps the window instead
+// of animating it, isBeingAnimated() stays false, and no transform shader runs.
+// The user's per-operation preference is inherited for free, with no config
+// reads and no branching.
+void updateMotionRecords() {
+    const auto& state = Desktop::windowState();
+    if (!state) return;
+
+    const auto now = std::chrono::steady_clock::now();
+
+    for (const auto& w : state->windows()) {
+        if (!w) continue;
+        Desktop::View::CWindow* raw = w.get();
+
+        auto&      posAnim  = w->positionAnimation();
+        auto&      sizeAnim = w->sizeAnimation();
+        const bool moving   = posAnim  && posAnim->isBeingAnimated();
+        const bool resizing = sizeAnim && sizeAnim->isBeingAnimated();
+
+        auto it = g_mWindowMotion.find(raw);
+
+        // Fast path: on any given frame nearly every window is neither moving
+        // nor settling. Two bool reads and a miss, then out.
+        if (!moving && !resizing && it == g_mWindowMotion.end()) continue;
+
+        if (it == g_mWindowMotion.end())
+            it = g_mWindowMotion.emplace(raw, MotionRecord{}).first;
+
+        MotionRecord&  rec  = it->second;
+        const Vector2D pos  = posAnim  ? posAnim->value()  : Vector2D(0, 0);
+        const Vector2D size = sizeAnim ? sizeAnim->value() : Vector2D(0, 0);
+
+        if (!rec.haveSample) {
+            rec.pos        = pos;
+            rec.size       = size;
+            rec.sampledAt  = now;
+            rec.haveSample = true;
+        } else if (const float dt = std::chrono::duration_cast<std::chrono::duration<float>>(now - rec.sampledAt).count();
+                   dt >= MIN_VELOCITY_DT) {
+            rec.velocity     = (pos - rec.pos) / dt;
+            rec.sizeVelocity = (size - rec.size) / dt;
+            rec.pos          = pos;
+            rec.size         = size;
+            rec.sampledAt    = now;
+        }
+
+        const bool wasInMotion = rec.moving || rec.resizing;
+        rec.moving             = moving;
+        rec.resizing           = resizing;
+
+        if (moving || resizing) {
+            // A new gesture starts its own peak; carrying the previous one over
+            // would let a fast move leave a loud settle on the slow one after it.
+            if (!wasInMotion) rec.peakVelocity = Vector2D(0, 0);
+            if (rec.velocity.distanceSq(Vector2D(0, 0)) > rec.peakVelocity.distanceSq(Vector2D(0, 0)))
+                rec.peakVelocity = rec.velocity;
+
+            rec.settling = false;
+
+            // A tiling reflow moves AND resizes at once, and only one of them
+            // can own the single animation slot in the stack. Position wins:
+            // travel across the screen is the more visible of the two. Both
+            // `is_moving` and `is_resizing` are still reported truthfully, so a
+            // shader that cares about the other one can still see it.
+            const CAnimatedVariable<Vector2D>* driver = moving ? posAnim.get() : sizeAnim.get();
+            rec.kind     = moving ? TRANSFORM_MOVE : TRANSFORM_RESIZE;
+            rec.progress = driver->getPercent();
+            rec.curve    = driver->getCurveValue();
+            rec.duration = animVarDuration(driver);
+
+            // Refresh only the axis that is actually animating. Updating both
+            // unconditionally meant a resize-only transform reported the
+            // position animvar's LAST COMPLETED trip as though it were current,
+            // so `move_delta` handed the shader a stale vector from some
+            // earlier move — plausible-looking, and undetectable from inside
+            // GLSL. Collapsing the idle axis onto its current value makes its
+            // delta and remaining both read as zero, which is the truth.
+            if (moving && posAnim) { rec.begun = posAnim->begun(); rec.goal = posAnim->goal(); }
+            else                   { rec.begun = rec.goal = rec.pos; }
+
+            if (resizing && sizeAnim) { rec.sizeBegun = sizeAnim->begun(); rec.sizeGoal = sizeAnim->goal(); }
+            else                      { rec.sizeBegun = rec.sizeGoal = rec.size; }
+            // Deliberately NOT touched once motion ends: the settle tail needs
+            // the trip it is settling from, so these stay frozen through it.
+        } else if (wasInMotion) {
+            // Motion just ended. Freeze the velocity it ended with so a shader
+            // can drive its own settle off it, and zero the live one — the
+            // window really has stopped, and reporting otherwise would be a lie
+            // a shader can't detect.
+            rec.settling        = true;
+            rec.motionEnd       = now;
+            rec.releaseVelocity = rec.velocity;
+            rec.velocity        = Vector2D(0, 0);
+            rec.sizeVelocity    = Vector2D(0, 0);
+            rec.progress        = 1.0f;
+            rec.curve           = 1.0f;
+        }
+
+        // Records are keyed by raw CWindow*, so a stale one could be matched by
+        // a future window allocated at the same address — the same hazard
+        // pruneFadeoutAnims exists for. Drop anything that stopped moving too
+        // long ago for any shader to still be settling on it.
+        if (!moving && !resizing) {
+            const float since = std::chrono::duration_cast<std::chrono::duration<float>>(now - rec.motionEnd).count();
+            if (!rec.settling || since > MAX_ANIM_DURATION)
+                g_mWindowMotion.erase(it);
+        }
+    }
+}
+
+// Move/resize animation for a live window. Mirrors resolveOpenAnim, but there is
+// no timer to run down: the compositor's own move animation is the clock, so
+// this is a pure read of the record sampled above. `progress` follows whatever
+// bezier or spring the user configured, and begins and ends exactly with the
+// motion — which is why these rules declare no duration.
+static const std::string* resolveTransformAnim(const PHLWINDOW& pWindow) {
+    if (g_mWindowMotion.empty()) return nullptr;
+
+    auto mIt = g_mWindowMotion.find(pWindow.get());
+    if (mIt == g_mWindowMotion.end()) return nullptr;
+    const MotionRecord& rec = mIt->second;
+
+    auto rIt = g_mWindowRuleShaders.find(pWindow.get());
+    if (rIt == g_mWindowRuleShaders.end()) return nullptr;
+    const auto& state = rIt->second;
+
+    // While settling there is no live animation to ask, so `kind` carries which
+    // one it was — the tail has to play the same shader the motion did.
+    const bool wantMove   = rec.moving   || (!rec.moving && !rec.resizing && rec.kind == TRANSFORM_MOVE);
+    const bool wantResize = rec.resizing || (!rec.moving && !rec.resizing && rec.kind == TRANSFORM_RESIZE);
+
+    const std::string* path       = nullptr;
+    float              ruleSettle = -1.0f;
+    if (wantMove && !state.moveAnim.empty()) {
+        path = &state.moveAnim;   ruleSettle = state.moveSettle;
+    } else if (wantResize && !state.resizeAnim.empty()) {
+        path = &state.resizeAnim; ruleSettle = state.resizeSettle;
+    }
+    if (!path) return nullptr;
+
+    g_pCurrentAnimSeed = animSeedFor(pWindow.get());
+
+    if (rec.moving || rec.resizing) {
+        // getPercent() is a linear time fraction; the eased value rides
+        // alongside it as `curve`, which on a spring can legitimately exceed 1
+        // while overshooting. Only the time fraction is clamped.
+        g_pCurrentAnimProgress = std::clamp(rec.progress, 0.0f, 1.0f);
+        g_pCurrentSettle       = -1.0f;
+        return path;
+    }
+
+    if (!rec.settling) return nullptr;
+
+    // Settle length precedence matches the rest of the plugin: an explicit
+    // `@<sec>` on the rule wins, then the shader's own `// @settle`, then none.
+    float tail = ruleSettle;
+    if (tail < 0.0f) {
+        const CompiledShader* cs = getOrCompileShader(*path);
+        tail                     = cs ? cs->settleDuration : 0.0f;
+    }
+    if (tail <= 0.0f) return nullptr;
+
+    const float since = secondsSince(rec.motionEnd);
+    if (since >= tail) return nullptr;
+
+    g_pCurrentAnimProgress = 1.0f;
+    g_pCurrentSettle       = since / tail;
+    return path;
 }
 
 // --- SHADER STACKING ---
@@ -571,6 +780,18 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
     g_pCurrentRenderLayer  = pLS ? pLS : pOwnerLS;
     g_pCurrentAnimProgress = -1.0f;
     g_pCurrentAnimSeed     = -1.0f;
+    g_pCurrentSettle       = -1.0f;
+
+    // Motion is published to every stage, not just a `shader_move:` one — a
+    // permanent shader is entitled to react to its window being thrown around.
+    // Borrowing a pointer into the map is safe for the same reason
+    // resolveShaderPath's returned pointer is: it is only mutated between
+    // frames, never during a draw chain.
+    g_pCurrentMotion = nullptr;
+    if (pWindow) {
+        if (auto mIt = g_mWindowMotion.find(pWindow.get()); mIt != g_mWindowMotion.end())
+            g_pCurrentMotion = &mIt->second;
+    }
 
     // Taken straight off the pass element rather than recomputed from the
     // window, so a shaded surface rounds exactly the way Hyprland was about to
@@ -595,9 +816,13 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
     int                nPaths = 0;
 
     const std::string* animPath = nullptr;
-    if (pWindow)
+    if (pWindow) {
         animPath = resolveOpenAnim(pWindow);
-    else if (pLS)
+        // An open animation outranks a transform. A window animating into place
+        // on map is genuinely "moving", so without this a window carrying both
+        // rules would try to play two one-shot shaders into the same slot.
+        if (!animPath) animPath = resolveTransformAnim(pWindow);
+    } else if (pLS)
         animPath = resolveLayerOpenAnim(pLS);
     else if (elem && !elem->m_data.surface && elem->m_data.tex)
         animPath = resolveCloseAnim(elem->m_data.tex, animMonitor);
@@ -606,6 +831,7 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
     // them aside: only the animation stage should see a real `progress`.
     const float animProgress = g_pCurrentAnimProgress;
     const float animSeed     = g_pCurrentAnimSeed;
+    const float animSettle   = g_pCurrentSettle;
 
     if (pWindow && windowReplaceMode(pWindow)) {
         // Opt-out: first match wins, exactly as it did before stacking existed.
@@ -654,6 +880,9 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
     // finished state, not be dragged through an animation it never asked for.
     g_pCurrentAnimProgress   = topIsAnim ? animProgress : -1.0f;
     g_pCurrentAnimSeed       = animSeed;
+    // `settle` is scoped to the animation stage for the same reason: the tail's
+    // length is a property of the transform shader, and a base layer has none.
+    g_pCurrentSettle         = topIsAnim ? animSettle : -1.0f;
 
     // Schedule continuous redraw if any stage uses `time`, or while a one-shot
     // animation is mid-flight — an animation shader drives itself off `progress`
@@ -681,6 +910,8 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
     g_pCurrentCompiledShader = nullptr;
     g_pCurrentAnimProgress   = -1.0f;
     g_pCurrentAnimSeed       = -1.0f;
+    g_pCurrentSettle         = -1.0f;
+    g_pCurrentMotion         = nullptr;
     g_pCurrentRound          = 0.0f;
 }
 
@@ -762,6 +993,78 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
         }
         if (activeEntry->roundPowerLoc >= 0)
             glUniform1f(activeEntry->roundPowerLoc, g_pCurrentRoundPower);
+        // --- TRANSFORM UNIFORMS ---
+        // Zeroed rather than skipped when the window has no motion record, so a
+        // shader reading `velocity` on a stationary window sees a still window
+        // instead of whatever the last moving one left in the program.
+        if (activeEntry->velocityLoc >= 0) {
+            const Vector2D v = g_pCurrentMotion ? g_pCurrentMotion->velocity : Vector2D(0, 0);
+            glUniform2f(activeEntry->velocityLoc, (float)v.x, (float)v.y);
+        }
+        if (activeEntry->sizeVelocityLoc >= 0) {
+            const Vector2D v = g_pCurrentMotion ? g_pCurrentMotion->sizeVelocity : Vector2D(0, 0);
+            glUniform2f(activeEntry->sizeVelocityLoc, (float)v.x, (float)v.y);
+        }
+        if (activeEntry->moveDeltaLoc >= 0) {
+            const Vector2D d = g_pCurrentMotion ? g_pCurrentMotion->goal - g_pCurrentMotion->begun : Vector2D(0, 0);
+            glUniform2f(activeEntry->moveDeltaLoc, (float)d.x, (float)d.y);
+        }
+        if (activeEntry->moveRemainingLoc >= 0) {
+            const Vector2D d = g_pCurrentMotion ? g_pCurrentMotion->goal - g_pCurrentMotion->pos : Vector2D(0, 0);
+            glUniform2f(activeEntry->moveRemainingLoc, (float)d.x, (float)d.y);
+        }
+        if (activeEntry->sizeDeltaLoc >= 0) {
+            const Vector2D d = g_pCurrentMotion ? g_pCurrentMotion->sizeGoal - g_pCurrentMotion->sizeBegun : Vector2D(0, 0);
+            glUniform2f(activeEntry->sizeDeltaLoc, (float)d.x, (float)d.y);
+        }
+        if (activeEntry->releaseVelLoc >= 0) {
+            const Vector2D v = g_pCurrentMotion ? g_pCurrentMotion->releaseVelocity : Vector2D(0, 0);
+            glUniform2f(activeEntry->releaseVelLoc, (float)v.x, (float)v.y);
+        }
+        if (activeEntry->peakVelLoc >= 0) {
+            const Vector2D v = g_pCurrentMotion ? g_pCurrentMotion->peakVelocity : Vector2D(0, 0);
+            glUniform2f(activeEntry->peakVelLoc, (float)v.x, (float)v.y);
+        }
+        if (activeEntry->isMovingLoc >= 0)
+            glUniform1f(activeEntry->isMovingLoc, (g_pCurrentMotion && g_pCurrentMotion->moving) ? 1.0f : 0.0f);
+        if (activeEntry->isResizingLoc >= 0)
+            glUniform1f(activeEntry->isResizingLoc, (g_pCurrentMotion && g_pCurrentMotion->resizing) ? 1.0f : 0.0f);
+        if (activeEntry->isDraggingLoc >= 0) {
+            // Always 0 for now. Wired ahead of the interactive-drag work so a
+            // shader written against it today keeps compiling and simply never
+            // takes the drag branch, rather than failing to link later.
+            glUniform1f(activeEntry->isDraggingLoc, 0.0f);
+        }
+        if (activeEntry->animKindLoc >= 0)
+            glUniform1f(activeEntry->animKindLoc, g_pCurrentMotion ? (float)g_pCurrentMotion->kind : 0.0f);
+        if (activeEntry->curveLoc >= 0) {
+            // Matches `progress`: a shader bound as an ordinary layer, outside
+            // any transform, should render its finished state rather than its
+            // start. Not clamped — a spring overshooting past 1.0 is real
+            // information a wobble shader wants.
+            glUniform1f(activeEntry->curveLoc,
+                        (g_pCurrentMotion && (g_pCurrentMotion->moving || g_pCurrentMotion->resizing)) ? g_pCurrentMotion->curve : 1.0f);
+        }
+        if (activeEntry->durationLoc >= 0)
+            glUniform1f(activeEntry->durationLoc, g_pCurrentMotion ? g_pCurrentMotion->duration : -1.0f);
+        if (activeEntry->settleLoc >= 0) {
+            // 0 outside a tail, so `settle` reads as "not settling" rather than
+            // as a completed one.
+            glUniform1f(activeEntry->settleLoc, g_pCurrentSettle >= 0.0f ? g_pCurrentSettle : 0.0f);
+        }
+        if (activeEntry->windowBoxLoc >= 0) {
+            // The window's own box, which a subsurface can use to place itself
+            // inside the parent. hkGLDrawTex runs per surface, so a displacement
+            // driven off v_texcoord alone deforms each subsurface about its own
+            // centre and tears the window apart; this is what lets a shader
+            // build one field across the whole thing.
+            CBox b;
+            if (contextWindow) {
+                if (const auto lb = contextWindow->logicalBox())
+                    b = *lb;
+            }
+            glUniform4f(activeEntry->windowBoxLoc, (float)b.x, (float)b.y, (float)b.w, (float)b.h);
+        }
         if (activeEntry->seedLoc >= 0) {
             float s = g_pCurrentAnimSeed;
             if (s < 0.0f) {
@@ -942,8 +1245,11 @@ void applyShaderRulesSafe(PHLWINDOW pWindow) {
             if (!isDefault) hasRules = true;
         };
 
-        // Animation tags additionally accept an optional `@<seconds>` suffix to
-        // override the duration the shader declares. rfind, so a path that
+        // Animation tags additionally accept an optional `@<seconds>` suffix.
+        // For open/close it overrides the duration the shader declares; for the
+        // transform tags there is no duration to override — the compositor's own
+        // move animation is the clock — so there it sets the settle tail instead.
+        // Same parse either way, different destination. rfind, so a path that
         // happens to contain '@' still works; and the suffix is only stripped if
         // it actually parsed as a positive number (clamped to MAX_ANIM_DURATION).
         const auto assignAnim = [&](std::string& field, float& dur) {
@@ -973,6 +1279,8 @@ void applyShaderRulesSafe(PHLWINDOW pWindow) {
         else if (key == "shader_fullscreen") assign(dst.fullscreen);
         else if (key == "shader_open")       assignAnim(dst.openAnim,  dst.openAnimDuration);
         else if (key == "shader_close")      assignAnim(dst.closeAnim, dst.closeAnimDuration);
+        else if (key == "shader_move")       assignAnim(dst.moveAnim,   dst.moveSettle);
+        else if (key == "shader_resize")     assignAnim(dst.resizeAnim, dst.resizeSettle);
         // Not a shader, and deliberately has no `_default` form: "unset" and
         // "explicitly false" are the same value for a bool, so a default could
         // never be overridden back off by a more specific rule. Also does not
@@ -1001,18 +1309,19 @@ void applyShaderRulesSafe(PHLWINDOW pWindow) {
     fill(state.tiled,      defaults.tiled);
     fill(state.fullscreen, defaults.fullscreen);
 
-    // The animation tags carry a duration alongside the path, so they promote as
-    // a pair rather than through `fill`.
-    if (state.openAnim.empty() && !defaults.openAnim.empty()) {
-        state.openAnim         = std::move(defaults.openAnim);
-        state.openAnimDuration = defaults.openAnimDuration;
-        hasRules               = true;
-    }
-    if (state.closeAnim.empty() && !defaults.closeAnim.empty()) {
-        state.closeAnim         = std::move(defaults.closeAnim);
-        state.closeAnimDuration = defaults.closeAnimDuration;
-        hasRules                = true;
-    }
+    // The animation tags carry a number alongside the path, so they promote as a
+    // pair rather than through `fill`.
+    const auto fillAnim = [&](std::string& specific, float& specificNum, std::string& fallback, float fallbackNum) {
+        if (!specific.empty() || fallback.empty()) return;
+        specific    = std::move(fallback);
+        specificNum = fallbackNum;
+        hasRules    = true;
+    };
+
+    fillAnim(state.openAnim,   state.openAnimDuration,  defaults.openAnim,   defaults.openAnimDuration);
+    fillAnim(state.closeAnim,  state.closeAnimDuration, defaults.closeAnim,  defaults.closeAnimDuration);
+    fillAnim(state.moveAnim,   state.moveSettle,        defaults.moveAnim,   defaults.moveSettle);
+    fillAnim(state.resizeAnim, state.resizeSettle,      defaults.resizeAnim, defaults.resizeSettle);
 
     if (hasRules) {
         g_mWindowRuleShaders[rawWin] = std::move(state);

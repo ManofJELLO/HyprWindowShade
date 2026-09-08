@@ -90,6 +90,17 @@ struct WindowShaderState {
     float       openAnimDuration  = -1.0f;
     std::string closeAnim;
     float       closeAnimDuration = -1.0f;
+    // Transform animations (move/resize). Unlike open/close these declare no
+    // duration of their own: the compositor's own move/resize animation is the
+    // clock, and the shader runs for exactly as long as the window is in
+    // motion. The optional `@<sec>` on these rules therefore means something
+    // different from the one on `shader_open:` — it sets the SETTLE tail, the
+    // extra seconds the shader keeps running after the motion has stopped.
+    // <0 means "ask the shader" (`// @settle`), which in turn defaults to 0.
+    std::string moveAnim;
+    float       moveSettle        = -1.0f;
+    std::string resizeAnim;
+    float       resizeSettle      = -1.0f;
     // `shader_replace:1` opts this window out of stacking and back to the
     // first-match-wins ladder the plugin used before stacking existed.
     bool        replaceMode       = false;
@@ -157,6 +168,75 @@ struct FadeoutAnim {
 };
 extern std::unordered_map<Desktop::IFadeout*, FadeoutAnim> g_mFadeoutAnims;
 
+// --- WINDOW TRANSFORMS (move / resize) ---
+// Which transformation a shader is currently playing for. Exposed to shaders as
+// the `anim_kind` uniform so one shader can serve several rules and branch on
+// what it was invoked for. The numbering is part of the shader ABI — append
+// only, never renumber. 3+ are reserved for the follow-ups (workspace switch,
+// fullscreen enter/exit, float<->tile).
+enum eTransformKind : uint8_t {
+    TRANSFORM_NONE   = 0,
+    TRANSFORM_MOVE   = 1,
+    TRANSFORM_RESIZE = 2,
+};
+
+// Per-window motion state, sampled once per frame from the window's own
+// animated variables rather than from the pass element's box.
+//
+// Two reasons it can't be derived in the draw hook. A fragment shader has no
+// memory between frames, so anything differentiated (velocity) has to be
+// computed CPU-side; and hkGLDrawTex runs once per *surface*, so a window with
+// subsurfaces would produce several different velocities from several different
+// boxes. Sampling the window's position animation once per frame gives one
+// answer for the whole window.
+//
+// Everything here describes Hyprland's own move/resize animation, so a shader
+// gets a progress value that follows the user's configured bezier/spring and
+// begins and ends exactly with the motion. No duration is declared or needed.
+struct MotionRecord {
+    // --- sampling state (previous frame) ---
+    Vector2D pos;
+    Vector2D size;
+    std::chrono::steady_clock::time_point sampledAt{};
+    bool     haveSample   = false;
+
+    // --- derived, px/sec ---
+    Vector2D velocity;
+    Vector2D sizeVelocity;
+    // Fastest the window travelled during the current gesture, reset when a new
+    // one begins. `velocity` is near zero at the END of an eased move — the
+    // window decelerates into its slot by construction — so it is the wrong
+    // thing to seed a post-motion wobble from. This is the honest measure of
+    // how energetic the move was, and it is not derivable in a shader.
+    Vector2D peakVelocity;
+
+    // --- live transform state ---
+    bool     moving       = false;
+    bool     resizing     = false;
+    Vector2D begun, goal;         // position trip endpoints
+    Vector2D sizeBegun, sizeGoal; // size trip endpoints
+    float    progress     = 0.0f; // getPercent(): linear time fraction
+    float    curve        = 0.0f; // getCurveValue(): eased fraction, may exceed 1 on a spring
+    float    duration     = -1.0f;// seconds; <0 when unknown (spring curves have none)
+
+    // --- settle (tail) ---
+    // Motion has stopped but the shader asked to keep running. `velocity` reads
+    // zero here (truthfully — the window isn't moving); releaseVelocity holds
+    // what it was at the instant motion ended, so a shader can write its own
+    // spring: releaseVelocity * exp(-k*settle) * sin(w*settle).
+    bool     settling     = false;
+    std::chrono::steady_clock::time_point motionEnd{};
+    Vector2D releaseVelocity;
+
+    // Which animation drove `progress`/`curve`/`duration` this frame.
+    uint8_t  kind         = TRANSFORM_NONE;
+};
+extern std::unordered_map<Desktop::View::CWindow*, MotionRecord> g_mWindowMotion;
+
+// Sampled once per frame from the RENDER_PRE_WINDOWS stage, before any window
+// is drawn, so every surface in the frame reads one consistent snapshot.
+void updateMotionRecords();
+
 struct CompiledShader {
     Hyprutils::Memory::CSharedPointer<CShader> shader;
     GLint     timeLoc         = -1;
@@ -169,6 +249,28 @@ struct CompiledShader {
     GLint     isFullscreenLoc = -1; // float 0/1
     GLint     progressLoc     = -1; // float 0..1 across a one-shot open/close animation
     GLint     seedLoc         = -1; // float 0..1, stable per window, so instances differ
+    // --- TRANSFORM (move/resize) ---
+    // Populated for any shader that declares them, not just a `shader_move:`
+    // stage: a permanent shader is free to react to the window being dragged
+    // around. See the validity table in the README — during an interactive drag
+    // (case 3, not yet implemented) `progress`/`curve`/`move_delta` will carry
+    // per-mouse-event noise rather than a whole-gesture value, which is why
+    // `is_dragging` exists to let a shader tell the two apart.
+    GLint     moveDeltaLoc     = -1; // vec2: goal - begun, the whole trip
+    GLint     moveRemainingLoc = -1; // vec2: goal - current, distance still to go
+    GLint     velocityLoc      = -1; // vec2: px/sec
+    GLint     sizeDeltaLoc     = -1; // vec2: size goal - size begun
+    GLint     sizeVelocityLoc  = -1; // vec2: px/sec
+    GLint     windowBoxLoc     = -1; // vec4: window box, so subsurfaces can stay coherent
+    GLint     isMovingLoc      = -1; // float 0/1
+    GLint     isResizingLoc    = -1; // float 0/1
+    GLint     isDraggingLoc    = -1; // float 0/1 — always 0 until case 3 lands
+    GLint     animKindLoc      = -1; // float: eTransformKind
+    GLint     curveLoc         = -1; // float: eased fraction (may exceed 1 on a spring)
+    GLint     durationLoc      = -1; // float: seconds, -1 when the curve has none
+    GLint     settleLoc        = -1; // float 0..1 across the post-motion tail
+    GLint     releaseVelLoc    = -1; // vec2: velocity frozen at the instant motion ended
+    GLint     peakVelLoc       = -1; // vec2: fastest velocity reached during the gesture
     // Corner rounding, re-applied by the wrapper. Hyprland rounds inside the
     // fragment program this shader replaces, so without these a shaded window
     // comes out with square corners.
@@ -179,6 +281,11 @@ struct CompiledShader {
     // Seconds the one-shot animation should run for, declared in the shader as
     // `// @duration 0.35`. <0 means the shader didn't say.
     float     animDuration    = -1.0f;
+    // Seconds to keep running AFTER a move/resize finishes, declared as
+    // `// @settle 0.4`. 0 means the shader stops with the motion. Unlike
+    // animDuration this has no default: inventing a tail the shader never asked
+    // for would keep a live window redrawing every frame for no reason.
+    float     settleDuration  = 0.0f;
     time_t    sourceMtime     = 0; // mtime at compile time; lets us auto-evict on edit
 };
 
@@ -252,6 +359,15 @@ extern float               g_pCurrentAnimSeed;
 // so they match exactly what Hyprland would have applied. Zeroed for offscreen
 // stages: the mask belongs to the final on-screen draw, applying it per layer
 // would cut the corners repeatedly and leave them ragged.
+// Motion snapshot for the window being drawn, or nullptr when it has none.
+// Points into g_mWindowMotion, which is only mutated from updateMotionRecords()
+// between frames — never during a draw chain — so borrowing across the call is
+// safe for exactly the same reason resolveShaderPath's returned pointer is.
+extern const MotionRecord* g_pCurrentMotion;
+// Settle progress 0..1 for the current draw, or <0 when not settling. Held
+// apart from the record because the tail's length belongs to the *shader*,
+// which isn't known until the draw path has resolved and compiled it.
+extern float               g_pCurrentSettle;
 extern Vector2D            g_pCurrentBoxSize;
 extern float               g_pCurrentRound;
 extern float               g_pCurrentRoundPower;

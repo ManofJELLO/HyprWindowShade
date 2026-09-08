@@ -19,6 +19,7 @@ std::map<std::string, AnimSpec>                       g_mLayerCloseAnims;
 std::unordered_map<Desktop::View::CWindow*, std::chrono::steady_clock::time_point> g_mWindowOpenTimes;
 std::unordered_map<Desktop::View::CLayerSurface*, std::chrono::steady_clock::time_point> g_mLayerOpenTimes;
 std::unordered_map<Desktop::IFadeout*, FadeoutAnim>   g_mFadeoutAnims;
+std::unordered_map<Desktop::View::CWindow*, MotionRecord> g_mWindowMotion;
 CFunctionHook*                                        g_pGLDrawTexHook          = nullptr;
 CFunctionHook*                                        g_pUseShaderHook          = nullptr;
 CFunctionHook*                                        g_pFadeoutCreateHook      = nullptr;
@@ -329,6 +330,16 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         if (window) g_pHyprRenderer->damageWindow(window);
     }));
 
+    // Sample window motion once per frame, before anything is drawn, so every
+    // surface in the frame reads one consistent snapshot. Velocity has to be
+    // differentiated CPU-side — a fragment shader has no memory between frames —
+    // and doing it here rather than in the draw hook means a window with
+    // subsurfaces gets one velocity instead of one per surface.
+    g_Listeners.push_back(Event::bus()->m_events.render.stage.listen([](eRenderStage stage) {
+        if (stage != RENDER_PRE_WINDOWS) return;
+        try { updateMotionRecords(); } catch (...) {}
+    }));
+
     // Drop entries keyed by raw CWindow* when the window is destroyed so they
     // can't accidentally match a future window at the same address.
     // V0.56: window.destroy emits PHLWINDOWREF (the shared ref is already gone
@@ -340,6 +351,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         g_mWindowManualShaders.erase(rawWin);
         g_mWindowRuleShaders.erase(rawWin);
         g_mWindowOpenTimes.erase(rawWin);
+        g_mWindowMotion.erase(rawWin);
     }));
 
     // --- DISPATCHERS (.conf-style — Hyprland's native bind path) ---
@@ -421,7 +433,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "layercloseanim",     &luaLayerCloseAnim);
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "reloadshaders",      &luaReloadShaders);
 
-    return {"HyprWindowShade", "Native CShader Injection (v0.56)", "ManofJELLO", "1.5"};
+    return {"HyprWindowShade", "Native CShader Injection (v0.56)", "ManofJELLO", "1.6"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
@@ -437,6 +449,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
     g_mLayerCloseAnims.clear();
     g_mWindowOpenTimes.clear();
     g_mLayerOpenTimes.clear();
+    g_mWindowMotion.clear();
     // Any fadeout we were holding open falls back to Hyprland's own `done` as
     // soon as the hooks come off below.
     g_mFadeoutAnims.clear();

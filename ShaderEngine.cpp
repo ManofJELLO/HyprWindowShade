@@ -26,6 +26,16 @@ static const std::regex MAIN_RE(R"(\bvoid\s+main\s*\(\s*(?:void\s*)?\))");
 // number on the CPU side to know when the animation is over.
 static const std::regex DURATION_RE(R"(//[ \t]*@duration[ \t]+([0-9]*\.?[0-9]+))");
 
+// A move/resize shader can ask to keep running after the motion stops:
+//
+//     // @settle 0.4
+//
+// Same comment-directive reasoning as @duration. This is NOT a duration for the
+// animation itself — the compositor's own move animation is the clock — it is
+// only the tail on the end of it, which is why it is a separate directive
+// rather than a reinterpretation of @duration.
+static const std::regex SETTLE_RE(R"(//[ \t]*@settle[ \t]+([0-9]*\.?[0-9]+))");
+
 // The rounding mask appended below needs `v_texcoord` to locate the fragment
 // within the box. Shaders that don't declare it keep the plain wrapper.
 static const std::regex TEXCOORD_RE(R"(\bin\s+vec2\s+v_texcoord\s*;)");
@@ -44,6 +54,19 @@ static float parseDeclaredDuration(const std::string& src) {
         if (d > 0.0f) return std::min(d, MAX_ANIM_DURATION);
     } catch (...) {}
     return -1.0f;
+}
+
+// Reads `// @settle` out of shader source. 0 when absent — a shader that didn't
+// ask for a tail doesn't get one, since a tail keeps a *live* window damaging
+// every frame and has none of the natural backstops a close animation has.
+static float parseDeclaredSettle(const std::string& src) {
+    std::smatch m;
+    if (!std::regex_search(src, m, SETTLE_RE)) return 0.0f;
+    try {
+        const float d = std::stof(m[1].str());
+        if (d > 0.0f) return std::min(d, MAX_ANIM_DURATION);
+    } catch (...) {}
+    return 0.0f;
 }
 
 // Compile the fragment shader standalone purely to capture glGetShaderInfoLog
@@ -119,6 +142,7 @@ CompiledShader* getOrCompileShader(const std::string& shaderPath) {
     // Read the animation duration off the ORIGINAL source, before the auto-alpha
     // wrapper appends anything.
     const float declaredDuration = parseDeclaredDuration(shaderCode);
+    const float declaredSettle   = parseDeclaredSettle(shaderCode);
 
     // --- SHADER WRAPPING (AUTO-ALPHA) ---
     // Tolerant `void main()` matcher — handles whitespace, newlines, and an
@@ -232,7 +256,23 @@ CompiledShader* getOrCompileShader(const std::string& shaderPath) {
     entry.boxSizeLoc      = glGetUniformLocation(prog, "plugin_box_size");
     entry.roundLoc        = glGetUniformLocation(prog, "plugin_round");
     entry.roundPowerLoc   = glGetUniformLocation(prog, "plugin_round_power");
+    entry.moveDeltaLoc     = glGetUniformLocation(prog, "move_delta");
+    entry.moveRemainingLoc = glGetUniformLocation(prog, "move_remaining");
+    entry.velocityLoc      = glGetUniformLocation(prog, "velocity");
+    entry.sizeDeltaLoc     = glGetUniformLocation(prog, "size_delta");
+    entry.sizeVelocityLoc  = glGetUniformLocation(prog, "size_velocity");
+    entry.windowBoxLoc     = glGetUniformLocation(prog, "window_box");
+    entry.isMovingLoc      = glGetUniformLocation(prog, "is_moving");
+    entry.isResizingLoc    = glGetUniformLocation(prog, "is_resizing");
+    entry.isDraggingLoc    = glGetUniformLocation(prog, "is_dragging");
+    entry.animKindLoc      = glGetUniformLocation(prog, "anim_kind");
+    entry.curveLoc         = glGetUniformLocation(prog, "curve");
+    entry.durationLoc      = glGetUniformLocation(prog, "duration");
+    entry.settleLoc        = glGetUniformLocation(prog, "settle");
+    entry.releaseVelLoc    = glGetUniformLocation(prog, "release_velocity");
+    entry.peakVelLoc       = glGetUniformLocation(prog, "peak_velocity");
     entry.animDuration    = declaredDuration;
+    entry.settleDuration  = declaredSettle;
     // Continuous redraw is needed only when the shader actually binds `time`.
     // Using the location instead of substring matching avoids false positives
     // like "lifetime" or "uniform_time_offset".

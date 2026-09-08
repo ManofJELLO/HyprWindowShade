@@ -15,6 +15,7 @@ Configuration is shown in Hyprland's Lua config format (`hyprland.lua`). The old
 - [Window shaders](#window-shaders) — [stacking](#stacking) · [fullscreen](#fullscreen) · [fallback rules](#fallback-rules)
 - [Layer shaders](#layer-shaders)
 - [Open and close animations](#open-and-close-animations)
+- [Move and resize animations](#move-and-resize-animations)
 - [Writing a shader](#writing-a-shader)
 - [Reference](#reference) — [Lua API](#lua-api) · [hyprctl dispatch](#hyprctl-dispatch) · [shader uniforms](#shader-uniforms)
 - [How close animations work](#how-close-animations-work)
@@ -141,6 +142,8 @@ Apply a shader to a window with a `tag` on a window rule. Ten tags are supported
 | `+shader_tiled:/path.glsl` | Applies only when tiled |
 | `+shader_open:/path.glsl` | Plays once when the window opens, on top of the window's normal shader |
 | `+shader_close:/path.glsl` | Plays once as the window closes |
+| `+shader_move:/path.glsl` | Plays while the window is being moved |
+| `+shader_resize:/path.glsl` | Plays while the window is being resized |
 | `+shader_replace:1` | Opts this window out of [stacking](#stacking) |
 | `+shader_fullscreen_stack:1` | Keeps this window's shaders while it is [fullscreen](#fullscreen) |
 
@@ -487,6 +490,85 @@ uniforms, same `// @duration`, same snapshot-based close path.
 
 ---
 
+## Move and resize animations
+
+`+shader_move:` and `+shader_resize:` play a shader while the window is in motion.
+Unlike open/close animations they declare **no duration** — Hyprland's own move
+animation is the clock, so the shader runs for exactly as long as the motion does and
+`progress` follows whatever bezier or spring you configured for `windowsMove`.
+
+```lua
+hl.window_rule({
+    name  = "wobble-on-move",
+    match = { class = "kitty" },
+    tag   = "+shader_move:/home/USERNAME/.config/hypr/shaders/wobble.glsl",
+})
+```
+
+### Only animated transformations trigger them
+
+The plugin keys off Hyprland's animated variables, so it inherits your animation
+settings for free — and that cuts both ways:
+
+- **Float toggles, window swaps and layout moves animate**, so a shader plays.
+- **A tiled split-ratio resize is warped in one step**, not animated. Nothing plays,
+  and that is correct rather than a bug.
+- If `misc:animate_manual_resizes` or `misc:animate_mouse_windowdragging` is off,
+  Hyprland warps that operation and no shader runs. No config is read to achieve
+  this; it falls out of asking the animation whether it is running.
+
+> **Interactive mouse drags are not supported yet.** With
+> `animate_mouse_windowdragging` enabled the animation *is* live during a drag, so a
+> move shader will fire — but Hyprland retargets it on every mouse event, so
+> `progress`, `curve` and `move_delta` carry per-event noise instead of a
+> whole-gesture value. `velocity` stays meaningful. `is_dragging` exists to tell the
+> cases apart and is wired but always 0 until that work lands.
+
+### The settle tail
+
+A move ends abruptly. To keep an effect running after it — so jelly can wobble to a
+stop — declare a tail:
+
+```glsl
+// @settle 0.45
+```
+
+During the tail `progress` reads 1.0 and `settle` runs 0 → 1. `velocity` correctly
+reads zero, because the window really has stopped; `release_velocity` holds what it
+was at the final instant, and `peak_velocity` holds the fastest point of the whole
+gesture. Seed a settle from **`peak_velocity`, not `release_velocity`** — an eased
+move decelerates into its slot, so it arrives at nearly zero velocity by construction.
+
+An `@<sec>` suffix on a transform rule sets the **settle**, not a duration — there is
+no duration to override:
+
+```lua
+tag = "+shader_move:/path/wobble.glsl@0.6"
+```
+
+### Making it deform rather than slide
+
+The trap worth knowing: a displacement field with a non-zero mean is a *translation*.
+Displace every pixel in the same direction and the window slides as one block, which
+is indistinguishable from the move already happening. Use full sine periods across the
+surface so the field integrates to zero, and drive it off `time` so it oscillates:
+
+```glsl
+const float TAU = 6.28318530718;
+vec2  rel  = v_texcoord - 0.5;
+vec2  dir  = normalize(velocity);
+float acrs = dot(rel, vec2(-dir.y, dir.x));
+// full period across the window -> zero mean -> deforms instead of translating
+float ripple = sin(acrs * TAU + time * 6.5 * TAU);
+vec2  uv     = v_texcoord - dir * ripple * amplitude / surface_size;
+```
+
+A fragment shader **cannot draw outside the window's box**, so content pushed past an
+edge has to be faded out rather than drawn. The silhouette appears to bend, but true
+corner overshoot would need the drawn quad to be larger than the window.
+
+---
+
 ## Writing a shader
 
 The plugin auto-wraps your shader: it renames your `void main()` to `void user_main()` and appends a `main()` that calls it, multiplies `fragColor` by `plugin_alpha`, and re-applies the window's corner rounding. You only need to write a normal HyprShade-style fragment shader.
@@ -591,6 +673,21 @@ Declare any of these in your fragment shader and the plugin will populate them e
 | `is_fullscreen` | `float` | 1.0 if fullscreen, else 0.0 |
 | `progress` | `float` | 0.0 → 1.0 across an open/close animation; 1.0 otherwise |
 | `seed` | `float` | stable per-window random value in 0..1 |
+| `velocity` | `vec2` | window velocity in px/sec; 0 when still |
+| `size_velocity` | `vec2` | resize rate in px/sec |
+| `peak_velocity` | `vec2` | fastest velocity reached during the current gesture |
+| `release_velocity` | `vec2` | velocity frozen at the instant motion stopped |
+| `move_delta` | `vec2` | whole trip vector, `goal - start`; 0 when not moving |
+| `move_remaining` | `vec2` | distance still to travel |
+| `size_delta` | `vec2` | whole resize vector; 0 when not resizing |
+| `window_box` | `vec4` | the window's own box `(x, y, w, h)` |
+| `is_moving` | `float` | 1.0 while the position is animating |
+| `is_resizing` | `float` | 1.0 while the size is animating |
+| `is_dragging` | `float` | 1.0 during an interactive drag — **always 0 for now** |
+| `anim_kind` | `float` | 0 none, 1 move, 2 resize |
+| `curve` | `float` | eased progress; **can exceed 1.0** on an overshoot/spring curve |
+| `duration` | `float` | seconds the transform will take; −1 when the curve has none |
+| `settle` | `float` | 0 → 1 across the post-motion tail; 0 while still moving |
 
 Names beginning with `plugin_` are reserved by the wrapper. Besides `plugin_alpha` it
 injects `plugin_box_size`, `plugin_round` and `plugin_round_power` to re-apply corner
