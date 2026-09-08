@@ -16,12 +16,14 @@ authors = ["ManofJELLO"]
 # check out a working revision instead of whatever HEAD happens to be, which is
 # what makes `hyprpm update` safe across Hyprland releases.
 #
-# Intentionally empty until the first pinned release: an entry has to name a
-# commit of this repo, which cannot be known until that commit exists. Add the
-# pair in a follow-up commit once this one has a hash.
-# commit_pins = [
-#     ["efb50993780079460b0cbed1363e2166a2de1d9f", "<this repo's commit>"], # 0.56.2
-# ]
+# Each entry pins a plugin commit KNOWN TO BUILD against a given Hyprland
+# commit, so `hyprpm update` checks out a working revision instead of whatever
+# HEAD happens to be. Add a new pair whenever a Hyprland release needs a
+# different revision of this plugin; leave the old ones in place so users on
+# older compositors still resolve to something that builds.
+commit_pins = [
+    ["efb50993780079460b0cbed1363e2166a2de1d9f", "af924965dbbc7acf740572cf64aa9fe2e9215924"], # 0.56.2
+]
 
 [HyprWindowShade]
 description = "Per-window, per-layer and per-class fragment shaders, with open and close animations"
