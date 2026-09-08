@@ -22,7 +22,7 @@ authors = ["ManofJELLO"]
 # different revision of this plugin; leave the old ones in place so users on
 # older compositors still resolve to something that builds.
 commit_pins = [
-    ["efb50993780079460b0cbed1363e2166a2de1d9f", "af924965dbbc7acf740572cf64aa9fe2e9215924"], # 0.56.2
+    ["efb50993780079460b0cbed1363e2166a2de1d9f", "64c5d22c5dd26f8ce08d865cf2ef19421f36610e"], # 0.56.2
 ]
 
 [HyprWindowShade]
