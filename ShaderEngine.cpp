@@ -271,6 +271,7 @@ CompiledShader* getOrCompileShader(const std::string& shaderPath) {
     entry.settleLoc        = glGetUniformLocation(prog, "settle");
     entry.releaseVelLoc    = glGetUniformLocation(prog, "release_velocity");
     entry.peakVelLoc       = glGetUniformLocation(prog, "peak_velocity");
+    entry.peakSizeVelLoc   = glGetUniformLocation(prog, "peak_size_velocity");
     entry.animDuration    = declaredDuration;
     entry.settleDuration  = declaredSettle;
     // Continuous redraw is needed only when the shader actually binds `time`.

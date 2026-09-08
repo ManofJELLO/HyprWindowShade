@@ -1,5 +1,8 @@
 #include "Globals.hpp"
+#include <hyprland/src/layout/LayoutManager.hpp>
+#include <hyprland/src/layout/supplementary/DragController.hpp>
 #include <algorithm>
+#include <cmath>
 #include <string_view>
 
 #include <cstdio>
@@ -286,6 +289,12 @@ static const std::string* resolveCloseAnim(const SP<Render::ITexture>& tex, PHLM
 // overwrite a good velocity with a meaningless one.
 static constexpr float MIN_VELOCITY_DT = 0.002f; // 2ms — well under any real frame
 
+// Time constant for smoothing drag velocity. Measured at ~100Hz, 64 of 240
+// frames during a real drag carried no new pointer event, so the raw signal
+// alternates between real values and hard zeros. 45ms rides over those gaps
+// without visibly lagging the cursor.
+static constexpr float DRAG_VELOCITY_TAU = 0.045f;
+
 // How long one run of an animated variable lasts, in seconds.
 static float animVarDuration(const CAnimatedVariable<Vector2D>* av) {
     // A spring has no duration — it runs until it settles — so there is no
@@ -316,11 +325,29 @@ static float animVarDuration(const CAnimatedVariable<Vector2D>* av) {
 // of animating it, isBeingAnimated() stays false, and no transform shader runs.
 // The user's per-operation preference is inherited for free, with no config
 // reads and no branching.
+// The window the user is physically dragging right now, or nullptr. Asked once
+// per frame rather than per window: the drag controller is global state, and a
+// drag involves exactly one target.
+static Desktop::View::CWindow* draggedWindow(eMouseBindMode& outMode) {
+    outMode = MBIND_INVALID;
+    if (!g_layoutManager) return nullptr;
+    const auto& dc = g_layoutManager->dragController();
+    if (!dc) return nullptr;
+    outMode = dc->mode();
+    if (outMode == MBIND_INVALID) return nullptr;
+    const auto t = dc->target();
+    if (!t) return nullptr;
+    const PHLWINDOW w = t->window();
+    return w ? w.get() : nullptr;
+}
+
 void updateMotionRecords() {
     const auto& state = Desktop::windowState();
     if (!state) return;
 
-    const auto now = std::chrono::steady_clock::now();
+    const auto     now        = std::chrono::steady_clock::now();
+    eMouseBindMode dragMode   = MBIND_INVALID;
+    const auto     draggedRaw = draggedWindow(dragMode);
 
     for (const auto& w : state->windows()) {
         if (!w) continue;
@@ -341,6 +368,7 @@ void updateMotionRecords() {
             it = g_mWindowMotion.emplace(raw, MotionRecord{}).first;
 
         MotionRecord&  rec  = it->second;
+        rec.dragging        = (raw == draggedRaw);
         const Vector2D pos  = posAnim  ? posAnim->value()  : Vector2D(0, 0);
         const Vector2D size = sizeAnim ? sizeAnim->value() : Vector2D(0, 0);
 
@@ -351,23 +379,52 @@ void updateMotionRecords() {
             rec.haveSample = true;
         } else if (const float dt = std::chrono::duration_cast<std::chrono::duration<float>>(now - rec.sampledAt).count();
                    dt >= MIN_VELOCITY_DT) {
-            rec.velocity     = (pos - rec.pos) / dt;
-            rec.sizeVelocity = (size - rec.size) / dt;
+            const Vector2D instantV  = (pos  - rec.pos)  / dt;
+            const Vector2D instantSV = (size - rec.size) / dt;
+
+            // A compositor-driven animation is already smooth, so it is fed
+            // straight through — smoothing there would only add lag. A drag is
+            // not: it is sampled from discrete pointer events, and measured at
+            // ~100Hz roughly a quarter of frames carry no new event at all, so
+            // the raw signal alternates between real values and hard zeros. A
+            // shader cannot fix that itself (no memory between frames), so the
+            // exponential average lives here. Time-constant based, so it
+            // behaves the same at any refresh rate.
+            if (rec.dragging) {
+                const float a    = 1.0f - std::exp(-dt / DRAG_VELOCITY_TAU);
+                rec.velocity     = rec.velocity     + (instantV  - rec.velocity)     * a;
+                rec.sizeVelocity = rec.sizeVelocity + (instantSV - rec.sizeVelocity) * a;
+            } else {
+                rec.velocity     = instantV;
+                rec.sizeVelocity = instantSV;
+            }
             rec.pos          = pos;
             rec.size         = size;
             rec.sampledAt    = now;
         }
 
-        const bool wasInMotion = rec.moving || rec.resizing;
+        const bool wasInMotion = rec.moving || rec.resizing || rec.wasDragging;
         rec.moving             = moving;
         rec.resizing           = resizing;
+        if (moving || resizing) rec.lastAnimated = now;
 
-        if (moving || resizing) {
+        // Hyprland WARPS an interactive drag — measured: goal == value on every
+        // frame of a 240-frame capture, and isBeingAnimated() never true, even
+        // with misc:animate_mouse_windowdragging on. So a drag has to be driven
+        // off the drag controller instead. There is no progress, curve or
+        // duration to report for it; velocity is the whole signal.
+        const bool dragMoving   = rec.dragging && dragMode == MBIND_MOVE;
+        const bool dragResizing = rec.dragging && dragMode != MBIND_MOVE && dragMode != MBIND_INVALID;
+        const bool inMotion     = moving || resizing || rec.dragging;
+
+        if (inMotion) {
             // A new gesture starts its own peak; carrying the previous one over
             // would let a fast move leave a loud settle on the slow one after it.
-            if (!wasInMotion) rec.peakVelocity = Vector2D(0, 0);
+            if (!wasInMotion) { rec.peakVelocity = Vector2D(0, 0); rec.peakSizeVelocity = Vector2D(0, 0); }
             if (rec.velocity.distanceSq(Vector2D(0, 0)) > rec.peakVelocity.distanceSq(Vector2D(0, 0)))
                 rec.peakVelocity = rec.velocity;
+            if (rec.sizeVelocity.distanceSq(Vector2D(0, 0)) > rec.peakSizeVelocity.distanceSq(Vector2D(0, 0)))
+                rec.peakSizeVelocity = rec.sizeVelocity;
 
             rec.settling = false;
 
@@ -376,11 +433,31 @@ void updateMotionRecords() {
             // travel across the screen is the more visible of the two. Both
             // `is_moving` and `is_resizing` are still reported truthfully, so a
             // shader that cares about the other one can still see it.
-            const CAnimatedVariable<Vector2D>* driver = moving ? posAnim.get() : sizeAnim.get();
-            rec.kind     = moving ? TRANSFORM_MOVE : TRANSFORM_RESIZE;
-            rec.progress = driver->getPercent();
-            rec.curve    = driver->getCurveValue();
-            rec.duration = animVarDuration(driver);
+            const CAnimatedVariable<Vector2D>* driver =
+                moving ? posAnim.get() : (resizing ? sizeAnim.get() : nullptr);
+
+            if (driver) {
+                rec.kind     = moving ? TRANSFORM_MOVE : TRANSFORM_RESIZE;
+                rec.progress = driver->getPercent();
+                rec.curve    = driver->getCurveValue();
+                rec.duration = animVarDuration(driver);
+            } else {
+                // Drag-only: nothing is animating, so there is no progress to
+                // report. Say so honestly rather than leaving the last
+                // animation's values in place, which a shader could not tell
+                // apart from a live transform. `is_dragging` is how a shader
+                // knows to ignore them and use velocity instead.
+                rec.kind     = dragMoving ? TRANSFORM_MOVE : TRANSFORM_RESIZE;
+                rec.progress = 1.0f;
+                rec.curve    = 1.0f;
+                rec.duration = -1.0f;
+            }
+
+            // Reported truthfully during a drag as well: the window really is
+            // moving or resizing, even though no animation is driving it.
+            rec.moving   = moving   || dragMoving;
+            rec.resizing = resizing || dragResizing;
+
 
             // Refresh only the axis that is actually animating. Updating both
             // unconditionally meant a resize-only transform reported the
@@ -389,11 +466,14 @@ void updateMotionRecords() {
             // earlier move — plausible-looking, and undetectable from inside
             // GLSL. Collapsing the idle axis onto its current value makes its
             // delta and remaining both read as zero, which is the truth.
-            if (moving && posAnim) { rec.begun = posAnim->begun(); rec.goal = posAnim->goal(); }
-            else                   { rec.begun = rec.goal = rec.pos; }
+            // A drag has no trip at all: measured, begun/goal are one mouse
+            // event apart, so reporting them as move_delta would hand the
+            // shader a few pixels of jitter dressed up as a whole gesture.
+            if (moving && posAnim && !rec.dragging) { rec.begun = posAnim->begun(); rec.goal = posAnim->goal(); }
+            else                                    { rec.begun = rec.goal = rec.pos; }
 
-            if (resizing && sizeAnim) { rec.sizeBegun = sizeAnim->begun(); rec.sizeGoal = sizeAnim->goal(); }
-            else                      { rec.sizeBegun = rec.sizeGoal = rec.size; }
+            if (resizing && sizeAnim && !rec.dragging) { rec.sizeBegun = sizeAnim->begun(); rec.sizeGoal = sizeAnim->goal(); }
+            else                                       { rec.sizeBegun = rec.sizeGoal = rec.size; }
             // Deliberately NOT touched once motion ends: the settle tail needs
             // the trip it is settling from, so these stay frozen through it.
         } else if (wasInMotion) {
@@ -403,7 +483,13 @@ void updateMotionRecords() {
             // a shader can't detect.
             rec.settling        = true;
             rec.motionEnd       = now;
+            // On drag release a floating window simply stops — the compositor
+            // runs no settle animation of its own — so the tail is the only
+            // thing that carries the gesture's energy out. Seed it from the
+            // peak rather than the final velocity, which is near zero after an
+            // eased move and merely noisy at the end of a drag.
             rec.releaseVelocity = rec.velocity;
+            rec.moving = rec.resizing = false;
             rec.velocity        = Vector2D(0, 0);
             rec.sizeVelocity    = Vector2D(0, 0);
             rec.progress        = 1.0f;
@@ -414,7 +500,9 @@ void updateMotionRecords() {
         // a future window allocated at the same address — the same hazard
         // pruneFadeoutAnims exists for. Drop anything that stopped moving too
         // long ago for any shader to still be settling on it.
-        if (!moving && !resizing) {
+        rec.wasDragging = rec.dragging;
+
+        if (!inMotion) {
             const float since = std::chrono::duration_cast<std::chrono::duration<float>>(now - rec.motionEnd).count();
             if (!rec.settling || since > MAX_ANIM_DURATION)
                 g_mWindowMotion.erase(it);
@@ -440,8 +528,9 @@ static const std::string* resolveTransformAnim(const PHLWINDOW& pWindow) {
 
     // While settling there is no live animation to ask, so `kind` carries which
     // one it was — the tail has to play the same shader the motion did.
-    const bool wantMove   = rec.moving   || (!rec.moving && !rec.resizing && rec.kind == TRANSFORM_MOVE);
-    const bool wantResize = rec.resizing || (!rec.moving && !rec.resizing && rec.kind == TRANSFORM_RESIZE);
+    const bool idle       = !rec.moving && !rec.resizing;
+    const bool wantMove   = rec.moving   || (idle && rec.kind == TRANSFORM_MOVE);
+    const bool wantResize = rec.resizing || (idle && rec.kind == TRANSFORM_RESIZE);
 
     const std::string* path       = nullptr;
     float              ruleSettle = -1.0f;
@@ -458,6 +547,10 @@ static const std::string* resolveTransformAnim(const PHLWINDOW& pWindow) {
         // getPercent() is a linear time fraction; the eased value rides
         // alongside it as `curve`, which on a spring can legitimately exceed 1
         // while overshooting. Only the time fraction is clamped.
+        //
+        // A drag reaches here too. Hyprland warps those, so rec.progress was
+        // set to 1.0 upstream rather than left holding a stale animation's
+        // value — a dragged window is not partway through anything.
         g_pCurrentAnimProgress = std::clamp(rec.progress, 0.0f, 1.0f);
         g_pCurrentSettle       = -1.0f;
         return path;
@@ -1025,16 +1118,16 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
             const Vector2D v = g_pCurrentMotion ? g_pCurrentMotion->peakVelocity : Vector2D(0, 0);
             glUniform2f(activeEntry->peakVelLoc, (float)v.x, (float)v.y);
         }
+        if (activeEntry->peakSizeVelLoc >= 0) {
+            const Vector2D v = g_pCurrentMotion ? g_pCurrentMotion->peakSizeVelocity : Vector2D(0, 0);
+            glUniform2f(activeEntry->peakSizeVelLoc, (float)v.x, (float)v.y);
+        }
         if (activeEntry->isMovingLoc >= 0)
             glUniform1f(activeEntry->isMovingLoc, (g_pCurrentMotion && g_pCurrentMotion->moving) ? 1.0f : 0.0f);
         if (activeEntry->isResizingLoc >= 0)
             glUniform1f(activeEntry->isResizingLoc, (g_pCurrentMotion && g_pCurrentMotion->resizing) ? 1.0f : 0.0f);
-        if (activeEntry->isDraggingLoc >= 0) {
-            // Always 0 for now. Wired ahead of the interactive-drag work so a
-            // shader written against it today keeps compiling and simply never
-            // takes the drag branch, rather than failing to link later.
-            glUniform1f(activeEntry->isDraggingLoc, 0.0f);
-        }
+        if (activeEntry->isDraggingLoc >= 0)
+            glUniform1f(activeEntry->isDraggingLoc, (g_pCurrentMotion && g_pCurrentMotion->dragging) ? 1.0f : 0.0f);
         if (activeEntry->animKindLoc >= 0)
             glUniform1f(activeEntry->animKindLoc, g_pCurrentMotion ? (float)g_pCurrentMotion->kind : 0.0f);
         if (activeEntry->curveLoc >= 0) {

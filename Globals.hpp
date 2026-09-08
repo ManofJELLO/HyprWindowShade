@@ -209,6 +209,11 @@ struct MotionRecord {
     // thing to seed a post-motion wobble from. This is the honest measure of
     // how energetic the move was, and it is not derivable in a shader.
     Vector2D peakVelocity;
+    // Same idea for the size axis. A resize barely moves the window's origin —
+    // measured, a corner drag shifted it by 2px — so a resize settle seeded
+    // from peakVelocity would have no energy at all. Tracked separately rather
+    // than conflated, since the two axes mean different things.
+    Vector2D peakSizeVelocity;
 
     // --- live transform state ---
     bool     moving       = false;
@@ -230,6 +235,19 @@ struct MotionRecord {
 
     // Which animation drove `progress`/`curve`/`duration` this frame.
     uint8_t  kind         = TRANSFORM_NONE;
+
+    // --- interactive drag ---
+    // True while the user is physically holding this window. Hyprland retargets
+    // the animation on every mouse-motion event during a drag, so `progress`,
+    // `curve` and the trip endpoints carry per-event noise rather than a
+    // whole-gesture value; `velocity` stays meaningful. A shader uses
+    // `is_dragging` to tell the two regimes apart.
+    bool     dragging     = false;
+    bool     wasDragging  = false;
+    // Last time this window's animation was actually running, used to bridge
+    // the brief gaps between mouse events without inventing motion for a user
+    // who turned drag animation off.
+    std::chrono::steady_clock::time_point lastAnimated{};
 };
 extern std::unordered_map<Desktop::View::CWindow*, MotionRecord> g_mWindowMotion;
 
@@ -271,6 +289,7 @@ struct CompiledShader {
     GLint     settleLoc        = -1; // float 0..1 across the post-motion tail
     GLint     releaseVelLoc    = -1; // vec2: velocity frozen at the instant motion ended
     GLint     peakVelLoc       = -1; // vec2: fastest velocity reached during the gesture
+    GLint     peakSizeVelLoc   = -1; // vec2: fastest resize rate reached during the gesture
     // Corner rounding, re-applied by the wrapper. Hyprland rounds inside the
     // fragment program this shader replaces, so without these a shaded window
     // comes out with square corners.
@@ -394,3 +413,4 @@ bool hkLayerFadeoutDone(void* thisptr);
 
 // Maps a pointer to a stable 0..1 value, so each window's animation differs.
 float animSeedFor(const void* p);
+

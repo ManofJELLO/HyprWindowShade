@@ -517,12 +517,29 @@ settings for free — and that cuts both ways:
   Hyprland warps that operation and no shader runs. No config is read to achieve
   this; it falls out of asking the animation whether it is running.
 
-> **Interactive mouse drags are not supported yet.** With
-> `animate_mouse_windowdragging` enabled the animation *is* live during a drag, so a
-> move shader will fire — but Hyprland retargets it on every mouse event, so
-> `progress`, `curve` and `move_delta` carry per-event noise instead of a
-> whole-gesture value. `velocity` stays meaningful. `is_dragging` exists to tell the
-> cases apart and is wired but always 0 until that work lands.
+### Interactive drags
+
+Dragging with the mouse works, but it is a different regime and shaders need to know
+which one they are in.
+
+Hyprland **warps** a drag rather than animating it — measured over a 240-frame capture,
+`goal == value` on every single frame, and the animation never reports itself as
+running, even with `misc:animate_mouse_windowdragging` enabled. So during a drag:
+
+- `is_dragging` is 1.0, and `is_moving` / `is_resizing` still report truthfully.
+- `velocity` and `size_velocity` are the **only** meaningful signals. They are smoothed
+  over ~45ms, because at 100Hz roughly a quarter of frames carry no new pointer event
+  and the raw signal alternates between real values and hard zeros. A shader cannot
+  smooth that itself — it has no memory between frames.
+- `progress` and `curve` read 1.0 and `duration` reads −1: there is no animation to be
+  partway through. They are set explicitly rather than left holding the previous
+  transform's values, which a shader could not tell apart from a live one.
+- `move_delta` and `size_delta` are zero. Measured, the trip endpoints during a drag
+  are one mouse event apart, so reporting them would hand you jitter dressed as a
+  gesture.
+- On release the settle tail runs, seeded from `peak_velocity` /
+  `peak_size_velocity`. A floating window gets no animation from the compositor after
+  you let go, so the tail is the only thing carrying the gesture's energy out.
 
 ### The settle tail
 
@@ -562,6 +579,26 @@ float acrs = dot(rel, vec2(-dir.y, dir.x));
 float ripple = sin(acrs * TAU + time * 6.5 * TAU);
 vec2  uv     = v_texcoord - dir * ripple * amplitude / surface_size;
 ```
+
+### Measured velocity ranges
+
+Worth knowing before picking constants, because these are far apart and a single gain
+cannot serve all three:
+
+| gesture | peak velocity |
+|---|---|
+| keybind / layout move | ~32,000 px/s |
+| mouse drag (move) | ~9,000 px/s |
+| mouse drag (resize) | ~1,400 px/s (`size_velocity`) |
+
+A resize barely moves the window's *origin* — a corner drag shifts it a couple of
+pixels — so `velocity` is near zero there and `size_velocity` is the signal. Scale the
+two independently.
+
+Note also that **centre velocity is not a uniform**, deliberately: it is
+`velocity + size_velocity/2`, derivable in one line. Its real use is as the term you
+*subtract* — it is the pure-translation component of a resize, and removing it is what
+makes a resize deform instead of slide.
 
 A fragment shader **cannot draw outside the window's box**, so content pushed past an
 edge has to be faded out rather than drawn. The silhouette appears to bend, but true
@@ -676,6 +713,7 @@ Declare any of these in your fragment shader and the plugin will populate them e
 | `velocity` | `vec2` | window velocity in px/sec; 0 when still |
 | `size_velocity` | `vec2` | resize rate in px/sec |
 | `peak_velocity` | `vec2` | fastest velocity reached during the current gesture |
+| `peak_size_velocity` | `vec2` | fastest resize rate reached during the current gesture |
 | `release_velocity` | `vec2` | velocity frozen at the instant motion stopped |
 | `move_delta` | `vec2` | whole trip vector, `goal - start`; 0 when not moving |
 | `move_remaining` | `vec2` | distance still to travel |
@@ -683,7 +721,7 @@ Declare any of these in your fragment shader and the plugin will populate them e
 | `window_box` | `vec4` | the window's own box `(x, y, w, h)` |
 | `is_moving` | `float` | 1.0 while the position is animating |
 | `is_resizing` | `float` | 1.0 while the size is animating |
-| `is_dragging` | `float` | 1.0 during an interactive drag — **always 0 for now** |
+| `is_dragging` | `float` | 1.0 while the user is physically dragging this window |
 | `anim_kind` | `float` | 0 none, 1 move, 2 resize |
 | `curve` | `float` | eased progress; **can exceed 1.0** on an overshoot/spring curve |
 | `duration` | `float` | seconds the transform will take; −1 when the curve has none |
