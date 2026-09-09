@@ -11,26 +11,21 @@
 name = "HyprWindowShade"
 authors = ["ManofJELLO"]
 
-# commit_pins maps a Hyprland commit to the commit of THIS repo known to build
+# commit_pins maps a Hyprland commit to a commit of THIS repo known to build
 # against it, as ["<hyprland commit>", "<plugin commit>"].
 #
 # Measured, not assumed: on the CURRENT Hyprland, `hyprpm update` checks out the
-# tip of the default branch, not the pinned commit. A pin is the fallback for
-# someone running an OLDER Hyprland — it hands them the revision that worked
-# with their version instead of a HEAD that needs newer headers. Which is why
-# upstream's manifest carries one entry per Hyprland release going back years.
+# tip of the default branch and ignores these entirely. A pin is the fallback
+# for someone on an OLDER Hyprland — it hands them a revision matching their
+# headers instead of a HEAD that needs newer ones. That is why upstream's
+# manifest carries one entry per Hyprland release rather than one per commit.
 #
-# So: add one entry per Hyprland release once the plugin is confirmed to build
-# against it. There is no need to bump a pin for every commit — that does
-# nothing for anyone on the current release.
-#
-# Each entry pins a plugin commit KNOWN TO BUILD against a given Hyprland
-# commit, so `hyprpm update` checks out a working revision instead of whatever
-# HEAD happens to be. Add a new pair whenever a Hyprland release needs a
-# different revision of this plugin; leave the old ones in place so users on
-# older compositors still resolve to something that builds.
+# So an entry is inert until main moves on to a newer Hyprland. The moment to
+# set one is at that transition: pin the outgoing Hyprland release to the last
+# commit verified against it, then leave it alone. There is nothing to gain from
+# bumping a pin per commit.
 commit_pins = [
-    ["efb50993780079460b0cbed1363e2166a2de1d9f", "ca6484aab6eab0a5369b3076cadfb1dde30551a9"], # 0.56.2
+    ["efb50993780079460b0cbed1363e2166a2de1d9f", "d08a1125cf0ae5e852a4351c02e79ee9da6b8eff"], # 0.56.2 — last verified against this release
 ]
 
 [HyprWindowShade]
