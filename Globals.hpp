@@ -144,7 +144,7 @@ extern std::unordered_map<Desktop::View::CWindow*, WindowShaderState> g_mWindowR
 // define `rand`/`noise`/the Ashima `mod289` boilerplate, and the combined
 // program would fail to link — unusable for shaders users download rather than
 // write. Separate programs compose without touching the source at all.
-inline constexpr int MAX_SHADER_STAGES = 5; // base + geometry + focus + fullscreen + anim
+inline constexpr int MAX_SHADER_STAGES = 7; // class + rule base + manual + geometry + focus + fullscreen + anim
 
 // Ping-pong render targets for the intermediate stages, keyed by texture size.
 // An intermediate result is consumed by the very next stage in the same draw

@@ -201,11 +201,13 @@ Layers are applied bottom-to-top in this order:
 
 | Order | Layer |
 |---|---|
-| 1 | `+shader:` |
-| 2 | `+shader_floating:` or `+shader_tiled:` |
-| 3 | `+shader_active:` or `+shader_inactive:` |
-| 4 | `+shader_fullscreen:` |
-| 5 | `+shader_open:` / `+shader_close:` |
+| 1 | a `classshader` for the window's class |
+| 2 | `+shader:` |
+| 3 | a `togglewindowshader` toggled onto this window |
+| 4 | `+shader_floating:` or `+shader_tiled:` |
+| 5 | `+shader_active:` or `+shader_inactive:` |
+| 6 | `+shader_fullscreen:` |
+| 7 | `+shader_open:` / `+shader_close:` |
 
 Nothing about the shaders themselves has to change for this to work. Each layer
 is a separate GL program that reads the layer below it through its own `tex`
@@ -216,9 +218,29 @@ Two notes on what stacking changed:
 
 - **Fullscreen is the exception.** Going fullscreen drops a window's shaders by
   default — see [fullscreen](#fullscreen) below.
-- **`togglewindowshader` still replaces.** A manually toggled shader is an
-  explicit override, so it takes the place of the rule layers rather than joining
-  them. Animations still play on top of it.
+- **Nothing replaces anything else.** Every source of shading contributes its
+  own layer — a class-wide shader, an always-on rule, a shader you toggled on by
+  hand, and whatever your focus and geometry state add. If two of them have an
+  opinion about how a window looks, the answer is both, in the order above, not
+  the more specific one winning. `+shader_replace:1` is the single opt-out.
+- **This includes `togglewindowshader` and `classshader`.** Both used to stand in
+  for the rule layers; they now join them. So a class shader composites with
+  `+shader_inactive:` rather than being erased by it the moment the window loses
+  focus:
+
+  ```sh
+  hyprctl dispatch 'hl.plugin.HyprWindowShade.classshader("google-chrome", "/path/reading_mode.glsl")'
+  ```
+
+  ```lua
+  hl.window_rule({
+      match = { class = ".*" },
+      tag   = "+shader_inactive_default:/path/chromaGlitch.glsl",
+  })
+  ```
+
+  Focused, Chrome renders through `reading_mode`. Unfocused, it renders through
+  `reading_mode` **and then** `chromaGlitch`.
 
 To get the old behavior back on a given window — the first matching tag wins and
 the rest are ignored — tag it `+shader_replace:1`.
@@ -238,6 +260,23 @@ A fullscreen window gets **no shaders at all** by default. Someone who put a pap
 or CRT effect on a browser almost certainly does not want it over a fullscreen
 video, and a game is the last place a permanent post-process effect belongs — so
 fullscreen is opt-in rather than opt-out.
+
+**"No shaders at all" is literal, and it is the one place the
+[stacking rule](#stacking) does not apply.** Everything is dropped: `+shader:` and
+the focus and geometry tags, a `classshader` set for the window's class, a shader
+you toggled on with `togglewindowshader`, and the one-shot animations —
+`+shader_open:`, `+shader_urgent:`, `+shader_focus:` and the generic
+`+shader_move:` / `+shader_resize:` / `+shader_workspace:`. An effect over a
+fullscreen window costs frames in the one place frames matter most, and it
+misrepresents what the window is trying to show, which is the whole point of a
+video player or a game being fullscreen in the first place.
+
+The two fullscreen *transitions* are the only way anything plays, and both are
+opt-in by naming a tag: [`+shader_fullscreen_enter:`](#fullscreen-and-float-toggles)
+and `+shader_fullscreen_exit:`. Neither falls back to the generic move/resize
+shader when unset — a window still reads as fullscreen for every frame its exit
+animates over, so a generic shader there is a shader running on a fullscreen
+window, which is the thing being ruled out.
 
 Two ways to opt in:
 
@@ -356,24 +395,30 @@ hl.bind("SUPER + W", shade("togglewindowshader", shaders.pixelate))
 
 > Popups belonging to a layer surface — a bar's tooltip or dropdown menu — are shaded with that layer's shader too. They do not pick up the layer's open animation or rounding, which belong to the layer's own box.
 
-Pass `*` as the namespace to set a **catch-all** — it applies to any layer that has no
-entry of its own:
+Pass `*` as the namespace to set a **catch-all** — it applies to every layer:
 
 ```lua
--- everything dims, except rofi which gets its own effect
+-- everything dims, and rofi additionally blurs
 hl.plugin.HyprWindowShade.layershader("*",    "/home/USERNAME/.config/hypr/shaders/dim.glsl")
 hl.plugin.HyprWindowShade.layershader("rofi", "/home/USERNAME/.config/hypr/shaders/blur.glsl")
 ```
 
-An exact namespace always wins; the catch-all is only consulted when the lookup misses, so
-precedence never depends on which shader path happens to sort first. It works the same way
-for `layeropenanim` and `layercloseanim`, and `("*", "clear")` removes it.
+Layers [stack](#stacking) exactly as windows do: the catch-all goes down first and a
+namespace's own shader composites over it. Above, rofi renders through `dim` **and then**
+`blur`; every other layer renders through `dim` alone. A namespace entry adds to the
+catch-all rather than standing in for it, so `("*", "clear")` removes the catch-all and
+leaves the per-namespace shaders alone.
 
-This is the layer equivalent of the window rules' [`_default` suffix](#fallback-rules), but
-it exists for a different reason. Window tags *needed* `_default` because Hyprland keeps them
-in an alphabetically sorted set, so a catch-all rule and a specific one would fight and the
-winner came down to the shader's filename. Layer entries are one slot per namespace with no
-ordering to be at the mercy of — they simply had no way to express a catch-all at all.
+Open and close animations are the exception, because only one of them can play at a time:
+`layeropenanim` and `layercloseanim` still resolve to the exact namespace if it has one and
+fall back to `*` otherwise.
+
+The window rules' [`_default` suffix](#fallback-rules) exists for a different reason, and is
+not the same mechanism. Window tags *needed* `_default` because Hyprland keeps them in an
+alphabetically sorted set, so a catch-all rule and a specific one setting the *same tag*
+would fight and the winner came down to the shader's filename. Layer entries are one slot per
+namespace with no ordering to be at the mercy of — they simply had no way to express a
+catch-all at all, and now that they do, both slots apply.
 
 > `*` catches **every** layer, which includes your wallpaper if it is one (`mpvpaper`,
 > `swaybg`, `hyprpaper`) and your bar. Name the namespaces individually if that isn't what
@@ -625,8 +670,10 @@ fullscreen is usually a game or a video, which is the least welcome place for an
 effect. This is the same reasoning that makes `+shader_fullscreen:` opt-in for the
 steady state.
 
-**Leaving fullscreen animates by default**, using whatever move/resize shader the
-window already has, and `+shader_fullscreen_exit:` overrides it.
+**Leaving fullscreen is silent by default too**, for the same reason and in the
+same way: the window still reports itself as fullscreen while the exit animates,
+so the generic move/resize shader is suppressed rather than played. Set
+`+shader_fullscreen_exit:` to give that transition a look.
 
 Float and tile both animate by default and fall through to the generic shader when no
 specific tag is set.
@@ -760,22 +807,37 @@ Two notes:
 ### hyprctl dispatch
 
 Every function above is also registered as a native dispatcher via
-`HyprlandAPI::addDispatcherV2`, invokable from any shell:
+`HyprlandAPI::addDispatcherV2`. **How you reach it from a shell depends on which config
+format the session is running**, because `hyprctl dispatch` behaves differently under each.
+
+**On a `.conf` session**, dispatchers take a name and space-separated arguments:
 
 ```sh
 hyprctl dispatch layershader mpvpaper /home/USERNAME/.config/hypr/shaders/pixelate.glsl
 hyprctl dispatch reloadshaders
 ```
 
-The dispatcher names and semantics match the [Lua API](#lua-api) table exactly, except that
-arguments arrive as one space-separated string. Handy for testing a shader without touching
-your config. The first argument supports double-quoting, so a class name with a space works:
+The first argument supports double-quoting, so a class name with a space works:
 `hyprctl dispatch classshader "Some Class" /path/to.glsl`. A dispatcher that can't parse its
 arguments reports a usage error rather than silently doing nothing, so
 `hyprctl dispatch layershader rofi` tells you the path is missing.
 
-> Dispatchers fire from `hyprctl` and from `.conf` binds, but **not** from Lua binds — that's
-> why the Lua functions exist.
+**On a `.lua` session this form does not work at all** — measured on 0.56.2. `hyprctl
+dispatch ARGS` wraps ARGS in `hl.dispatch(ARGS)` and evaluates it as *Lua*, so a bare
+dispatcher name is a syntax error or an undefined global, and this is true of Hyprland's own
+dispatchers too (`hyprctl dispatch workspace 2` fails the same way). Call the Lua function
+instead:
+
+```sh
+hyprctl dispatch 'hl.plugin.HyprWindowShade.layershader("mpvpaper", "/path/pixelate.glsl")'
+```
+
+One wrinkle: the call runs, but it returns nothing, so `hl.dispatch` then rejects it with
+`hl.dispatch: expected a dispatcher` on stderr and a non-zero exit *after* the shader has
+already been applied. A script driving the plugin this way should ignore the exit code.
+
+> Dispatchers fire from `hyprctl` on a `.conf` session and from `.conf` binds, but **not**
+> from Lua binds — that's why the Lua functions exist.
 
 ### Shader uniforms
 

@@ -457,7 +457,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "layercloseanim",     &luaLayerCloseAnim);
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "reloadshaders",      &luaReloadShaders);
 
-    return {"HyprWindowShade", "Native CShader Injection (v0.56)", "ManofJELLO", "1.6"};
+    return {"HyprWindowShade", "Native CShader Injection (v0.56)", "ManofJELLO", "1.7"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {

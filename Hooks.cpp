@@ -653,6 +653,33 @@ void updateMotionRecords() {
     }
 }
 
+// True while a window is fullscreen and has not opted into being shaded there.
+// Fullscreen is opt-in for animations for the same reason it is for the steady
+// state: the window is usually a game or a video, where an effect costs frames
+// and misrepresents what is on screen. `+shader_fullscreen_stack:1` is the
+// blanket opt-in; `+shader_fullscreen_enter:` / `+shader_fullscreen_exit:` opt
+// the two transitions in individually and are resolved before this applies.
+static bool fullscreenSuppresses(const PHLWINDOW& pWindow) {
+    if (!pWindow || !Fullscreen::controller()->isFullscreen(pWindow)) return false;
+    auto it = g_mWindowRuleShaders.find(pWindow.get());
+    return it == g_mWindowRuleShaders.end() || !it->second.fullscreenStack;
+}
+
+// The stricter form: fullscreen, and nothing has opted this window into being
+// shaded *or* animated there, so every path below would resolve to "no shaders"
+// anyway. Lets hkGLDrawTex bail before it touches the class, manual and rule
+// maps or builds a stack, which is what keeps a fullscreen game costing what it
+// would cost with the plugin unloaded. Windows that are not fullscreen pay one
+// predictable branch for this; only fullscreen ones reach the lookup.
+static bool fullscreenRendersNothing(const PHLWINDOW& pWindow) {
+    if (!pWindow || !Fullscreen::controller()->isFullscreen(pWindow)) return false;
+    auto it = g_mWindowRuleShaders.find(pWindow.get());
+    if (it == g_mWindowRuleShaders.end()) return true;
+    const auto& st = it->second;
+    return !st.fullscreenStack && st.fullscreen.empty()
+        && st.fsEnterAnim.empty() && st.fsExitAnim.empty();
+}
+
 // Move/resize animation for a live window. Mirrors resolveOpenAnim, but there is
 // no timer to run down: the compositor's own move animation is the clock, so
 // this is a pure read of the record sampled above. `progress` follows whatever
@@ -711,6 +738,18 @@ static const std::string* resolveTransformAnim(const PHLWINDOW& pWindow) {
         default: break;
     }
     if (suppressGeneric) return nullptr;
+
+    // Past this point only the generic move/resize/workspace shaders remain, and
+    // those are exactly what a fullscreen window should not be playing. The
+    // fullscreen transition tags above already returned if they were set, so an
+    // explicit `+shader_fullscreen_enter:` / `+shader_fullscreen_exit:` still
+    // plays — this only suppresses the generic shader standing in for one.
+    //
+    // Leaving fullscreen is included, not exempt: the window still reads as
+    // fullscreen for every frame the exit animates over, so a generic move or
+    // resize shader here is a shader running on a fullscreen window, which is
+    // the thing being ruled out.
+    if (!path && fullscreenSuppresses(pWindow)) return nullptr;
 
     if (!path && wantWs && !state.workspaceAnim.empty()) {
         path = &state.workspaceAnim; ruleSettle = state.workspaceSettle;
@@ -774,11 +813,21 @@ static bool windowReplaceMode(const PHLWINDOW& pWindow) {
     return it != g_mWindowRuleShaders.end() && it->second.replaceMode;
 }
 
-// Collects the shader layers for a window or layer surface, bottom first. The
-// order is the one users can reason about: the base look goes down first, then
-// the geometry-conditional layer, then the focus-conditional layer, then
-// fullscreen on top. A one-shot animation is added above all of these by the
-// caller, since it can also apply to a fadeout that has no window left.
+// Collects the shader layers for a window or layer surface, bottom first.
+//
+// The plugin's general rule is that shading sources STACK — they never stand in
+// for one another. Whatever a window picks up from its class, from an always-on
+// rule, from an imperative toggle and from its focus or geometry state all
+// composite together, and layer surfaces follow the same rule for their
+// catch-all and namespace entries. If two sources disagree about how a surface
+// should look, the answer is both, in a defined order, not the more specific one
+// winning. `+shader_replace:1` is the single opt-out, handled by the caller.
+//
+// The order is the one users can reason about, coarsest first: the class-wide
+// look, then the always-on rule, then an imperative toggle, then the
+// geometry-conditional layer, then the focus-conditional layer, then fullscreen
+// on top. A one-shot animation is added above all of these by the caller, since
+// it can also apply to a fadeout that has no window left.
 //
 // Returns how many entries were written. Never exceeds MAX_SHADER_STAGES - 1,
 // leaving room for the animation.
@@ -788,54 +837,73 @@ static int collectBaseLayers(const PHLWINDOW& pWindow, const PHLLS& pLS, const s
     if (pWindow) {
         Desktop::View::CWindow* rawWin = pWindow.get();
 
-        // A manual `togglewindowshader` is an explicit, imperative override —
-        // it replaces the rule layers rather than joining them, which is the
-        // whole point of toggling one on. Animations still stack above it.
-        if (auto it = g_mWindowManualShaders.find(rawWin); it != g_mWindowManualShaders.end()) {
-            out[n++] = &it->second;
-            return n;
+        // Every source of shading contributes its own layer. Nothing here
+        // replaces anything else: a shader set by class, by an always-on rule,
+        // by an imperative toggle and by focus state all composite, in that
+        // order, and the caller adds the one-shot animation on top. The only
+        // opt-out is `+shader_replace:1`, handled by the caller.
+        const std::string* classShader = nullptr;
+        {
+            const auto& initClass    = rawWin->m_initialClass;
+            const auto& currentClass = rawWin->m_class;
+            auto        classIt      = g_mWindowClassShaderMap.find(initClass);
+            if (classIt == g_mWindowClassShaderMap.end()) classIt = g_mWindowClassShaderMap.find(currentClass);
+            if (classIt != g_mWindowClassShaderMap.end()) classShader = &classIt->second;
         }
 
-        if (auto it = g_mWindowRuleShaders.find(rawWin); it != g_mWindowRuleShaders.end()) {
-            const auto& state        = it->second;
-            const bool  isActive     = Desktop::focusState()->isWindowActive(pWindow);
-            const bool  isFloating   = rawWin->m_isFloating;
-            const bool  isFullscreen = Fullscreen::controller()->isFullscreen(pWindow);
+        const std::string* manualShader = nullptr;
+        if (auto it = g_mWindowManualShaders.find(rawWin); it != g_mWindowManualShaders.end())
+            manualShader = &it->second;
 
-            // Fullscreen drops the window's shaders by default. Someone who
-            // put a permanent effect on a browser almost certainly does not
-            // want it over a fullscreen video or game, so fullscreen is opt-in
-            // rather than opt-out: `+shader_fullscreen:` is the deliberate
-            // exception, and `+shader_fullscreen_stack:1` restores the normal
-            // stack for a window that genuinely wants it.
+        const bool isFullscreen = Fullscreen::controller()->isFullscreen(pWindow);
+
+        if (auto it = g_mWindowRuleShaders.find(rawWin); it != g_mWindowRuleShaders.end()) {
+            const auto& state      = it->second;
+            const bool  isActive   = Desktop::focusState()->isWindowActive(pWindow);
+            const bool  isFloating = rawWin->m_isFloating;
+
+            // Fullscreen drops EVERYTHING by default — rule layers, class
+            // shaders and imperative toggles alike. A fullscreen window is
+            // usually a game or a video: an effect there costs frames, and it
+            // misrepresents what the window is actually trying to show. So
+            // fullscreen is opt-in rather than opt-out, and the opt-in has to be
+            // deliberate: `+shader_fullscreen:` names one shader for the
+            // fullscreen state, and `+shader_fullscreen_stack:1` restores the
+            // whole normal stack for a window that genuinely wants it.
             if (isFullscreen && !state.fullscreenStack) {
                 if (!state.fullscreen.empty())                  out[n++] = &state.fullscreen;
             } else {
+                if (classShader)                                out[n++] = classShader;
                 if (!state.fallback.empty())                    out[n++] = &state.fallback;
+                if (manualShader)                               out[n++] = manualShader;
                 if (isFloating)  { if (!state.floating.empty())  out[n++] = &state.floating; }
                 else             { if (!state.tiled.empty())     out[n++] = &state.tiled; }
                 if (isActive)    { if (!state.active.empty())    out[n++] = &state.active; }
                 else             { if (!state.inactive.empty())  out[n++] = &state.inactive; }
                 if (isFullscreen && !state.fullscreen.empty())   out[n++] = &state.fullscreen;
             }
-        }
-
-        // Class shaders are a coarser fallback than any rule, so they only speak
-        // up when no rule layer did — same as before stacking existed.
-        if (n == 0) {
-            const auto& initClass    = rawWin->m_initialClass;
-            const auto& currentClass = rawWin->m_class;
-            auto        classIt      = g_mWindowClassShaderMap.find(initClass);
-            if (classIt == g_mWindowClassShaderMap.end()) classIt = g_mWindowClassShaderMap.find(currentClass);
-            if (classIt != g_mWindowClassShaderMap.end()) out[n++] = &classIt->second;
+        } else if (!isFullscreen) {
+            // No rules at all, so there is nothing to opt this window into
+            // being shaded while fullscreen — and opting in is the only way.
+            if (classShader)                                    out[n++] = classShader;
+            if (manualShader)                                   out[n++] = manualShader;
         }
 
         return n;
     }
 
     if (pLS) {
-        if (const std::string* p = lookupLayerEntry(g_mLayerNamespaceShaderMap, pLS->m_namespace))
-            out[n++] = p;
+        // Layers follow the same invariant as windows: shading sources stack
+        // rather than replace. A catch-all shader is the coarser of the two, so
+        // it goes down first and a namespace-specific one composites over it,
+        // instead of the specific entry standing in for the catch-all.
+        if (auto it = g_mLayerNamespaceShaderMap.find(LAYER_CATCH_ALL); it != g_mLayerNamespaceShaderMap.end())
+            out[n++] = &it->second;
+
+        if (pLS->m_namespace != LAYER_CATCH_ALL) {
+            if (auto it = g_mLayerNamespaceShaderMap.find(pLS->m_namespace); it != g_mLayerNamespaceShaderMap.end())
+                out[n++] = &it->second;
+        }
     }
 
     return n;
@@ -1107,6 +1175,22 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
         pLS = elem->m_data.currentLS.lock();
     }
 
+    // --- FULLSCREEN FAST PATH ---
+    // A fullscreen window that opted into nothing must cost nothing. Everything
+    // below — the class/manual/rule lookups, the stack build, the offscreen
+    // chain, the damage scheduling — would resolve to "no shaders" for it, so
+    // skip straight to Hyprland's own draw. This is the path a fullscreen game
+    // takes on every surface of every frame, and it is the reason the plugin can
+    // be left loaded while gaming.
+    if (fullscreenRendersNothing(pWindow)) {
+        g_pCurrentRenderWindow.reset();
+        g_pCurrentRenderLayer.reset();
+        g_pCurrentCompiledShader = nullptr;
+        g_pCurrentMotion         = nullptr;
+        ((TGLDrawTex)g_pGLDrawTexHook->m_original)(thisptr, element, damage);
+        return;
+    }
+
     g_pCurrentRenderWindow = pWindow;
     g_pCurrentRenderLayer  = pLS ? pLS : pOwnerLS;
     g_pCurrentAnimProgress = -1.0f;
@@ -1149,7 +1233,12 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
 
     const std::string* animPath = nullptr;
     if (pWindow) {
-        animPath = resolveOpenAnim(pWindow);
+        // Open, urgent and focus cues are suppressed outright for a fullscreen
+        // window that has not opted in; only the fullscreen transition tags can
+        // still speak, and resolveTransformAnim is what serves those.
+        const bool fsQuiet = fullscreenSuppresses(pWindow);
+
+        animPath = fsQuiet ? nullptr : resolveOpenAnim(pWindow);
         // Priority, and the ordering is deliberate:
         //   open/close  — a window appearing or leaving outranks everything.
         //   urgent      — an alert. Rare, and the user needs to see it even
@@ -1158,9 +1247,9 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
         //   focus       — LAST, because window.active fires on every workspace
         //                 switch. Ranked above transforms it would fight the
         //                 workspace shader on every single switch.
-        if (!animPath) animPath = resolveOneShotAnim(pWindow, /* urgentOnly */ true);
-        if (!animPath) animPath = resolveTransformAnim(pWindow);
-        if (!animPath) animPath = resolveOneShotAnim(pWindow, /* urgentOnly */ false);
+        if (!animPath && !fsQuiet) animPath = resolveOneShotAnim(pWindow, /* urgentOnly */ true);
+        if (!animPath)             animPath = resolveTransformAnim(pWindow);
+        if (!animPath && !fsQuiet) animPath = resolveOneShotAnim(pWindow, /* urgentOnly */ false);
     } else if (pLS)
         animPath = resolveLayerOpenAnim(pLS);
     else if (elem && !elem->m_data.surface && elem->m_data.tex)
