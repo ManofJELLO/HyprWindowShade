@@ -836,7 +836,8 @@ static int collectBaseLayers(const PHLWINDOW& pWindow, const PHLLS& pLS, const s
 //
 // Returns nullptr when the chain can't run, in which case the caller falls back
 // to drawing the top stage alone — degraded, but never broken.
-static SP<Render::ITexture> runIntermediateStages(CompiledShader* const* stages, int count, const SP<Render::ITexture>& src) {
+static SP<Render::ITexture> runIntermediateStages(CompiledShader* const* stages, int count, const SP<Render::ITexture>& src,
+                                                  int animIndex = -1) {
     if (count <= 0 || !src || !Render::GL::g_pHyprOpenGL || !g_pHyprRenderer) return nullptr;
 
     // A rotated or flipped source buffer would need the targets' dimensions
@@ -931,10 +932,15 @@ static SP<Render::ITexture> runIntermediateStages(CompiledShader* const* stages,
     const CBox box(0.0, 0.0, projSpace.x, projSpace.y);
 
     // Intermediate stages render their finished state: `progress` belongs to the
-    // animation on top of the stack, not to the layers it's animating.
-    const float savedProgress = g_pCurrentAnimProgress;
-    g_pCurrentAnimProgress = -1.0f;
-    g_bIntermediatePass    = true;
+    // animation, not to the layers it is animating. `animIndex` names the one
+    // stage that is the animation, if it is in this batch — when the final draw
+    // is handed back to Hyprland every stage comes through here, the animation
+    // included, and forcing its progress to -1 would freeze it on its last
+    // frame instead of playing it.
+    const float   savedProgress = g_pCurrentAnimProgress;
+    const float   savedSettle   = g_pCurrentSettle;
+    const uint8_t savedOneShot  = g_pCurrentOneShotKind;
+    g_bIntermediatePass         = true;
 
     SP<Render::ITexture> cur = src;
     for (int i = 0; i < count; ++i) {
@@ -949,6 +955,11 @@ static SP<Render::ITexture> runIntermediateStages(CompiledShader* const* stages,
 
         g_pCurrentCompiledShader = stages[i];
 
+        const bool isAnimStage   = (i == animIndex);
+        g_pCurrentAnimProgress   = isAnimStage ? savedProgress : -1.0f;
+        g_pCurrentSettle         = isAnimStage ? savedSettle   : -1.0f;
+        g_pCurrentOneShotKind    = isAnimStage ? savedOneShot   : TRANSFORM_NONE;
+
         CHyprOpenGLImpl::STextureRenderData data;
         data.a        = 1.0f;
         data.damage   = &R.damage;
@@ -960,6 +971,8 @@ static SP<Render::ITexture> runIntermediateStages(CompiledShader* const* stages,
 
     g_bIntermediatePass    = false;
     g_pCurrentAnimProgress = savedProgress;
+    g_pCurrentSettle       = savedSettle;
+    g_pCurrentOneShotKind  = savedOneShot;
 
     glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)savedFBO);
 
@@ -1143,26 +1156,60 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
     // Everything below the top stage renders into an offscreen target; the top
     // stage is left for Hyprland's own draw, with the composed texture swapped
     // in underneath it, so geometry/rounding/damage stay entirely theirs.
+    // Everything Hyprland's own fragment program does — blur, colour management,
+    // discard, motion blur, on top of rounding and dim — is done in the program
+    // this plugin substitutes, so binding our shader for the final draw throws
+    // all of it away. Rounding and dim are re-applied by the wrapper; the rest
+    // cannot reasonably be, and reimplementing each new one as Hyprland gains it
+    // is a losing game on a plugin that has to work against everyone's config,
+    // not one machine's.
+    //
+    // So when the element actually needs any of it, run EVERY user stage
+    // offscreen and let Hyprland draw the composed result with its own program.
+    // Each effect then applies natively and exactly once: intermediate stages
+    // already neutralise alpha, dim and rounding precisely so the final draw can
+    // own them.
+    //
+    // It costs one extra offscreen pass, so it is not taken unconditionally —
+    // an element that needs none of these keeps the cheaper path where our top
+    // stage is the on-screen draw.
+    const bool wantsNativeFinal = elem && (elem->m_data.blur
+                                        || elem->m_data.discardActive
+                                        || elem->m_data.motionBlur.enabled
+                                        || elem->m_data.cmBackToSRGB);
+
     SP<Render::ITexture> originalTex;
-    if (nStages >= 2 && elem && elem->m_data.tex) {
-        if (auto composed = runIntermediateStages(stages, nStages - 1, elem->m_data.tex)) {
-            originalTex       = elem->m_data.tex;
-            elem->m_data.tex  = composed;
+    bool                 nativeFinal = false;
+    if (nStages >= 1 && elem && elem->m_data.tex) {
+        const int offscreen = wantsNativeFinal ? nStages : nStages - 1;
+        if (offscreen >= 1) {
+            // The animation is the top stage when there is one; tell the chain
+            // so it keeps its progress instead of rendering its finished state.
+            const int animIdx = topIsAnim ? nStages - 1 : -1;
+            if (auto composed = runIntermediateStages(stages, offscreen, elem->m_data.tex, animIdx)) {
+                originalTex      = elem->m_data.tex;
+                elem->m_data.tex = composed;
+                nativeFinal      = wantsNativeFinal;
+            }
+            // If the chain couldn't run we fall through with the top stage only,
+            // which is degraded but never a broken frame.
         }
-        // If the chain couldn't run we fall through with the top stage only,
-        // which is the pre-stacking behaviour rather than a broken frame.
     }
 
-    g_pCurrentCompiledShader = nStages > 0 ? stages[nStages - 1] : nullptr;
+    // nullptr leaves Hyprland's own program bound, which is the whole point of
+    // the native path.
+    g_pCurrentCompiledShader = (nativeFinal || nStages == 0) ? nullptr : stages[nStages - 1];
     // Only the animation stage gets the live progress. If the animation shader
     // failed to compile, the top stage is an ordinary layer and must render its
     // finished state, not be dragged through an animation it never asked for.
-    g_pCurrentAnimProgress   = topIsAnim ? animProgress : -1.0f;
+    // In the native path the animation already ran as an offscreen stage, so the
+    // on-screen draw is Hyprland's and wants none of this.
+    g_pCurrentAnimProgress   = (topIsAnim && !nativeFinal) ? animProgress : -1.0f;
     g_pCurrentAnimSeed       = animSeed;
     // `settle` is scoped to the animation stage for the same reason: the tail's
     // length is a property of the transform shader, and a base layer has none.
-    g_pCurrentSettle         = topIsAnim ? animSettle : -1.0f;
-    g_pCurrentOneShotKind    = topIsAnim ? animOneShot : TRANSFORM_NONE;
+    g_pCurrentSettle         = (topIsAnim && !nativeFinal) ? animSettle : -1.0f;
+    g_pCurrentOneShotKind    = (topIsAnim && !nativeFinal) ? animOneShot : TRANSFORM_NONE;
 
     // Schedule continuous redraw if any stage uses `time`, or while a one-shot
     // animation is mid-flight — an animation shader drives itself off `progress`

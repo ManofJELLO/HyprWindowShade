@@ -817,9 +817,16 @@ names yourself, and don't write to `fragColor` expecting them to be absent.
 > **Why the wrapper re-applies these.** Replacing Hyprland's fragment program means
 > losing everything that program did. Corner rounding and `dim_inactive` both live
 > inside it (`surface.frag.inc` does `pixColor.rgb *= tint`), so without the wrapper
-> putting them back, a shaded window comes out square-cornered and undimmed. If you add
-> a shader and a window stops respecting some other decoration setting, this is the
-> first place to look.
+> putting them back, a shaded window comes out square-cornered and undimmed.
+>
+> Rounding and dim are cheap to redo. Blur, colour management, discard and motion blur
+> are not — and chasing each new one as Hyprland gains it is a losing game for a plugin
+> that has to work against everyone's config. So when an element needs any of those,
+> the plugin runs **every** shader stage offscreen and hands the finished texture back
+> to Hyprland to draw with its own program, which applies all of them natively and
+> exactly once. It costs one extra offscreen pass, so it is only taken when the element
+> actually needs it; a window with no blur, no discard, no motion blur and no colour
+> conversion keeps the cheaper path.
 
 ---
 
