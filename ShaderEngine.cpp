@@ -174,9 +174,13 @@ CompiledShader* getOrCompileShader(const std::string& shaderPath) {
             uniform float plugin_alpha;
         )";
 
-        // Corner rounding lives in the fragment program Hyprland would have
-        // bound here, so replacing that program squares off every shaded
-        // window. Redo the mask in the wrapper instead.
+        // Corner rounding, alpha and dim are re-applied below ONLY for the
+        // fallback draw path. Normally every stage renders offscreen and
+        // Hyprland draws the composed result with its own program, which
+        // applies all three natively — there these multiplies see 1.0 / 0 and
+        // do nothing. They matter when runIntermediateStages declines the job
+        // (a rotated monitor, a rotated source buffer), where our shader is
+        // the on-screen draw and nothing else would put them back.
         //
         // Only when the shader declares `v_texcoord`, which the mask needs to
         // know where in the box it is. Every shader following the documented

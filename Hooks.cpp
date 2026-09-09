@@ -1170,13 +1170,15 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
     // already neutralise alpha, dim and rounding precisely so the final draw can
     // own them.
     //
-    // It costs one extra offscreen pass, so it is not taken unconditionally —
-    // an element that needs none of these keeps the cheaper path where our top
-    // stage is the on-screen draw.
-    const bool wantsNativeFinal = elem && (elem->m_data.blur
-                                        || elem->m_data.discardActive
-                                        || elem->m_data.motionBlur.enabled
-                                        || elem->m_data.cmBackToSRGB);
+    // Taken unconditionally rather than only when one of Hyprland's effects is
+    // detectably in play. Gating on a list of known flags means every effect
+    // Hyprland gains in future is silently dropped until someone notices and
+    // adds it to the list — the exact failure this is meant to end. The cost is
+    // one offscreen pass per shaded element per frame.
+    //
+    // This applies to layer surfaces as much as windows: the decision is made
+    // from the pass element, which does not care which it is drawing.
+    const bool wantsNativeFinal = true;
 
     SP<Render::ITexture> originalTex;
     bool                 nativeFinal = false;
@@ -1191,8 +1193,13 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
                 elem->m_data.tex = composed;
                 nativeFinal      = wantsNativeFinal;
             }
-            // If the chain couldn't run we fall through with the top stage only,
-            // which is degraded but never a broken frame.
+            // If the chain could not run — a rotated monitor or a rotated
+            // source buffer, which runIntermediateStages declines rather than
+            // getting subtly wrong — we fall back to binding the top stage as
+            // the on-screen draw. That path is why the wrapper still re-applies
+            // alpha, rounding and dim: they are dead code on the native path,
+            // and the only thing standing between a vertical-monitor user and
+            // square corners on the fallback one.
         }
     }
 

@@ -821,12 +821,22 @@ names yourself, and don't write to `fragColor` expecting them to be absent.
 >
 > Rounding and dim are cheap to redo. Blur, colour management, discard and motion blur
 > are not — and chasing each new one as Hyprland gains it is a losing game for a plugin
-> that has to work against everyone's config. So when an element needs any of those,
-> the plugin runs **every** shader stage offscreen and hands the finished texture back
-> to Hyprland to draw with its own program, which applies all of them natively and
-> exactly once. It costs one extra offscreen pass, so it is only taken when the element
-> actually needs it; a window with no blur, no discard, no motion blur and no colour
-> conversion keeps the cheaper path.
+> that has to work against everyone's config rather than one machine's.
+>
+> So the plugin runs **every** shader stage offscreen and hands the finished texture
+> back to Hyprland, which draws it with its own program. Every effect then applies
+> natively and exactly once, whatever the user has enabled — including effects added to
+> Hyprland after this was written. This holds for layer surfaces as much as windows.
+>
+> It is unconditional rather than gated on detecting which effects are in play: a list
+> of known flags silently drops the next effect that isn't on it, which is the failure
+> this exists to end. The cost is one offscreen pass per shaded element per frame.
+>
+> The wrapper's `plugin_alpha` / `plugin_round` / `plugin_dim` multiplies are dead code
+> on that path — the values are 1.0 / 0 and do nothing. They exist for the fallback:
+> `runIntermediateStages` declines a rotated monitor or a rotated source buffer rather
+> than getting them subtly wrong, and there the shader *is* the on-screen draw. Without
+> them a vertical-monitor user would get square corners and no dim.
 
 ---
 
