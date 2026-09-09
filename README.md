@@ -274,9 +274,8 @@ video player or a game being fullscreen in the first place.
 The two fullscreen *transitions* are the only way anything plays, and both are
 opt-in by naming a tag: [`+shader_fullscreen_enter:`](#fullscreen-and-float-toggles)
 and `+shader_fullscreen_exit:`. Neither falls back to the generic move/resize
-shader when unset — a window still reads as fullscreen for every frame its exit
-animates over, so a generic shader there is a shader running on a fullscreen
-window, which is the thing being ruled out.
+shader when unset; each suppresses it outright, so going fullscreen and coming
+back are both silent unless you asked for something.
 
 Two ways to opt in:
 
@@ -670,10 +669,12 @@ fullscreen is usually a game or a video, which is the least welcome place for an
 effect. This is the same reasoning that makes `+shader_fullscreen:` opt-in for the
 steady state.
 
-**Leaving fullscreen is silent by default too**, for the same reason and in the
-same way: the window still reports itself as fullscreen while the exit animates,
-so the generic move/resize shader is suppressed rather than played. Set
-`+shader_fullscreen_exit:` to give that transition a look.
+**Leaving fullscreen is silent by default too**, in exactly the same way: with no
+`+shader_fullscreen_exit:` set, the generic move/resize shader is suppressed
+rather than played. Note this is done explicitly rather than by testing whether
+the window is fullscreen — Hyprland's fullscreen event fires *after* the flip, so
+by the time the transition is recognised the window already reports itself as not
+fullscreen. Set `+shader_fullscreen_exit:` to give that transition a look.
 
 Float and tile both animate by default and fall through to the generic shader when no
 specific tag is set.

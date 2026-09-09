@@ -58,25 +58,32 @@ static const std::string* resolveShaderPath(const PHLWINDOW& pWindow, const PHLL
     if (pWindow) {
         Desktop::View::CWindow* rawWin = pWindow.get();
 
+        // Fullscreen drops everything unless the window opted in, checked before
+        // anything else so `+shader_replace:1` cannot become a way around the
+        // policy the stacking path enforces. The manual-toggle lookup below used
+        // to come first and unconditionally, which let a toggled shader render
+        // over a fullscreen window even when `+shader_fullscreen:` named a
+        // different one.
+        if (Fullscreen::controller()->isFullscreen(pWindow)) {
+            auto it = g_mWindowRuleShaders.find(rawWin);
+            if (it == g_mWindowRuleShaders.end())  return nullptr;
+            if (!it->second.fullscreen.empty())    return &it->second.fullscreen;
+            if (!it->second.fullscreenStack)       return nullptr;
+            // `+shader_fullscreen_stack:1` — fall through and resolve normally.
+        }
+
         if (auto it = g_mWindowManualShaders.find(rawWin); it != g_mWindowManualShaders.end())
             return &it->second;
 
-        if (Fullscreen::controller()->isFullscreen(pWindow)) {
-            auto it = g_mWindowRuleShaders.find(rawWin);
-            if (it != g_mWindowRuleShaders.end() && !it->second.fullscreen.empty())
-                return &it->second.fullscreen;
-        } else {
-            auto it = g_mWindowRuleShaders.find(rawWin);
-            if (it != g_mWindowRuleShaders.end()) {
-                const auto& state      = it->second;
-                const bool  isActive   = Desktop::focusState()->isWindowActive(pWindow);
-                const bool  isFloating = rawWin->m_isFloating;
-                if      (isFloating  && !state.floating.empty())  return &state.floating;
-                else if (!isFloating && !state.tiled.empty())     return &state.tiled;
-                else if (isActive    && !state.active.empty())    return &state.active;
-                else if (!isActive   && !state.inactive.empty())  return &state.inactive;
-                else if (!state.fallback.empty())                 return &state.fallback;
-            }
+        if (auto it = g_mWindowRuleShaders.find(rawWin); it != g_mWindowRuleShaders.end()) {
+            const auto& state      = it->second;
+            const bool  isActive   = Desktop::focusState()->isWindowActive(pWindow);
+            const bool  isFloating = rawWin->m_isFloating;
+            if      (isFloating  && !state.floating.empty())  return &state.floating;
+            else if (!isFloating && !state.tiled.empty())     return &state.tiled;
+            else if (isActive    && !state.active.empty())    return &state.active;
+            else if (!isActive   && !state.inactive.empty())  return &state.inactive;
+            else if (!state.fallback.empty())                 return &state.fallback;
         }
 
         const auto& initClass    = rawWin->m_initialClass;
@@ -727,7 +734,14 @@ static const std::string* resolveTransformAnim(const PHLWINDOW& pWindow) {
             else                            suppressGeneric = true;
             break;
         case FLAVOUR_FULLSCREEN_EXIT:
+            // Mirrors ENTER: silent unless explicitly asked for, and it has to
+            // suppress the generic move/resize shader rather than relying on a
+            // fullscreen check. The window.fullscreen event fires AFTER the flip
+            // (see main.cpp), so by the time this flavour is latched the window
+            // already reports itself as NOT fullscreen — an isFullscreen() test
+            // here would be false for the whole exit and suppress nothing.
             if (!state.fsExitAnim.empty()) { path = &state.fsExitAnim; ruleSettle = state.fsExitSettle; }
+            else                           suppressGeneric = true;
             break;
         case FLAVOUR_FLOAT:
             if (!state.floatAnim.empty())  { path = &state.floatAnim;  ruleSettle = state.floatSettle; }
@@ -745,10 +759,10 @@ static const std::string* resolveTransformAnim(const PHLWINDOW& pWindow) {
     // explicit `+shader_fullscreen_enter:` / `+shader_fullscreen_exit:` still
     // plays — this only suppresses the generic shader standing in for one.
     //
-    // Leaving fullscreen is included, not exempt: the window still reads as
-    // fullscreen for every frame the exit animates over, so a generic move or
-    // resize shader here is a shader running on a fullscreen window, which is
-    // the thing being ruled out.
+    // This covers a window that is fullscreen and moving for some other reason —
+    // a workspace switch, say. The two fullscreen transitions do not rely on it:
+    // ENTER and EXIT both set suppressGeneric above, because the fullscreen flag
+    // has already flipped by the time either flavour is latched.
     if (!path && fullscreenSuppresses(pWindow)) return nullptr;
 
     if (!path && wantWs && !state.workspaceAnim.empty()) {
@@ -1783,9 +1797,16 @@ void applyShaderRulesSafe(PHLWINDOW pWindow) {
         // than being kept alive with an empty state.
         else if (!isDefault && key == "shader_replace")
             state.replaceMode = (val != "0" && val != "false" && val != "no" && val != "off");
-        // Same shape, and the same reason for having no `_default` form.
-        else if (!isDefault && key == "shader_fullscreen_stack")
+        // Same reason for having no `_default` form, but unlike shader_replace
+        // this one DOES mark the window as ruled. It is the only way to opt a
+        // class shader or an imperative toggle into rendering while fullscreen,
+        // and both of those are set by dispatcher rather than by tag — so a
+        // window whose only shading comes from one of them would otherwise be
+        // erased from the map, and the opt-in would have nothing left to read.
+        else if (!isDefault && key == "shader_fullscreen_stack") {
             state.fullscreenStack = (val != "0" && val != "false" && val != "no" && val != "off");
+            if (state.fullscreenStack) hasRules = true;
+        }
     }
 
     // Promote each fallback the window didn't override. A promoted default is a
