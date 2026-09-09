@@ -156,7 +156,7 @@ Apply a shader to a window with a `tag` on a window rule. Ten tags are supported
 | `+shader_replace:1` | Opts this window out of [stacking](#stacking) |
 | `+shader_fullscreen_stack:1` | Keeps this window's shaders while it is [fullscreen](#fullscreen) |
 
-Any of the eight shader tags also accepts a `_default` suffix
+Any shader tag that names a shader also accepts a `_default` suffix
 (`+shader_close_default:`) marking it as a [fallback](#fallback-rules) that yields
 to a rule setting the same tag without the suffix.
 
@@ -270,7 +270,7 @@ alphabetically sorted set, so a catch-all rule and a per-app rule that both set
 `+shader_close:` resolve by whichever shader *path* sorts later. Renaming a file
 can flip which one wins.
 
-Append `_default` to any of the eight shader tags to mark it as a fallback. A
+Append `_default` to any shader tag to mark it as a fallback. A
 fallback applies only when the same tag without the suffix is absent from that
 window, whatever the paths happen to be called:
 
