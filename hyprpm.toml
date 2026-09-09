@@ -12,9 +12,17 @@ name = "HyprWindowShade"
 authors = ["ManofJELLO"]
 
 # commit_pins maps a Hyprland commit to the commit of THIS repo known to build
-# against it, as ["<hyprland commit>", "<plugin commit>"]. hyprpm uses it to
-# check out a working revision instead of whatever HEAD happens to be, which is
-# what makes `hyprpm update` safe across Hyprland releases.
+# against it, as ["<hyprland commit>", "<plugin commit>"].
+#
+# Measured, not assumed: on the CURRENT Hyprland, `hyprpm update` checks out the
+# tip of the default branch, not the pinned commit. A pin is the fallback for
+# someone running an OLDER Hyprland — it hands them the revision that worked
+# with their version instead of a HEAD that needs newer headers. Which is why
+# upstream's manifest carries one entry per Hyprland release going back years.
+#
+# So: add one entry per Hyprland release once the plugin is confirmed to build
+# against it. There is no need to bump a pin for every commit — that does
+# nothing for anyone on the current release.
 #
 # Each entry pins a plugin commit KNOWN TO BUILD against a given Hyprland
 # commit, so `hyprpm update` checks out a working revision instead of whatever

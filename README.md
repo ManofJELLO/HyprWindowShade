@@ -21,6 +21,7 @@ Configuration is shown in Hyprland's Lua config format (`hyprland.lua`). The old
 - [How close animations work](#how-close-animations-work)
 - [Troubleshooting](#troubleshooting)
 - [Legacy: hyprland.conf](#legacy-hyprlandconf)
+- [Development](#development)
 - [Extending the plugin](#extending-the-plugin)
 
 ---
@@ -966,6 +967,48 @@ bind = $mainMod SHIFT, B, layershader, mpvpaper clear
 exec-once = hyprctl dispatch layeropenanim  rofi /path/to/open.glsl
 exec-once = hyprctl dispatch layercloseanim rofi /path/to/close.glsl
 ```
+
+---
+
+## Development
+
+**`main` is the release channel.** hyprpm tracks a repository's default branch, so
+anything pushed to `main` reaches every user on their next `hyprpm update` — it does
+not wait for a tag or a GitHub release, and it does not consult `commit_pins` on the
+current Hyprland version. A half-finished commit on `main` ships.
+
+So work on `dev` and merge when it is verified:
+
+```sh
+git switch dev
+# ... change, build, test ...
+git switch main && git merge --ff-only dev && git push
+```
+
+Testers can install straight from the branch, since `hyprpm add` takes an optional
+revision:
+
+```sh
+hyprpm add https://github.com/ManofJELLO/HyprWindowShade dev
+```
+
+### Building against a live session
+
+`./build.sh` compiles, verifies, installs and hot-loads into the running compositor.
+It is a *session-only* install: hyprpm's cached build is what loads at your next
+login, and `build.sh` warns when the two differ.
+
+`./build.sh --build-only` compiles and runs every check without unloading, installing
+or loading anything. Prefer it while changing render-path code — a misbehaving plugin
+takes the whole compositor with it, and there is no fallback if Hyprland is your only
+session.
+
+### Adding a Hyprland release
+
+When a new Hyprland lands and the plugin builds against it, add a `commit_pins` entry
+mapping that Hyprland commit to a plugin commit known to work with it. That is what
+lets someone on an older Hyprland still get a revision that compiles. Pins are not
+needed for the current release — HEAD already wins there.
 
 ---
 
