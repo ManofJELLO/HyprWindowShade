@@ -457,7 +457,10 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "layercloseanim",     &luaLayerCloseAnim);
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "reloadshaders",      &luaReloadShaders);
 
-    return {"HyprWindowShade", "Native CShader Injection (v0.56)", "ManofJELLO", "1.7"};
+    // Version is deliberately empty: releases are GitHub tags, and hyprpm ships
+    // whatever commit `commit_pins` names. A number maintained here would be a
+    // second source of truth that silently drifts from both.
+    return {"HyprWindowShade", "Native CShader Injection (v0.56)", "ManofJELLO", ""};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {

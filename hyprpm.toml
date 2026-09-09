@@ -14,18 +14,21 @@ authors = ["ManofJELLO"]
 # commit_pins maps a Hyprland commit to a commit of THIS repo known to build
 # against it, as ["<hyprland commit>", "<plugin commit>"].
 #
-# Measured, not assumed: on the CURRENT Hyprland, `hyprpm update` checks out the
-# tip of the default branch and ignores these entirely. A pin is the fallback
-# for someone on an OLDER Hyprland — it hands them a revision matching their
-# headers instead of a HEAD that needs newer ones. That is why upstream's
-# manifest carries one entry per Hyprland release rather than one per commit.
+# A MATCHING PIN ALWAYS WINS, including on the Hyprland everyone is currently
+# running. Per the Hyprland wiki: "if someone is running 0.33.1, hyprpm will
+# reset your plugin to commit hash <...>", and "if no pin matches, latest git
+# will be used" — latest git is the fallback for an unpinned Hyprland, never an
+# override of a pin that matched. The wiki also recommends "a pin for each
+# Hyprland release", so the entry for the current release is the normal case,
+# not a special one.
 #
-# So an entry is inert until main moves on to a newer Hyprland. The moment to
-# set one is at that transition: pin the outgoing Hyprland release to the last
-# commit verified against it, then leave it alone. There is nothing to gain from
-# bumping a pin per commit.
+# Practical consequence: THIS IS THE RELEASE SWITCH. Pushing to main does not
+# ship anything to anyone whose Hyprland is pinned here — hyprpm reads this
+# manifest from the default branch, then resets to the commit named below and
+# builds that. Bump the pin when you want a release to reach users, and expect
+# the bump itself to land one commit behind whatever it points at.
 commit_pins = [
-    ["efb50993780079460b0cbed1363e2166a2de1d9f", "d08a1125cf0ae5e852a4351c02e79ee9da6b8eff"], # 0.56.2 — last verified against this release
+    ["efb50993780079460b0cbed1363e2166a2de1d9f", "848904272b0011678e37f636bfd1c003c0d621ef"], # 0.56.2
 ]
 
 [HyprWindowShade]

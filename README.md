@@ -1035,12 +1035,14 @@ exec-once = hyprctl dispatch layercloseanim rofi /path/to/close.glsl
 
 ## Development
 
-**`main` is the release channel.** hyprpm tracks a repository's default branch, so
-anything pushed to `main` reaches every user on their next `hyprpm update` — it does
-not wait for a tag or a GitHub release, and it does not consult `commit_pins` on the
-current Hyprland version. A half-finished commit on `main` ships.
+**`commit_pins` is the release switch, not `main`.** hyprpm reads
+[`hyprpm.toml`](#adding-a-hyprland-release) from the default branch, and if a pin
+matches the user's Hyprland it resets the plugin to that commit and builds it. So
+pushing to `main` ships nothing to a user whose Hyprland is pinned — a release
+happens when you bump the pin.
 
-So work on `dev` and merge when it is verified:
+Do still treat `main` as publishable: it is what an unpinned Hyprland builds from, and
+what the pin is read out of. So work on `dev` and merge when it is verified:
 
 ```sh
 git switch dev
@@ -1070,8 +1072,22 @@ session.
 
 When a new Hyprland lands and the plugin builds against it, add a `commit_pins` entry
 mapping that Hyprland commit to a plugin commit known to work with it. That is what
-lets someone on an older Hyprland still get a revision that compiles. Pins are not
-needed for the current release — HEAD already wins there.
+lets someone on an older Hyprland still get a revision that compiles.
+
+**Keep a pin for the current release too, and bump it to ship.** The Hyprland wiki
+recommends "a pin for each Hyprland release", and a matching pin always wins — "if no
+pin matches, latest git will be used", so latest git is the fallback for an *unpinned*
+Hyprland rather than an override of a pin that matched. Leaving a stale pin on the
+release everyone runs silently holds them all at that commit no matter what lands on
+`main`.
+
+One wrinkle to expect: the commit that bumps a pin cannot name itself, so the pin
+points at its parent and the bump lands one commit behind what it ships. Either accept
+the lag or follow it with a second bump.
+
+Versioning is GitHub tags — there is no version number maintained in the source, and
+`PLUGIN_DESCRIPTION_INFO` deliberately reports an empty one, so nothing can drift out
+of sync with the tags or the pin.
 
 ---
 
