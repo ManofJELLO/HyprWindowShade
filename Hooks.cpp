@@ -841,8 +841,11 @@ static SP<Render::ITexture> runIntermediateStages(CompiledShader* const* stages,
     if (count <= 0 || !src || !Render::GL::g_pHyprOpenGL || !g_pHyprRenderer) return nullptr;
 
     // A rotated or flipped source buffer would need the targets' dimensions
-    // swapped and the transform reapplied on the way back out. Rare enough that
-    // dropping to single-stage shading beats getting it subtly wrong.
+    // swapped and the transform reapplied on the way back out. Declining beats
+    // getting it subtly wrong — and measured on a rotated monitor, the fallback
+    // that this drops into renders correctly: right geometry, right orientation,
+    // rounding and dim intact. It loses only the effects Hyprland's own program
+    // would have added. See the note on the monitor transform below.
     if (src->m_transform != HYPRUTILS_TRANSFORM_NORMAL) return nullptr;
 
     // Snapped to whole pixels up front and used everywhere below. A framebuffer
@@ -880,8 +883,17 @@ static SP<Render::ITexture> runIntermediateStages(CompiledShader* const* stages,
     auto& R = g_pHyprRenderer->m_renderData;
 
     // Coordinate space of the projection currently in force. A rotated monitor
-    // would need the box transformed to match; bail to single-stage instead of
-    // guessing, the same way a rotated source buffer does above.
+    // needs the box transformed to match, and this does not do it — the blit
+    // below assumes the projection does not rotate, which holds only at
+    // transform 0.
+    //
+    // This is not a gap in Hyprland: it separates m_pixelSize (the physical
+    // panel, e.g. 2560x1080) from m_transformedSize (the logical space windows
+    // live in, 1080x2560 at 90 degrees) and carries the rotation in the monitor
+    // projection, which is exactly right and hands us everything needed. The
+    // work simply is not done here. Verified by rotating a real monitor: the
+    // fallback path renders correctly, so a rotated setup loses Hyprland's
+    // blur/CM/discard/motion-blur on shaded surfaces but nothing else.
     // Monitors carry a wl_output_transform, textures a Hyprutils eTransform.
     // The two NORMAL constants are both 0, so mixing them up still behaves —
     // it just isn't the same enum, and -Wenum-compare is right to say so.
