@@ -300,6 +300,9 @@ struct MotionRecord {
     // what it was at the instant motion ended, so a shader can write its own
     // spring: releaseVelocity * exp(-k*settle) * sin(w*settle).
     bool     settling     = false;
+    // Settle length, resolved once when the tail begins. Recomputing it per
+    // draw meant a stat() per surface per frame for the whole settle.
+    float    settleTail   = -1.0f;
     std::chrono::steady_clock::time_point motionEnd{};
     Vector2D releaseVelocity;
 
@@ -388,6 +391,10 @@ struct CompiledShader {
     // for would keep a live window redrawing every frame for no reason.
     float     settleDuration  = 0.0f;
     time_t    sourceMtime     = 0; // mtime at compile time; lets us auto-evict on edit
+    // When the mtime was last checked. The check is a stat() syscall and this
+    // struct is looked up per stage per textured surface per frame, so it is
+    // throttled rather than run every time. See getOrCompileShader.
+    std::chrono::steady_clock::time_point lastStatAt{};
 };
 
 // Reserved key: a layer entry stored under this namespace applies to any layer

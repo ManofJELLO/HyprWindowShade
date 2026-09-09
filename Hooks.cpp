@@ -430,22 +430,33 @@ void updateMotionRecords() {
 
         auto&      posAnim  = w->positionAnimation();
         auto&      sizeAnim = w->sizeAnimation();
-        const auto ws       = w->m_workspace;
+        // Reference, not a copy: PHLWORKSPACE is a shared pointer, and copying
+        // it for every window on every frame is pure atomic refcount traffic.
+        const auto& ws      = w->m_workspace;
         const bool moving   = posAnim  && posAnim->isBeingAnimated();
         const bool resizing = sizeAnim && sizeAnim->isBeingAnimated();
         const bool wsMoving = ws && ws->m_renderOffset && ws->m_renderOffset->isBeingAnimated();
 
+        // Hyprland warps a drag, so none of the three flags above are set while
+        // one is in progress — the drag has to be part of the liveness test in
+        // its own right. Without it a window with no existing record was
+        // skipped here and its `dragging` flag never assigned, so a cold drag
+        // on a window that had not moved recently did nothing at all. Every
+        // drag that appeared to work did so only because a float toggle or an
+        // earlier move had left a record alive.
+        const bool isDragged = (raw == draggedRaw);
+
         auto it = g_mWindowMotion.find(raw);
 
-        // Fast path: on any given frame nearly every window is neither moving
-        // nor settling. Two bool reads and a miss, then out.
-        if (!moving && !resizing && !wsMoving && it == g_mWindowMotion.end()) continue;
+        // Fast path: on any given frame nearly every window is idle. A few bool
+        // reads and a miss, then out.
+        if (!moving && !resizing && !wsMoving && !isDragged && it == g_mWindowMotion.end()) continue;
 
         if (it == g_mWindowMotion.end())
             it = g_mWindowMotion.emplace(raw, MotionRecord{}).first;
 
         MotionRecord&  rec  = it->second;
-        rec.dragging        = (raw == draggedRaw);
+        rec.dragging        = isDragged;
 
         // A window's on-screen position is its own position PLUS its
         // workspace's render offset — during a switch the window does not move
@@ -510,7 +521,22 @@ void updateMotionRecords() {
         if (inMotion) {
             // A new gesture starts its own peak; carrying the previous one over
             // would let a fast move leave a loud settle on the slow one after it.
-            if (!wasInMotion) { rec.peakVelocity = Vector2D(0, 0); rec.peakSizeVelocity = Vector2D(0, 0); }
+            if (!wasInMotion) {
+                rec.peakVelocity     = Vector2D(0, 0);
+                rec.peakSizeVelocity = Vector2D(0, 0);
+                rec.settleTail       = -1.0f;
+
+                // A flavour belongs to the motion its toggle caused, and was
+                // only ever cleared by the record being dropped. A record
+                // survives its settle, so a plain move started during that
+                // settle inherited the previous toggle's flavour — replaying a
+                // fullscreen-exit shader for an ordinary move, or worse, being
+                // silently suppressed by a stale fullscreen-ENTER. If nothing
+                // latched a flavour for THIS gesture, it is an ordinary one.
+                const float sinceLatch =
+                    std::chrono::duration_cast<std::chrono::duration<float>>(now - rec.flavourAt).count();
+                if (sinceLatch > FLAVOUR_GRACE) rec.flavour = FLAVOUR_NONE;
+            }
             if (rec.velocity.distanceSq(Vector2D(0, 0)) > rec.peakVelocity.distanceSq(Vector2D(0, 0)))
                 rec.peakVelocity = rec.velocity;
             if (rec.sizeVelocity.distanceSq(Vector2D(0, 0)) > rec.peakSizeVelocity.distanceSq(Vector2D(0, 0)))
@@ -624,7 +650,7 @@ static const std::string* resolveTransformAnim(const PHLWINDOW& pWindow) {
 
     auto mIt = g_mWindowMotion.find(pWindow.get());
     if (mIt == g_mWindowMotion.end()) return nullptr;
-    const MotionRecord& rec = mIt->second;
+    MotionRecord& rec = mIt->second;
 
     auto rIt = g_mWindowRuleShaders.find(pWindow.get());
     if (rIt == g_mWindowRuleShaders.end()) return nullptr;
@@ -701,11 +727,21 @@ static const std::string* resolveTransformAnim(const PHLWINDOW& pWindow) {
 
     // Settle length precedence matches the rest of the plugin: an explicit
     // `@<sec>` on the rule wins, then the shader's own `// @settle`, then none.
-    float tail = ruleSettle;
-    if (tail < 0.0f) {
-        const CompiledShader* cs = getOrCompileShader(*path);
-        tail                     = cs ? cs->settleDuration : 0.0f;
+    //
+    // Resolved once per settle and cached. getOrCompileShader() stat()s the
+    // file to check for edits, and this runs per textured surface per frame —
+    // so without the cache a one-second settle on a window with a few
+    // subsurfaces was hundreds of syscalls for a value that cannot change
+    // mid-settle.
+    if (rec.settleTail < 0.0f) {
+        float tail = ruleSettle;
+        if (tail < 0.0f) {
+            const CompiledShader* cs = getOrCompileShader(*path);
+            tail                     = cs ? cs->settleDuration : 0.0f;
+        }
+        rec.settleTail = std::max(tail, 0.0f);
     }
+    const float tail = rec.settleTail;
     if (tail <= 0.0f) return nullptr;
 
     const float since = secondsSince(rec.motionEnd);

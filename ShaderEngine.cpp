@@ -97,18 +97,38 @@ static std::string captureFragmentLog(const std::string& src) {
 
 // --- HELPER: SHADER COMPILATION (WITH AUTO-ALPHA INJECTION) ---
 // V0.55: No longer needs thisptr — we use global g_pHyprOpenGL directly.
+// How often a cached shader's mtime is actually re-checked. Hot-reload within a
+// quarter second is indistinguishable from instant when you are saving a file in
+// an editor, and it turns a per-frame syscall into a rare one.
+static constexpr auto STAT_INTERVAL = std::chrono::milliseconds(250);
+
 CompiledShader* getOrCompileShader(const std::string& shaderPath) {
-    const time_t currentMtime = fileMtime(shaderPath);
+    const auto now = std::chrono::steady_clock::now();
 
     // Success cache. If mtime matches we serve the cached entry; otherwise the
     // file was edited and we drop it so the recompile path below runs. mtime==0
     // (stat failed) is treated as "unchanged" — we keep serving cached shader
     // rather than evicting on a transient stat error.
+    //
+    // The mtime check is what makes editing a .glsl take effect on the next
+    // frame, but it is a stat() and this function runs per stage per textured
+    // surface per frame — a shaded window with a few subsurfaces was issuing
+    // hundreds of them a second purely to notice an edit that had not happened.
+    // Throttled to STAT_INTERVAL, which removes essentially all of them without
+    // making a save feel any less immediate.
     if (auto it = g_mCompiledCShaders.find(shaderPath); it != g_mCompiledCShaders.end()) {
-        if (currentMtime == 0 || it->second.sourceMtime == currentMtime)
+        if (now - it->second.lastStatAt < STAT_INTERVAL)
+            return &it->second;
+        it->second.lastStatAt = now;
+
+        const time_t mtimeNow = fileMtime(shaderPath);
+        if (mtimeNow == 0 || it->second.sourceMtime == mtimeNow)
             return &it->second;
         g_mCompiledCShaders.erase(it);
     }
+
+    // Reached only on a cache miss or an actual edit, so the stat here is rare.
+    const time_t currentMtime = fileMtime(shaderPath);
 
     // Failure cache. If the same path failed with the same mtime, the source
     // hasn't changed, so retrying would just fail identically — return nullptr
@@ -288,6 +308,7 @@ CompiledShader* getOrCompileShader(const std::string& shaderPath) {
     // like "lifetime" or "uniform_time_offset".
     entry.usesTime    = (entry.timeLoc >= 0);
     entry.sourceMtime = currentMtime;
+    entry.lastStatAt  = now;
 
     auto [insertedIt, _] = g_mCompiledCShaders.emplace(shaderPath, std::move(entry));
     return &insertedIt->second;
