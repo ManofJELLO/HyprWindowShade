@@ -811,8 +811,15 @@ Declare any of these in your fragment shader and the plugin will populate them e
 
 Names beginning with `plugin_` are reserved by the wrapper. Besides `plugin_alpha` it
 injects `plugin_box_size`, `plugin_round` and `plugin_round_power` to re-apply corner
-rounding — don't declare those names yourself, and don't write to `fragColor` expecting
-them to be absent.
+rounding, and `plugin_dim` to re-apply `decoration:dim_inactive` — don't declare those
+names yourself, and don't write to `fragColor` expecting them to be absent.
+
+> **Why the wrapper re-applies these.** Replacing Hyprland's fragment program means
+> losing everything that program did. Corner rounding and `dim_inactive` both live
+> inside it (`surface.frag.inc` does `pixColor.rgb *= tint`), so without the wrapper
+> putting them back, a shaded window comes out square-cornered and undimmed. If you add
+> a shader and a window stops respecting some other decoration setting, this is the
+> first place to look.
 
 ---
 

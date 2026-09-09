@@ -168,8 +168,13 @@ CompiledShader* getOrCompileShader(const std::string& shaderPath) {
             uniform vec2  plugin_box_size;
             uniform float plugin_round;
             uniform float plugin_round_power;
+            uniform float plugin_dim;
             void main() {
                 user_main();
+                // Hyprland's dim_inactive is a tint multiply inside the
+                // fragment program we replaced, so re-apply it here or a shaded
+                // window is undimmed for exactly as long as the shader is bound.
+                fragColor.rgb *= plugin_dim;
                 // Normalise to premultiplied alpha. Surface colours are
                 // premultiplied, and the compositor blends with
                 // `src.rgb + dst * (1 - src.a)`, so a fragment carrying more
@@ -201,8 +206,11 @@ CompiledShader* getOrCompileShader(const std::string& shaderPath) {
         )";
         } else {
             shaderCode += R"(
+            uniform float plugin_dim;
             void main() {
                 user_main();
+                // Same dim re-application as the rounded variant above.
+                fragColor.rgb *= plugin_dim;
                 // Normalise to premultiplied alpha. Surface colours are
                 // premultiplied, and the compositor blends with
                 // `src.rgb + dst * (1 - src.a)`, so a fragment carrying more
@@ -256,6 +264,7 @@ CompiledShader* getOrCompileShader(const std::string& shaderPath) {
     entry.boxSizeLoc      = glGetUniformLocation(prog, "plugin_box_size");
     entry.roundLoc        = glGetUniformLocation(prog, "plugin_round");
     entry.roundPowerLoc   = glGetUniformLocation(prog, "plugin_round_power");
+    entry.dimLoc          = glGetUniformLocation(prog, "plugin_dim");
     entry.moveDeltaLoc     = glGetUniformLocation(prog, "move_delta");
     entry.moveRemainingLoc = glGetUniformLocation(prog, "move_remaining");
     entry.velocityLoc      = glGetUniformLocation(prog, "velocity");

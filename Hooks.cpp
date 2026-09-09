@@ -1238,6 +1238,15 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
         }
         if (activeEntry->roundPowerLoc >= 0)
             glUniform1f(activeEntry->roundPowerLoc, g_pCurrentRoundPower);
+        if (activeEntry->dimLoc >= 0) {
+            // Offscreen stages stay undimmed for the same reason they stay
+            // fully opaque: the dim belongs to the finished result reaching the
+            // screen, and folding it into every layer would compound it.
+            float tint = 1.0f;
+            if (!g_bIntermediatePass && contextWindow && contextWindow->m_dimPercent)
+                tint = 1.0f - contextWindow->m_dimPercent->value();
+            glUniform1f(activeEntry->dimLoc, std::clamp(tint, 0.0f, 1.0f));
+        }
         // --- TRANSFORM UNIFORMS ---
         // Zeroed rather than skipped when the window has no motion record, so a
         // shader reading `velocity` on a stationary window sees a still window

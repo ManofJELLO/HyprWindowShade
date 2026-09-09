@@ -373,6 +373,11 @@ struct CompiledShader {
     GLint     boxSizeLoc      = -1; // vec2: size in px of the box being drawn
     GLint     roundLoc        = -1; // float: corner radius in px, 0 = no rounding
     GLint     roundPowerLoc   = -1; // float: superellipse exponent
+    // Hyprland applies dim_inactive as a `tint` multiply inside the fragment
+    // program this shader replaces (surface.frag.inc: `pixColor.rgb *= tint`),
+    // so a shaded window loses its dim entirely — the same way it lost its
+    // corner rounding before the wrapper started re-applying that.
+    GLint     dimLoc          = -1; // float: tint multiplier, 1.0 = no dim
     bool      usesTime        = false;
     // Seconds the one-shot animation should run for, declared in the shader as
     // `// @duration 0.35`. <0 means the shader didn't say.
