@@ -157,6 +157,9 @@ inline constexpr int MAX_SHADER_STAGES = 5; // base + geometry + focus + fullscr
 // destructor would run.
 struct StageFramebuffers {
     Render::GL::CGLFramebuffer fb[2];
+    // When this bucket was last drawn into. Buckets are evicted by age rather
+    // than by dropping the whole pool — see the note in runIntermediateStages.
+    std::chrono::steady_clock::time_point lastUsed{};
 };
 extern std::unordered_map<uint64_t, StageFramebuffers>* g_pStageFBs;
 

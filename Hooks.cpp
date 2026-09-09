@@ -303,6 +303,13 @@ static constexpr float DRAG_VELOCITY_TAU = 0.045f;
 // enough that a toggle which animates nothing does not leave a stale record.
 static constexpr float FLAVOUR_GRACE = 0.25f;
 
+// How long an unused offscreen bucket is kept before its framebuffers are
+// released, and the hard ceiling on how many are held at once. The TTL is what
+// actually bounds the pool; the ceiling only matters if something pathological
+// outruns it.
+static constexpr float  STAGE_FB_TTL = 2.0f;
+static constexpr size_t STAGE_FB_MAX = 32;
+
 // How long one run of an animated variable lasts, in seconds.
 static float animVarDuration(const CAnimatedVariable<Vector2D>* av) {
     // A spring has no duration — it runs until it settles — so there is no
@@ -395,6 +402,12 @@ static const std::string* resolveOneShotAnim(const PHLWINDOW& pWindow, bool urge
 // cause starts on this frame or the next.
 void latchTransformFlavour(Desktop::View::CWindow* raw, uint8_t flavour) {
     if (!raw) return;
+    // Only windows carrying rules can act on a flavour — resolveTransformAnim
+    // returns immediately without a rule entry — so do not mint a motion record
+    // for every fullscreen or float toggle on the desktop just to prune it again
+    // moments later.
+    if (g_mWindowRuleShaders.find(raw) == g_mWindowRuleShaders.end()) return;
+
     auto& rec     = g_mWindowMotion[raw];
     rec.flavour   = flavour;
     rec.flavourAt = std::chrono::steady_clock::now();
@@ -859,14 +872,37 @@ static SP<Render::ITexture> runIntermediateStages(CompiledShader* const* stages,
 
     if (!g_pStageFBs) g_pStageFBs = new std::unordered_map<uint64_t, StageFramebuffers>();
 
-    // One entry per distinct on-screen window size, so this stays small on its
-    // own. The clear is a backstop for pathological cases (a window being
-    // resized continuously allocates a bucket per intermediate size); dropping
-    // the pool costs one reallocation on the next frame and nothing else.
-    if (g_pStageFBs->size() > 8) g_pStageFBs->clear();
+    // One entry per distinct source size. Evicted by age, not by dropping the
+    // whole pool.
+    //
+    // The pool used to be cleared outright once it passed a handful of entries,
+    // which was harmless while this path ran only for multi-stage stacks —
+    // rare, so the pool was nearly always tiny. Now that every shaded surface
+    // renders offscreen, a pool of live buckets is the normal case, and
+    // clearing it destroys framebuffers that are in use on every frame. The bad
+    // case is resizing a shaded window: a new size arrives each frame, the cap
+    // is reached continuously, and the pool is torn down and rebuilt while the
+    // buckets it is dropping are the ones being drawn into.
+    //
+    // Age-based eviction keeps the transient sizes from a resize from
+    // accumulating, without ever touching a bucket that is still being used.
+    const auto poolNow = std::chrono::steady_clock::now();
+    for (auto it = g_pStageFBs->begin(); it != g_pStageFBs->end();) {
+        const float idle = std::chrono::duration_cast<std::chrono::duration<float>>(poolNow - it->second.lastUsed).count();
+        it = (idle > STAGE_FB_TTL) ? g_pStageFBs->erase(it) : std::next(it);
+    }
+    // Backstop for a pathological frame that somehow outruns the TTL. Drops the
+    // single oldest bucket rather than all of them.
+    while (g_pStageFBs->size() > STAGE_FB_MAX) {
+        auto oldest = g_pStageFBs->begin();
+        for (auto it = std::next(oldest); it != g_pStageFBs->end(); ++it)
+            if (it->second.lastUsed < oldest->second.lastUsed) oldest = it;
+        g_pStageFBs->erase(oldest);
+    }
 
     const uint64_t key = ((uint64_t)(uint32_t)w << 32) | (uint32_t)h;
     auto&          fbs = (*g_pStageFBs)[key];
+    fbs.lastUsed       = poolNow;
 
     for (auto& fb : fbs.fb) {
         if (!fb.isAllocated() || fb.m_size != size) {
