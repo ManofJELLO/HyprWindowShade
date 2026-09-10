@@ -849,7 +849,7 @@ Declare any of these in your fragment shader and the plugin will populate them e
 | `time` | `float` | seconds since plugin start (monotonic) |
 | `plugin_alpha` | `float` | `window->alphaTotal()` for the window being drawn |
 | `resolution` | `vec2` | active monitor pixel size |
-| `surface_size` | `vec2` | window size |
+| `surface_size` | `vec2` | window size; for a layer surface or a close animation's snapshot, that surface's box |
 | `mouse` | `vec2` | pointer position in compositor coords |
 | `is_active` | `float` | 1.0 if focused, else 0.0 |
 | `is_floating` | `float` | 1.0 if floating, else 0.0 |

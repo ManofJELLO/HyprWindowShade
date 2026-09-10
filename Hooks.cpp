@@ -22,6 +22,7 @@ const MotionRecord* g_pCurrentMotion         = nullptr;
 float               g_pCurrentSettle         = -1.0f;
 uint8_t             g_pCurrentOneShotKind    = TRANSFORM_NONE;
 Vector2D            g_pCurrentBoxSize;
+Vector2D            g_pCurrentElemSize;
 float               g_pCurrentRound          = 0.0f;
 float               g_pCurrentRoundPower     = 2.0f;
 
@@ -1201,6 +1202,7 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
         g_pCurrentRenderLayer.reset();
         g_pCurrentCompiledShader = nullptr;
         g_pCurrentMotion         = nullptr;
+        g_pCurrentElemSize       = Vector2D(0, 0);
         ((TGLDrawTex)g_pGLDrawTexHook->m_original)(thisptr, element, damage);
         return;
     }
@@ -1235,6 +1237,12 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
         g_pCurrentRound      = 0.0f;
         g_pCurrentRoundPower = 2.0f;
     }
+
+    // Kept apart from g_pCurrentBoxSize, which is deliberately gated on the
+    // surface being one that gets rounded. `surface_size` has to answer for a
+    // layer surface and for a close animation's snapshot as well, and neither
+    // has a window to ask.
+    g_pCurrentElemSize = elem ? elem->m_data.box.size() : Vector2D(0, 0);
 
     // --- BUILD THE STACK ---
     // A one-shot animation always sits on top of whatever the window normally
@@ -1398,6 +1406,7 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
     g_pCurrentSettle         = -1.0f;
     g_pCurrentOneShotKind    = TRANSFORM_NONE;
     g_pCurrentMotion         = nullptr;
+    g_pCurrentElemSize       = Vector2D(0, 0);
     g_pCurrentRound          = 0.0f;
 }
 
@@ -1447,6 +1456,13 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
                 if (const auto box = contextWindow->logicalBox())
                     sz = box->size();
             }
+            // A layer surface and a close animation's snapshot both arrive with
+            // no window, and used to leave this at (0,0). Any shader converting
+            // pixels to texels through it then divided by one instead, so a
+            // displacement meant to be a few pixels moved whole texture widths
+            // and every sample fell outside the surface.
+            if (sz.x <= 0.0 || sz.y <= 0.0)
+                sz = g_pCurrentElemSize;
             glUniform2f(activeEntry->surfaceSizeLoc, (float)sz.x, (float)sz.y);
         }
         if (activeEntry->mouseLoc >= 0 && Pointer::mgr()) {

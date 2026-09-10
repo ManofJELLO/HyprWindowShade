@@ -483,6 +483,10 @@ extern float               g_pCurrentSettle;
 // has no motion record to carry `anim_kind`, so it rides here instead.
 extern uint8_t             g_pCurrentOneShotKind;
 extern Vector2D            g_pCurrentBoxSize;
+// The pass element's box, set for every drawn surface rather than only the ones
+// that get rounded. This is what answers `surface_size` when there is no window
+// to ask — a layer surface, or a close animation's snapshot.
+extern Vector2D            g_pCurrentElemSize;
 extern float               g_pCurrentRound;
 extern float               g_pCurrentRoundPower;
 
