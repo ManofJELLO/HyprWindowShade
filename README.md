@@ -6,15 +6,18 @@ Configuration is shown in Hyprland's Lua config format (`hyprland.lua`). The old
 
 > This has not been stress-tested. It may break when Hyprland updates or simply not work on your system. Only tested on AMD graphics on Arch. Good luck, have fun, don't say I didn't warn ya.
 
-<video src="https://github.com/ManofJELLO/HyprWindowShade/raw/main/docs/demo.mp4" controls muted playsinline width="100%"></video>
+![HyprWindowShade demo](docs/demo.gif)
 
-[▶ Watch the demo](https://github.com/ManofJELLO/HyprWindowShade/raw/main/docs/demo.mp4) if the player above does not load.
-
-In order: a glitch shader on every unfocused window, [reading mode](#keybind-examples)
-toggled onto Chrome by class, [pixelate](#layer-shaders) toggled onto the `mpvpaper`
-wallpaper layer, rofi opening and closing with its own
+Four of the effects, in order: [reading mode](#keybind-examples) toggled onto Chrome by
+class, [pixelate](#layer-shaders) toggled onto the `mpvpaper` wallpaper layer, rofi
+opening and closing with its own
 [layer animations](#layer-surfaces-rofiwofi-notifications-bars), and a jelly
-[wobble](#move-and-resize-animations) as a terminal is moved and resized.
+[wobble](#move-and-resize-animations) as a terminal is moved and resized. The glitch on
+the unfocused windows runs throughout.
+
+The GIF is cut down and dithered to keep the page light. The full 31s reel at 1280p is
+[`docs/demo.mp4`](docs/demo.mp4) — GitHub will not play it inline, so that link
+downloads it.
 
 ---
 
