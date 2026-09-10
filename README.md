@@ -6,6 +6,16 @@ Configuration is shown in Hyprland's Lua config format (`hyprland.lua`). The old
 
 > This has not been stress-tested. It may break when Hyprland updates or simply not work on your system. Only tested on AMD graphics on Arch. Good luck, have fun, don't say I didn't warn ya.
 
+<video src="https://github.com/ManofJELLO/HyprWindowShade/raw/main/docs/demo.mp4" controls muted playsinline width="100%"></video>
+
+[▶ Watch the demo](https://github.com/ManofJELLO/HyprWindowShade/raw/main/docs/demo.mp4) if the player above does not load.
+
+In order: a glitch shader on every unfocused window, [reading mode](#keybind-examples)
+toggled onto Chrome by class, [pixelate](#layer-shaders) toggled onto the `mpvpaper`
+wallpaper layer, rofi opening and closing with its own
+[layer animations](#layer-surfaces-rofiwofi-notifications-bars), and a jelly
+[wobble](#move-and-resize-animations) as a terminal is moved and resized.
+
 ---
 
 ## Contents
@@ -541,6 +551,30 @@ Find a namespace with `hyprctl layers`. Common ones: `rofi`, `wofi`, `notificati
 Everything else behaves exactly as it does for windows — same [`progress` and `seed`](#shader-uniforms)
 uniforms, same `// @duration`, same snapshot-based close path.
 
+### Motion uniforms do not work on layers
+
+**A layer surface never reports motion.** The plugin only keeps a motion record for
+windows, so on a layer every motion uniform reads zero, always:
+
+`velocity`, `size_velocity`, `peak_velocity`, `peak_size_velocity`,
+`release_velocity`, `move_delta`, `move_remaining`, `size_delta`, `is_moving`,
+`is_resizing`, `is_dragging`.
+
+This is not an oversight to be worked around — layers do not move. A bar, a launcher
+and a notification are placed by their anchors and stay there, so there is no velocity
+to report and `+shader_move:` / `+shader_resize:` have no layer equivalent.
+
+The practical consequence: **a shader that derives its amplitude from velocity is a
+no-op on a layer**, silently. Point `wobble.glsl` at `rofi` and nothing happens — it
+scales its displacement by `peak_velocity`, which is zero, so it renders the surface
+untouched. There is no error, because reading zero from a uniform is not a failure.
+
+To get that look on a layer, drive it off `progress` in a `layeropenanim` /
+`layercloseanim` instead — `progress` runs 0 → 1 across the animation and is the layer's
+equivalent of a gesture. `shaders/rofi_open.glsl` in this repo does exactly that: the
+same decaying sine displacement, with the envelope keyed to `progress` rather than to
+how fast something was thrown.
+
 ---
 
 ## Move and resize animations
@@ -856,7 +890,7 @@ Declare any of these in your fragment shader and the plugin will populate them e
 | `is_fullscreen` | `float` | 1.0 if fullscreen, else 0.0 |
 | `progress` | `float` | 0.0 → 1.0 across an open/close animation; 1.0 otherwise |
 | `seed` | `float` | stable per-window random value in 0..1 |
-| `velocity` | `vec2` | window velocity in px/sec; 0 when still |
+| `velocity` | `vec2` | window velocity in px/sec; 0 when still. **Windows only** — always 0 on a layer, see [motion uniforms do not work on layers](#motion-uniforms-do-not-work-on-layers) |
 | `size_velocity` | `vec2` | resize rate in px/sec |
 | `peak_velocity` | `vec2` | fastest velocity reached during the current gesture |
 | `peak_size_velocity` | `vec2` | fastest resize rate reached during the current gesture |
