@@ -1519,7 +1519,22 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
             // displacement meant to be a few pixels moved whole texture widths
             // and every sample fell outside the surface.
             if (sz.x <= 0.0 || sz.y <= 0.0)
-                sz = g_pCurrentElemSize;
+                sz = g_pCurrentElemSize; // already device px — a pass element box
+            else if (auto mon = g_pHyprRenderer->m_renderData.pMonitor.lock(); mon && mon->m_scale > 0.0f)
+                // logicalBox() is logical; every other size the plugin publishes is
+                // device pixels. `resolution` is m_pixelSize, and box_size/round come
+                // straight off the pass element, whose box is pre-scaled —
+                // CTexPassElement::boundingBox() divides by m_scale to recover
+                // logical, which is what pins the units down, and the wrapper's
+                // rounding mask depends on box_size and round sharing that space.
+                //
+                // So the window branch was the odd one out, not the element branch:
+                // on a scale-2 monitor a window reported half what a layer did for
+                // the same pixels, and a shader displacing "22px" moved 11 on one
+                // and 22 on the other. Unifying on device pixels keeps surface_size
+                // agreeing with resolution and with the texture being sampled, which
+                // is what the uniform is for. Invisible at scale 1.
+                sz *= mon->m_scale;
             glUniform2f(activeEntry->surfaceSizeLoc, (float)sz.x, (float)sz.y);
         }
         if (activeEntry->mouseLoc >= 0 && Pointer::mgr()) {
