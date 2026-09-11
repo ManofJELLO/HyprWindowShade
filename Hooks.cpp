@@ -1382,21 +1382,63 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
     // and may never bind `time`, so it needs frames either way. Keyed on the
     // animation being *resolved* rather than compiled, so a broken animation
     // shader still ticks down and clears itself instead of stranding the window.
+    //
+    // Every branch has to DAMAGE, not merely schedule a frame. scheduleFrame()
+    // sets needsFrame, which wakes the output and gets as far as
+    // renderMonitor(); the actual draw sits behind a separate `if
+    // (!finalDamage.empty())`, so a woken monitor with a clean damage ring
+    // renders nothing at all and commits an empty frame. A window-less surface
+    // therefore has to dirty the monitor itself or its shader silently stops
+    // advancing the moment nothing else on that monitor happens to be moving —
+    // which is why this only ever showed up on a second monitor that was
+    // otherwise idle.
     if (animPath || stackUsesTime) {
         if (pWindow)
             g_pHyprRenderer->damageWindow(pWindow);
         else if (auto ls = pLS ? pLS : pOwnerLS) {
+            // Whole monitor, matching what Hyprland does for layers: their
+            // position/size/alpha animations are all created AVARDAMAGE_ENTIRE
+            // and CLayerSurface damages the monitor outright. A layer's own box
+            // is monitor-local while damageBox() wants global coordinates, so
+            // this also avoids getting that conversion subtly wrong.
             if (auto mon = ls->m_monitor.lock())
-                mon->scheduleFrame();
+                g_pHyprRenderer->damageMonitor(mon);
         } else if (animMonitor)
-            animMonitor->scheduleFrame();
+            g_pHyprRenderer->damageMonitor(animMonitor);
     }
+
+    // --- LET THE CLOSE SHADER OWN THE FADE ---
+    // renderFadeouts() hands the snapshot over with `a = fadeout->alpha()`, the
+    // value of Hyprland's own `fadeOut` animation. Holding the fadeout alive past
+    // that animation (holdFadeoutOpen) is pointless if the snapshot is pinned at
+    // alpha 0 for the extra time, so the declared duration is the plugin's clock
+    // for the fade as well: the close shader reaches full transparency at
+    // progress 1.0 by contract, and it cannot honour that contract while
+    // something else is driving alpha to zero on a different schedule.
+    //
+    // This is what made the bug monitor-transform-specific. On the native path
+    // Hyprland's own program applies that alpha, so a close animation truncated
+    // by a frozen frame was already invisible and nobody saw it. On a rotated
+    // monitor runIntermediateStages declines, our shader is the on-screen draw,
+    // and plugin_alpha resolves to 1.0 because a fadeout has no window to ask for
+    // alphaTotal() — so the same frozen frame stayed fully opaque and read as
+    // "the animation stopped two thirds through and left the window behind".
+    //
+    // Gated on topIsAnim so a close shader that failed to compile still fades on
+    // Hyprland's schedule instead of sitting opaque until the hold expires. Only
+    // the pass element's copy is touched, never the animated variable, so
+    // CWindowFadeout::done() still reports true on Hyprland's own timing and the
+    // hold stays the only thing keeping the snapshot alive.
+    const bool  ownFade   = animMonitor && topIsAnim;
+    const float origElemA = elem ? elem->m_data.a : 1.0f;
+    if (ownFade) elem->m_data.a = 1.0f;
 
     ((TGLDrawTex)g_pGLDrawTexHook->m_original)(thisptr, element, damage);
 
     // The element belongs to the pass, not to us — put its texture back before
     // anything else in the frame looks at it.
     if (originalTex) elem->m_data.tex = originalTex;
+    if (ownFade)     elem->m_data.a   = origElemA;
 
     g_pCurrentRenderWindow.reset();
     g_pCurrentRenderLayer.reset();
@@ -1630,8 +1672,27 @@ static bool holdFadeoutOpen(Desktop::IFadeout* key, bool origDone) {
         // Keep frames coming ourselves: once Hyprland's fade animation is over it
         // has no reason left to tick this monitor, and without a frame the
         // animation would freeze mid-way instead of playing out.
+        //
+        // DAMAGE, not just scheduleFrame(). A scheduled frame only sets
+        // needsFrame, which gets the monitor as far as renderMonitor() and no
+        // further: with an empty damage region the whole `else if
+        // (!finalDamage.empty())` branch is skipped, so renderWorkspace() never
+        // runs, no fadeout is drawn, and the frame commits with nothing in it.
+        // The close shader then stops advancing at whatever progress it had
+        // reached when Hyprland's own fade animation ended — while the plugin
+        // spun the output at full refresh producing empty frames for the rest of
+        // the declared duration.
+        //
+        // Hyprland's fadeouts damage through exactly this call: all three of a
+        // fadeout's animated variables are created AVARDAMAGE_NONE with an
+        // update callback that calls damageMonitor, so the whole monitor is what
+        // the compositor itself dirties on every tick of a fade. Matching that
+        // is both correct and no coarser than what we are replacing — a
+        // fadeout's renderBox is monitor-sized anyway, because the snapshot
+        // framebuffer covers the monitor and is merely offset so the window's
+        // part of it lands where the window was.
         if (auto mon = key->monitor().lock())
-            mon->scheduleFrame();
+            g_pHyprRenderer->damageMonitor(mon);
         return false;
     }
 

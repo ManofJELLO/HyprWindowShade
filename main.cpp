@@ -139,8 +139,12 @@ namespace shadeActions {
         // Same intent as the failure cache: an explicit reload means "report
         // everything again", including animation shaders missing a duration.
         g_mDurationWarnedMtimes.clear();
-        for (auto& w : Desktop::windowState()->windows()) if (w) g_pHyprRenderer->damageWindow(w);
-        for (auto& m : State::monitorState()->monitors()) if (m) m->scheduleFrame();
+        // damageMonitor, not scheduleFrame: a scheduled frame with a clean damage
+        // ring reaches renderMonitor() and stops there, because the draw itself
+        // sits behind `if (!finalDamage.empty())`. Nothing would be redrawn with
+        // the newly compiled shaders. This also covers every window, every layer
+        // and every fadeout on the monitor in one call.
+        for (auto& m : State::monitorState()->monitors()) if (m) g_pHyprRenderer->damageMonitor(m);
         HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] Shaders Reloaded from Disk!", CHyprColor(0.2f, 1.0f, 0.2f, 1.0f), 3000.0f);
     }
 }
@@ -302,8 +306,12 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_Listeners.push_back(Event::bus()->m_events.layer.opened.listen([](PHLLS layer) {
         if (!layer) return;
         g_mLayerOpenTimes[layer.get()] = std::chrono::steady_clock::now();
+        // Same reason as reloadShaders: scheduleFrame() alone wakes the output
+        // but leaves the damage ring clean, and renderMonitor() draws nothing.
+        // A layer open animation on an otherwise idle monitor would never get
+        // its first frame.
         if (auto mon = layer->m_monitor.lock())
-            mon->scheduleFrame();
+            g_pHyprRenderer->damageMonitor(mon);
     }));
 
     g_Listeners.push_back(Event::bus()->m_events.layer.closed.listen([](PHLLS layer) {
