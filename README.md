@@ -886,7 +886,7 @@ Declare any of these in your fragment shader and the plugin will populate them e
 | `time` | `float` | seconds since plugin start (monotonic) |
 | `plugin_alpha` | `float` | `window->alphaTotal()` for the window being drawn |
 | `resolution` | `vec2` | active monitor pixel size |
-| `surface_size` | `vec2` | window size; for a layer surface or a close animation's snapshot, that surface's box |
+| `surface_size` | `vec2` | the size of what `v_texcoord` spans: the window for a window, its box for a layer, and **the whole monitor** for a close animation — see [how close animations work](#how-close-animations-work) |
 | `mouse` | `vec2` | pointer position in compositor coords |
 | `is_active` | `float` | 1.0 if focused, else 0.0 |
 | `is_floating` | `float` | 1.0 if floating, else 0.0 |

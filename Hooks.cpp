@@ -286,6 +286,21 @@ static const std::string* resolveCloseAnim(const SP<Render::ITexture>& tex, PHLM
         g_pCurrentAnimProgress = anim.duration > 0.0f ? std::min(elapsed / anim.duration, 1.0f) : 1.0f;
         g_pCurrentAnimSeed     = anim.seed;
         outMonitor             = f->monitor().lock();
+
+        // `surface_size` for a snapshot. The element's box is renderBox(), which is
+        // `m_transformedSize * (m_realSize / m_sourceSize)` — the monitor's size
+        // times a factor windowsOut animates all the way down. Measured over one
+        // close: 2560x1080 on the first frame, 14x11 on the last. A shader
+        // converting pixels to texels through `1.0 / surface_size` therefore had
+        // its divisor shrink by two orders of magnitude mid-animation.
+        //
+        // m_transformedSize is that same space with the animating factor divided
+        // back out, so it is constant for the life of the fade. It is also the
+        // space v_texcoord actually spans: at 90 degrees the snapshot texture is
+        // the panel, 2560x1080, while the box it is drawn into is 1080x2560, and
+        // the UVs run across the box. Reporting the texture's own pixel size here
+        // would be the wrong axis order on exactly the monitors this matters on.
+        if (outMonitor) g_pCurrentElemSize = outMonitor->m_transformedSize;
         return &anim.path;
     }
     return nullptr;
