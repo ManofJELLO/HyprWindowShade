@@ -190,6 +190,13 @@ struct FadeoutAnim {
     std::chrono::steady_clock::time_point start;
     float                                 duration = -1.0f; // <0: ask the shader
     float                                 seed     = 0.5f;  // captured from the window
+    // Where the closing view sat on its monitor, in monitor-local device pixels.
+    // The snapshot framebuffer covers the whole monitor, so this is the only way
+    // a close shader can find the thing it is animating. Captured at fadeout
+    // creation, while the view is still alive to be asked; normalised at draw
+    // time. Zero size means "not known", and the shader is told the whole texture.
+    Vector2D                              srcPos;
+    Vector2D                              srcSize;
 };
 extern std::unordered_map<Desktop::IFadeout*, FadeoutAnim> g_mFadeoutAnims;
 
@@ -363,6 +370,7 @@ struct CompiledShader {
     GLint     sizeDeltaLoc     = -1; // vec2: size goal - size begun
     GLint     sizeVelocityLoc  = -1; // vec2: px/sec
     GLint     windowBoxLoc     = -1; // vec4: window box, so subsurfaces can stay coherent
+    GLint     windowRectLoc    = -1; // vec4: the view's rect within what v_texcoord spans, 0..1
     GLint     isMovingLoc      = -1; // float 0/1
     GLint     isResizingLoc    = -1; // float 0/1
     GLint     isDraggingLoc    = -1; // float 0/1 — always 0 until case 3 lands
@@ -487,6 +495,12 @@ extern Vector2D            g_pCurrentBoxSize;
 // that get rounded. This is what answers `surface_size` when there is no window
 // to ask — a layer surface, or a close animation's snapshot.
 extern Vector2D            g_pCurrentElemSize;
+// The rect the drawn view occupies inside the texture `v_texcoord` spans,
+// normalised to 0..1. (0,0,1,1) for everything that maps 1:1 — every window,
+// layer and subsurface — and the view's former sub-rect for a close animation,
+// whose snapshot covers the whole monitor. Exposed as `window_rect` so one
+// expression locates the view on every path.
+extern CBox                g_pCurrentWindowRect;
 extern float               g_pCurrentRound;
 extern float               g_pCurrentRoundPower;
 

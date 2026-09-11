@@ -901,7 +901,8 @@ Declare any of these in your fragment shader and the plugin will populate them e
 | `move_delta` | `vec2` | whole trip vector, `goal - start`; 0 when not moving |
 | `move_remaining` | `vec2` | distance still to travel |
 | `size_delta` | `vec2` | whole resize vector; 0 when not resizing |
-| `window_box` | `vec4` | the window's own box `(x, y, w, h)` |
+| `window_box` | `vec4` | the window's own box `(x, y, w, h)` in global logical coords; `(0,0,0,0)` for a layer or a close animation |
+| `window_rect` | `vec4` | where the drawn view sits inside what `v_texcoord` spans, normalised `(x, y, w, h)`. `(0,0,1,1)` for windows, layers and subsurfaces; the view's former sub-rect for a [close animation](#the-snapshot-covers-the-whole-monitor) |
 | `is_moving` | `float` | 1.0 while the position is animating |
 | `is_resizing` | `float` | 1.0 while the size is animating |
 | `is_dragging` | `float` | 1.0 while the user is physically dragging this window |
@@ -967,6 +968,48 @@ Two consequences worth knowing:
   than your shader wants. The plugin holds it open for exactly the declared duration, so
   you don't have to match your config's fade-out animation. If Hyprland's fadeout
   animation is disabled entirely, no snapshot is created and close animations won't run.
+
+### The snapshot covers the whole monitor
+
+This is the one real difference between writing an open animation and writing a close
+one, and it will bite you if you port a shader across without knowing.
+
+Hyprland does not snapshot the window into a window-sized framebuffer. It snapshots it
+into a **monitor-sized** one, then draws that framebuffer offset and scaled so the
+window's part of it lands where the window was. So during a close animation `v_texcoord`
+spans the entire monitor and the closing view occupies only the sub-rect it used to sit
+in. `surface_size` reports that monitor-sized space, not the window.
+
+For anything that only samples `tex` at `v_texcoord` — a dissolve driven by alpha, a
+colour shift, film grain — this makes no difference. It matters the moment your shader is
+**positional**: a fade from the centre, a directional wipe, an edge glow, a radial mask.
+Written against `v_texcoord` directly, those key off the centre and edges of the
+*monitor*. It is also why such a shader changes character on a monitor of a different
+shape — on a portrait monitor that texcoord space is portrait too.
+
+`window_rect` is the fix. It is `(0,0,1,1)` for a window or a layer and the view's
+sub-rect for a close animation, so one expression is right on every path:
+
+```glsl
+uniform vec4  window_rect;
+uniform float progress;
+
+void main() {
+    // 0..1 across the view itself, whatever it is being drawn into
+    vec2 local = (v_texcoord - window_rect.xy) / window_rect.zw;
+
+    // `local` now means the same thing in an open and a close shader
+    float d = distance(local, vec2(0.5)) * 1.4142;
+    float a = 1.0 - smoothstep(d - 0.2, d, progress);
+
+    vec4 src = texture(tex, v_texcoord);
+    fragColor = src * a;            // src is premultiplied, so scaling both is correct
+}
+```
+
+Keep sampling `tex` at `v_texcoord` — that is where the pixels are. Use `local` only to
+decide *what to do* at a fragment. If you want the view's own size in pixels rather than
+its position, that is `surface_size * window_rect.zw`.
 
 </details>
 

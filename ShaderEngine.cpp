@@ -295,6 +295,7 @@ CompiledShader* getOrCompileShader(const std::string& shaderPath) {
     entry.sizeDeltaLoc     = glGetUniformLocation(prog, "size_delta");
     entry.sizeVelocityLoc  = glGetUniformLocation(prog, "size_velocity");
     entry.windowBoxLoc     = glGetUniformLocation(prog, "window_box");
+    entry.windowRectLoc    = glGetUniformLocation(prog, "window_rect");
     entry.isMovingLoc      = glGetUniformLocation(prog, "is_moving");
     entry.isResizingLoc    = glGetUniformLocation(prog, "is_resizing");
     entry.isDraggingLoc    = glGetUniformLocation(prog, "is_dragging");

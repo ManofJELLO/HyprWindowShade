@@ -23,6 +23,7 @@ float               g_pCurrentSettle         = -1.0f;
 uint8_t             g_pCurrentOneShotKind    = TRANSFORM_NONE;
 Vector2D            g_pCurrentBoxSize;
 Vector2D            g_pCurrentElemSize;
+CBox                g_pCurrentWindowRect = {0.0, 0.0, 1.0, 1.0};
 float               g_pCurrentRound          = 0.0f;
 float               g_pCurrentRoundPower     = 2.0f;
 
@@ -301,6 +302,17 @@ static const std::string* resolveCloseAnim(const SP<Render::ITexture>& tex, PHLM
         // the UVs run across the box. Reporting the texture's own pixel size here
         // would be the wrong axis order on exactly the monitors this matters on.
         if (outMonitor) g_pCurrentElemSize = outMonitor->m_transformedSize;
+
+        // Normalised against that same space, never against the texture's pixel
+        // size: at 90 degrees the texture is the panel (2560x1080) while the box
+        // the UVs run across is 1080x2560, and dividing by the texture would put
+        // the rect outside 0..1 — measured, 1049+511 against a height of 1080.
+        if (outMonitor && anim.srcSize.x > 0 && anim.srcSize.y > 0) {
+            const Vector2D sp = outMonitor->m_transformedSize;
+            if (sp.x > 0 && sp.y > 0)
+                g_pCurrentWindowRect = CBox{anim.srcPos.x / sp.x, anim.srcPos.y / sp.y,
+                                            anim.srcSize.x / sp.x, anim.srcSize.y / sp.y};
+        }
         return &anim.path;
     }
     return nullptr;
@@ -1218,6 +1230,7 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
         g_pCurrentCompiledShader = nullptr;
         g_pCurrentMotion         = nullptr;
         g_pCurrentElemSize       = Vector2D(0, 0);
+        g_pCurrentWindowRect     = CBox{0.0, 0.0, 1.0, 1.0};
         ((TGLDrawTex)g_pGLDrawTexHook->m_original)(thisptr, element, damage);
         return;
     }
@@ -1258,6 +1271,9 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
     // layer surface and for a close animation's snapshot as well, and neither
     // has a window to ask.
     g_pCurrentElemSize = elem ? elem->m_data.box.size() : Vector2D(0, 0);
+    // Identity unless a close animation overrides it below: for every window,
+    // layer and subsurface the texture IS the view, so the view fills it.
+    g_pCurrentWindowRect = CBox{0.0, 0.0, 1.0, 1.0};
 
     // --- BUILD THE STACK ---
     // A one-shot animation always sits on top of whatever the window normally
@@ -1464,6 +1480,7 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
     g_pCurrentOneShotKind    = TRANSFORM_NONE;
     g_pCurrentMotion         = nullptr;
     g_pCurrentElemSize       = Vector2D(0, 0);
+    g_pCurrentWindowRect     = CBox{0.0, 0.0, 1.0, 1.0};
     g_pCurrentRound          = 0.0f;
 }
 
@@ -1653,6 +1670,19 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
             }
             glUniform4f(activeEntry->windowBoxLoc, (float)b.x, (float)b.y, (float)b.w, (float)b.h);
         }
+        if (activeEntry->windowRectLoc >= 0) {
+            // Unlike window_box this is normalised and in texcoord space, which is
+            // what lets one expression work on every path:
+            //
+            //     vec2 local = (v_texcoord - window_rect.xy) / window_rect.zw;
+            //
+            // (0,0,1,1) for a window or layer, so `local` is just v_texcoord there,
+            // and the view's former sub-rect for a close animation, whose snapshot
+            // covers the whole monitor. Being unitless it also sidesteps the
+            // logical-versus-device-pixel question entirely.
+            const CBox& r = g_pCurrentWindowRect;
+            glUniform4f(activeEntry->windowRectLoc, (float)r.x, (float)r.y, (float)r.w, (float)r.h);
+        }
         if (activeEntry->seedLoc >= 0) {
             float s = g_pCurrentAnimSeed;
             if (s < 0.0f) {
@@ -1674,12 +1704,15 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
 
 // Records the close shader for a freshly created fadeout. Everything after this
 // point keys off the IFadeout, because the window or layer is already gone.
-static void tagFadeout(Desktop::IFadeout* key, const std::string& path, float duration, const void* seedSource) {
+static void tagFadeout(Desktop::IFadeout* key, const std::string& path, float duration, const void* seedSource,
+                       const Vector2D& srcPos, const Vector2D& srcSize) {
     FadeoutAnim anim;
     anim.path     = path;
     anim.start    = std::chrono::steady_clock::now();
     anim.duration = duration; // <0 -> resolved from the shader on first draw
     anim.seed     = animSeedFor(seedSource);
+    anim.srcPos   = srcPos;
+    anim.srcSize  = srcSize;
     g_mFadeoutAnims[key] = std::move(anim);
 }
 
@@ -1750,7 +1783,19 @@ hkFadeoutCreate(PHLWINDOW window, Hyprutils::Memory::CSharedPointer<Render::IFra
     // Derived-to-base conversion, not a reinterpret: IFadeout has a virtual base,
     // so the compiler has to apply the right offset for the key to match what
     // fadeouts() hands back.
-    tagFadeout(result.get(), it->second.closeAnim, it->second.closeAnimDuration, window.get());
+    // The window is still alive here, which is the only moment its geometry can be
+    // read — everything after this keys off the IFadeout, and the window is gone.
+    // GEOMETRIC_CURRENT, not GOAL: the snapshot captured where the window actually
+    // was, not where it was heading. Scaled into the monitor's transformed space,
+    // which is what m_transformedSize measures and what the snapshot box spans;
+    // no rotation term is needed because that space is already rotated.
+    Vector2D srcPos, srcSize;
+    if (const auto mon = window->m_monitor.lock()) {
+        srcPos  = (window->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT) - mon->m_position) * mon->m_scale;
+        srcSize = window->size(Desktop::View::IGeometric::GEOMETRIC_CURRENT) * mon->m_scale;
+    }
+
+    tagFadeout(result.get(), it->second.closeAnim, it->second.closeAnimDuration, window.get(), srcPos, srcSize);
 
     return result;
 }
@@ -1772,7 +1817,17 @@ hkLayerFadeoutCreate(PHLLS layer, Hyprutils::Memory::CSharedPointer<Render::IFra
     const AnimSpec* spec = lookupLayerEntry(g_mLayerCloseAnims, layer->m_namespace);
     if (!spec || spec->path.empty()) return result;
 
-    tagFadeout(result.get(), spec->path, spec->duration, layer.get());
+    // m_geometry is monitor-local already — CLayerSurface adds the monitor position
+    // to it everywhere it wants a global box — so it only needs scaling, and the
+    // monitor origin must not come off a second time.
+    Vector2D srcPos, srcSize;
+    if (const auto mon = layer->m_monitor.lock()) {
+        const CBox& g = layer->m_geometry;
+        srcPos  = Vector2D(g.x, g.y) * mon->m_scale;
+        srcSize = Vector2D(g.w, g.h) * mon->m_scale;
+    }
+
+    tagFadeout(result.get(), spec->path, spec->duration, layer.get(), srcPos, srcSize);
 
     return result;
 }
