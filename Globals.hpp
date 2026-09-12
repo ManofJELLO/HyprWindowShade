@@ -350,7 +350,7 @@ struct CompiledShader {
     GLint     timeLoc         = -1;
     GLint     alphaLoc        = -1;
     GLint     resolutionLoc   = -1; // vec2: current monitor pixel size
-    GLint     surfaceSizeLoc  = -1; // vec2: size in device px of what v_texcoord spans
+    GLint     surfaceSizeLoc  = -1; // vec2: the view's own size; 0,0 when unknown
     GLint     mouseLoc        = -1; // vec2: pointer position
     GLint     isActiveLoc     = -1; // float 0/1
     GLint     isFloatingLoc   = -1; // float 0/1

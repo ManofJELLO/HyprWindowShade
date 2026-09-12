@@ -291,27 +291,39 @@ static const std::string* resolveCloseAnim(const SP<Render::ITexture>& tex, PHLM
         // `surface_size` for a snapshot. The element's box is renderBox(), which is
         // `m_transformedSize * (m_realSize / m_sourceSize)` — the monitor's size
         // times a factor windowsOut animates all the way down. Measured over one
-        // close: 2560x1080 on the first frame, 14x11 on the last. A shader
+        // close: 2560x1080 on the first drawn frame, 14x11 on the last. A shader
         // converting pixels to texels through `1.0 / surface_size` therefore had
         // its divisor shrink by two orders of magnitude mid-animation.
         //
-        // m_transformedSize is that same space with the animating factor divided
-        // back out, so it is constant for the life of the fade. It is also the
-        // space v_texcoord actually spans: at 90 degrees the snapshot texture is
-        // the panel, 2560x1080, while the box it is drawn into is 1080x2560, and
-        // the UVs run across the box. Reporting the texture's own pixel size here
-        // would be the wrong axis order on exactly the monitors this matters on.
-        if (outMonitor) g_pCurrentElemSize = outMonitor->m_transformedSize;
+        // The texture's own size is the honest answer, and it is constant for the
+        // life of the fade. v_texcoord spans the TEXTURE, not the box it is drawn
+        // into: Hyprland reconciles the two by composing MONITOR_INVERTED into
+        // glMatrix, which transforms positions only, while the UVs come from the
+        // untransformed unit quad. m_transformedSize was the tempting answer and
+        // is wrong on exactly the monitors this matters on — at 90 degrees the
+        // snapshot texture is the panel, 2560x1080, while m_transformedSize is
+        // 1080x2560, so it had the axes the wrong way round.
+        g_pCurrentElemSize = tex->m_size;
 
-        // Normalised against that same space, never against the texture's pixel
-        // size: at 90 degrees the texture is the panel (2560x1080) while the box
-        // the UVs run across is 1080x2560, and dividing by the texture would put
-        // the rect outside 0..1 — measured, 1049+511 against a height of 1080.
-        if (outMonitor && anim.srcSize.x > 0 && anim.srcSize.y > 0) {
-            const Vector2D sp = outMonitor->m_transformedSize;
-            if (sp.x > 0 && sp.y > 0)
-                g_pCurrentWindowRect = CBox{anim.srcPos.x / sp.x, anim.srcPos.y / sp.y,
-                                            anim.srcSize.x / sp.x, anim.srcSize.y / sp.y};
+        // The captured rect is monitor-local device px in TRANSFORMED space, and
+        // the texture is in panel space, so the monitor transform has to be
+        // applied before normalising — the two differ by a transpose at 90/270.
+        // Verified on hardware before this was written: a window at (69,1049)
+        // 942x511 on a 90-degree monitor previously produced a window_rect whose
+        // block rendered at (438,322) 184x1922, x and y swapped.
+        //
+        // Hyprutils' own box transform does the mapping, the same call
+        // CMonitor::onConnect uses to go from transformed space to panel space.
+        // invertTransform matches the direction Hyprland composes into glMatrix.
+        // At transform 0 this is the identity, so the ordinary case is untouched.
+        if (anim.srcSize.x > 0 && anim.srcSize.y > 0 && outMonitor) {
+            const Vector2D xfmd = outMonitor->m_transformedSize;
+            const Vector2D texSz = tex->m_size;
+            if (xfmd.x > 0 && xfmd.y > 0 && texSz.x > 0 && texSz.y > 0) {
+                CBox r{anim.srcPos.x, anim.srcPos.y, anim.srcSize.x, anim.srcSize.y};
+                r.transform(Math::wlTransformToHyprutils(Math::invertTransform(outMonitor->m_transform)), xfmd.x, xfmd.y);
+                g_pCurrentWindowRect = CBox{r.x / texSz.x, r.y / texSz.y, r.w / texSz.x, r.h / texSz.y};
+            }
         }
         return &anim.path;
     }
@@ -1536,22 +1548,22 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
             // displacement meant to be a few pixels moved whole texture widths
             // and every sample fell outside the surface.
             if (sz.x <= 0.0 || sz.y <= 0.0)
-                sz = g_pCurrentElemSize; // already device px — a pass element box
-            else if (auto mon = g_pHyprRenderer->m_renderData.pMonitor.lock(); mon && mon->m_scale > 0.0f)
-                // logicalBox() is logical; every other size the plugin publishes is
-                // device pixels. `resolution` is m_pixelSize, and box_size/round come
-                // straight off the pass element, whose box is pre-scaled —
-                // CTexPassElement::boundingBox() divides by m_scale to recover
-                // logical, which is what pins the units down, and the wrapper's
-                // rounding mask depends on box_size and round sharing that space.
-                //
-                // So the window branch was the odd one out, not the element branch:
-                // on a scale-2 monitor a window reported half what a layer did for
-                // the same pixels, and a shader displacing "22px" moved 11 on one
-                // and 22 on the other. Unifying on device pixels keeps surface_size
-                // agreeing with resolution and with the texture being sampled, which
-                // is what the uniform is for. Invisible at scale 1.
-                sz *= mon->m_scale;
+                sz = g_pCurrentElemSize;
+            // No scale conversion here, deliberately. 68c1f46 multiplied the
+            // window branch by m_scale to put everything in device pixels, on the
+            // premise that surface_size is "the size of what v_texcoord spans".
+            // That premise is false twice over. The axis order was wrong for a
+            // rotated snapshot (see resolveCloseAnim), and v_texcoord spans the
+            // client's BUFFER, whose scale need not match the monitor's: an
+            // XWayland or non-HiDPI app on a scale-2 monitor submits an 800x600
+            // buffer for an 800x600 logical window, so the conversion reported
+            // 1600x1200 for 800x600 texels and halved every displacement written
+            // against the documented contract.
+            //
+            // So this stays the view's own size — the window's logical box, or the
+            // element box for a layer or snapshot. Subsurfaces keep preferring
+            // their parent window's box above; that is what lets a shader build
+            // one coherent field across a window instead of per-surface.
             glUniform2f(activeEntry->surfaceSizeLoc, (float)sz.x, (float)sz.y);
         }
         if (activeEntry->mouseLoc >= 0 && Pointer::mgr()) {
