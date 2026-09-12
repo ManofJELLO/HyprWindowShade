@@ -27,6 +27,8 @@ CFunctionHook*                                        g_pFadeoutCreateHook      
 CFunctionHook*                                        g_pFadeoutDoneHook        = nullptr;
 CFunctionHook*                                        g_pLayerFadeoutCreateHook = nullptr;
 CFunctionHook*                                        g_pLayerFadeoutDoneHook   = nullptr;
+CFunctionHook*                                        g_pFadeoutRenderBoxHook      = nullptr;
+CFunctionHook*                                        g_pLayerFadeoutRenderBoxHook = nullptr;
 
 // Tracks the most recently activated window so togglewindowshader doesn't have
 // to linear-scan Desktop::windowState()->windows() asking isWindowActive on each.
@@ -265,6 +267,21 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         if (fadeoutDoneAddr && layerFadeoutDoneAddr) break;
     }
 
+    // renderBox holds the snapshot still for the shader's declared duration. Looked
+    // up separately because it is optional: without it close animations still run,
+    // they just collapse on Hyprland's schedule the way they always did.
+    auto  methodsRenderBox         = HyprlandAPI::findFunctionsByName(PHANDLE, "renderBox");
+    void* fadeoutRenderBoxAddr     = nullptr;
+    void* layerFadeoutRenderBoxAddr = nullptr;
+    for (auto& m : methodsRenderBox) {
+        if (!fadeoutRenderBoxAddr && m.signature.find("14CWindowFadeout9renderBox") != std::string::npos)
+            fadeoutRenderBoxAddr = m.address;
+        else if (!layerFadeoutRenderBoxAddr && m.signature.find("13CLayerFadeout9renderBox") != std::string::npos)
+            layerFadeoutRenderBoxAddr = m.address;
+
+        if (fadeoutRenderBoxAddr && layerFadeoutRenderBoxAddr) break;
+    }
+
     // Window and layer close animations are installed independently, so one
     // missing symbol doesn't take the other down with it.
     if (fadeoutCreateAddr && fadeoutDoneAddr) {
@@ -272,6 +289,10 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         g_pFadeoutDoneHook   = HyprlandAPI::createFunctionHook(PHANDLE, fadeoutDoneAddr,   (void*)&hkFadeoutDone);
         g_pFadeoutCreateHook->hook();
         g_pFadeoutDoneHook->hook();
+        if (fadeoutRenderBoxAddr) {
+            g_pFadeoutRenderBoxHook = HyprlandAPI::createFunctionHook(PHANDLE, fadeoutRenderBoxAddr, (void*)&hkFadeoutRenderBox);
+            g_pFadeoutRenderBoxHook->hook();
+        }
     } else {
         HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] CWindowFadeout hooks not found — shader_close: disabled.",
                                      CHyprColor(1.0f, 0.7f, 0.2f, 1.0f), 8000.0f);
@@ -282,6 +303,10 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         g_pLayerFadeoutDoneHook   = HyprlandAPI::createFunctionHook(PHANDLE, layerFadeoutDoneAddr,   (void*)&hkLayerFadeoutDone);
         g_pLayerFadeoutCreateHook->hook();
         g_pLayerFadeoutDoneHook->hook();
+        if (layerFadeoutRenderBoxAddr) {
+            g_pLayerFadeoutRenderBoxHook = HyprlandAPI::createFunctionHook(PHANDLE, layerFadeoutRenderBoxAddr, (void*)&hkLayerFadeoutRenderBox);
+            g_pLayerFadeoutRenderBoxHook->hook();
+        }
     } else {
         HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] CLayerFadeout hooks not found — layercloseanim disabled.",
                                      CHyprColor(1.0f, 0.7f, 0.2f, 1.0f), 8000.0f);
@@ -507,6 +532,8 @@ APICALL EXPORT void PLUGIN_EXIT() {
     if (g_pFadeoutDoneHook)        HyprlandAPI::removeFunctionHook(PHANDLE, g_pFadeoutDoneHook);
     if (g_pLayerFadeoutCreateHook) HyprlandAPI::removeFunctionHook(PHANDLE, g_pLayerFadeoutCreateHook);
     if (g_pLayerFadeoutDoneHook)   HyprlandAPI::removeFunctionHook(PHANDLE, g_pLayerFadeoutDoneHook);
+    if (g_pFadeoutRenderBoxHook)      HyprlandAPI::removeFunctionHook(PHANDLE, g_pFadeoutRenderBoxHook);
+    if (g_pLayerFadeoutRenderBoxHook) HyprlandAPI::removeFunctionHook(PHANDLE, g_pLayerFadeoutRenderBoxHook);
 
     HyprlandAPI::removeDispatcher(PHANDLE, "layershader");
     HyprlandAPI::removeDispatcher(PHANDLE, "togglelayershader");

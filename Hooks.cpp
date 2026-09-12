@@ -24,6 +24,9 @@ uint8_t             g_pCurrentOneShotKind    = TRANSFORM_NONE;
 Vector2D            g_pCurrentBoxSize;
 Vector2D            g_pCurrentElemSize;
 CBox                g_pCurrentWindowRect = {0.0, 0.0, 1.0, 1.0};
+// The fadeout record being drawn this element, or null. Borrowed for the length
+// of one draw only; nothing inserts into g_mFadeoutAnims during a draw.
+static FadeoutAnim* g_pCurrentFadeoutAnim = nullptr;
 float               g_pCurrentRound          = 0.0f;
 float               g_pCurrentRoundPower     = 2.0f;
 
@@ -287,6 +290,7 @@ static const std::string* resolveCloseAnim(const SP<Render::ITexture>& tex, PHLM
         g_pCurrentAnimProgress = anim.duration > 0.0f ? std::min(elapsed / anim.duration, 1.0f) : 1.0f;
         g_pCurrentAnimSeed     = anim.seed;
         outMonitor             = f->monitor().lock();
+        g_pCurrentFadeoutAnim  = &anim;
 
         // `surface_size` for a snapshot. The element's box is renderBox(), which is
         // `m_transformedSize * (m_realSize / m_sourceSize)` — the monitor's size
@@ -1286,6 +1290,7 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
     // Identity unless a close animation overrides it below: for every window,
     // layer and subsurface the texture IS the view, so the view fills it.
     g_pCurrentWindowRect = CBox{0.0, 0.0, 1.0, 1.0};
+    g_pCurrentFadeoutAnim = nullptr;
 
     // --- BUILD THE STACK ---
     // A one-shot animation always sits on top of whatever the window normally
@@ -1473,6 +1478,9 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
     // CWindowFadeout::done() still reports true on Hyprland's own timing and the
     // hold stays the only thing keeping the snapshot alive.
     const bool  ownFade   = animMonitor && topIsAnim;
+    // Proof the close shader exists and reached the stack. renderBox() reads this
+    // to decide whether holding the snapshot still is safe.
+    if (ownFade && g_pCurrentFadeoutAnim) g_pCurrentFadeoutAnim->shaderLive = true;
     const float origElemA = elem ? elem->m_data.a : 1.0f;
     if (ownFade) elem->m_data.a = 1.0f;
 
@@ -1773,6 +1781,62 @@ static bool holdFadeoutOpen(Desktop::IFadeout* key, bool origDone) {
 
     if (origDone) g_mFadeoutAnims.erase(it);
     return origDone;
+}
+
+// --- V0.56 HOOKS: CWindowFadeout::renderBox / CLayerFadeout::renderBox ---
+// Hyprland builds this box as `m_transformedSize * (m_realSize / m_sourceSize)`,
+// and windowsOut drives that second factor to nothing on its own schedule.
+// Measured across one close: 2560x1080 on the first drawn frame, 14x11 on the
+// last. Holding the fadeout open past that bought the shader time it could not
+// actually draw in, so a shader declaring a duration longer than windowsOut spent
+// its climax — the moment it is contracted to reach full transparency — inside a
+// fourteen-pixel box.
+//
+// At SCALE == 1 the expression reduces exactly to {0, 0, m_transformedSize}: the
+// position terms cancel, because at t=0 the window's animated position IS its
+// source position. So this is not a new layout, it is the fadeout's own first
+// frame held for the declared duration.
+//
+// This is hooked rather than patched in hkGLDrawTex because the box is read
+// independently by pass-element construction, by boundingBox() for damage and
+// culling, by the offscreen composition, and by the final draw. Patching it
+// midway leaves those disagreeing — measured, a snapshot pinned in the draw hook
+// filled the monitor on the fallback path and still collapsed on the native one.
+//
+// Note this cannot be done by disabling Hyprland's close animation instead: the
+// snapshot exists BECAUSE Hyprland is animating the close, so turning that off
+// deletes the feature rather than replacing it. Neutralise, never disable.
+static std::optional<CBox> pinnedFadeoutBox(Desktop::IFadeout* key) {
+    if (g_mFadeoutAnims.empty() || !key) return std::nullopt;
+
+    auto it = g_mFadeoutAnims.find(key);
+    // shaderLive, not merely "tagged": a close shader that failed to compile must
+    // still collapse the way Hyprland intended rather than sit full-size and pop.
+    if (it == g_mFadeoutAnims.end() || !it->second.shaderLive) return std::nullopt;
+
+    const auto mon = key->monitor().lock();
+    if (!mon) return std::nullopt;
+
+    const Vector2D xf = mon->m_transformedSize;
+    if (xf.x < 1.0 || xf.y < 1.0) return std::nullopt;
+
+    return CBox{0.0, 0.0, xf.x, xf.y};
+}
+
+typedef CBox (*TFadeoutRenderBox)(void* thisptr);
+
+CBox hkFadeoutRenderBox(void* thisptr) {
+    // Derived-to-base first, so the compiler applies the right offset for the key
+    // to match what fadeouts() hands back — IFadeout has a virtual base.
+    if (auto b = pinnedFadeoutBox(static_cast<Desktop::CWindowFadeout*>(thisptr)))
+        return *b;
+    return ((TFadeoutRenderBox)g_pFadeoutRenderBoxHook->m_original)(thisptr);
+}
+
+CBox hkLayerFadeoutRenderBox(void* thisptr) {
+    if (auto b = pinnedFadeoutBox(static_cast<Desktop::CLayerFadeout*>(thisptr)))
+        return *b;
+    return ((TFadeoutRenderBox)g_pLayerFadeoutRenderBoxHook->m_original)(thisptr);
 }
 
 // --- V0.56 HOOK: Desktop::CWindowFadeout::create ---

@@ -197,6 +197,12 @@ struct FadeoutAnim {
     // time. Zero size means "not known", and the shader is told the whole texture.
     Vector2D                              srcPos;
     Vector2D                              srcSize;
+    // Set once the animation stage is actually in the stack for a drawn frame,
+    // which is the only proof the close shader compiled. renderBox() is hooked to
+    // hold the snapshot still, and holding it still for a shader that never runs
+    // would leave the window sitting full-size and then popping — strictly worse
+    // than letting Hyprland collapse it. False until proven otherwise.
+    bool                                  shaderLive = false;
 };
 extern std::unordered_map<Desktop::IFadeout*, FadeoutAnim> g_mFadeoutAnims;
 
@@ -449,6 +455,8 @@ extern CFunctionHook* g_pFadeoutCreateHook;
 extern CFunctionHook* g_pFadeoutDoneHook;
 extern CFunctionHook* g_pLayerFadeoutCreateHook;
 extern CFunctionHook* g_pLayerFadeoutDoneHook;
+extern CFunctionHook* g_pFadeoutRenderBoxHook;
+extern CFunctionHook* g_pLayerFadeoutRenderBoxHook;
 
 // --- ACTIVE RENDER CONTEXT ---
 // Set by hkGLDrawTex before delegating; consumed by hkUseShader during the call.
@@ -524,6 +532,17 @@ bool hkFadeoutDone(void* thisptr);
 Hyprutils::Memory::CSharedPointer<Desktop::CLayerFadeout>
      hkLayerFadeoutCreate(PHLLS layer, Hyprutils::Memory::CSharedPointer<Render::IFramebuffer> snapshot, float sourceAlpha);
 bool hkLayerFadeoutDone(void* thisptr);
+
+// --- V0.56 HOOKS: CWindowFadeout::renderBox / CLayerFadeout::renderBox ---
+// The box a fadeout's snapshot is drawn into. Hyprland derives it from the
+// windowsOut animation, which runs on ITS schedule rather than the shader's and
+// collapses the box to nothing — so a close shader declaring a longer duration
+// spent its climax inside a fourteen-pixel box. Hooked rather than patched in the
+// draw path because the box is read independently by pass-element construction,
+// boundingBox()/damage, the offscreen composition and the final draw; patching
+// one of those leaves the others disagreeing.
+CBox hkFadeoutRenderBox(void* thisptr);
+CBox hkLayerFadeoutRenderBox(void* thisptr);
 
 // Maps a pointer to a stable 0..1 value, so each window's animation differs.
 float animSeedFor(const void* p);
