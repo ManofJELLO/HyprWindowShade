@@ -886,7 +886,7 @@ Declare any of these in your fragment shader and the plugin will populate them e
 | `time` | `float` | seconds since plugin start (monotonic) |
 | `plugin_alpha` | `float` | `window->alphaTotal()` for the window being drawn |
 | `resolution` | `vec2` | active monitor pixel size |
-| `surface_size` | `vec2` | the size of what `v_texcoord` spans: the window for a window, its box for a layer, and **the whole monitor** for a close animation — see [how close animations work](#how-close-animations-work) |
+| `surface_size` | `vec2` | the drawn view's own size: the window's logical box, the layer's box, or — for a [close animation](#the-snapshot-covers-the-whole-monitor) — the monitor-sized snapshot texture it is sampling |
 | `mouse` | `vec2` | pointer position in compositor coords |
 | `is_active` | `float` | 1.0 if focused, else 0.0 |
 | `is_floating` | `float` | 1.0 if floating, else 0.0 |
@@ -902,7 +902,7 @@ Declare any of these in your fragment shader and the plugin will populate them e
 | `move_remaining` | `vec2` | distance still to travel |
 | `size_delta` | `vec2` | whole resize vector; 0 when not resizing |
 | `window_box` | `vec4` | the window's own box `(x, y, w, h)` in global logical coords; `(0,0,0,0)` for a layer or a close animation |
-| `window_rect` | `vec4` | where the drawn view sits inside what `v_texcoord` spans, normalised `(x, y, w, h)`. `(0,0,1,1)` for windows, layers and subsurfaces; the view's former sub-rect for a [close animation](#the-snapshot-covers-the-whole-monitor) |
+| `window_rect` | `vec4` | where the drawn view sits inside the texture being sampled, normalised `(x, y, w, h)`. `(0,0,1,1)` for windows, layers and subsurfaces; the view's former sub-rect for a [close animation](#the-snapshot-covers-the-whole-monitor), correct at every monitor rotation |
 | `is_moving` | `float` | 1.0 while the position is animating |
 | `is_resizing` | `float` | 1.0 while the size is animating |
 | `is_dragging` | `float` | 1.0 while the user is physically dragging this window |
@@ -960,10 +960,17 @@ shades it on the way out. Layer surfaces close through the identical mechanism
 
 Two consequences worth knowing:
 
-- **Your close shader should reach full transparency at `progress == 1.0`.** The plugin
-  replaces Hyprland's texture shader, so Hyprland's own fade-out alpha isn't applied to
-  the snapshot — your shader has sole control of how it disappears. If it ends opaque,
-  the snapshot pops rather than fades.
+- **Your close shader must reach full transparency at `progress == 1.0`.** This is a
+  requirement, not a suggestion. The plugin pins the snapshot's alpha to 1.0 for the whole
+  declared duration, so Hyprland's own `fadeOut` alpha is not applied and your shader has
+  sole control of how the window disappears — which is the only way a shader can outlive
+  an `animation = fadeOut` that is shorter than its `@duration`.
+
+  The flip side: a shader that never drives `fragColor.a` no longer fades out on
+  Hyprland's schedule. It stays fully opaque for the entire duration and then vanishes in
+  a single frame. Earlier versions silently covered for this, because Hyprland's own
+  program was still applying the fade underneath. If you are porting a close shader that
+  only does a colour wipe or a scale, drive alpha to zero yourself.
 - Hyprland normally drops the fadeout when *its* animation finishes, which can be sooner
   than your shader wants. The plugin holds it open for exactly the declared duration, so
   you don't have to match your config's fade-out animation. If Hyprland's fadeout
@@ -977,8 +984,13 @@ one, and it will bite you if you port a shader across without knowing.
 Hyprland does not snapshot the window into a window-sized framebuffer. It snapshots it
 into a **monitor-sized** one, then draws that framebuffer offset and scaled so the
 window's part of it lands where the window was. So during a close animation `v_texcoord`
-spans the entire monitor and the closing view occupies only the sub-rect it used to sit
-in. `surface_size` reports that monitor-sized space, not the window.
+spans that whole snapshot and the closing view occupies only the sub-rect it used to sit
+in. `surface_size` reports the snapshot texture, not the window.
+
+On a rotated monitor the snapshot is stored panel-oriented — 2560x1080 on a 90-degree
+2560x1080 panel, not 1080x2560 — because `v_texcoord` runs across the texture rather than
+across the box it is drawn into. `window_rect` already accounts for that, which is the
+whole reason to use it instead of deriving a position yourself.
 
 For anything that only samples `tex` at `v_texcoord` — a dissolve driven by alpha, a
 colour shift, film grain — this makes no difference. It matters the moment your shader is
