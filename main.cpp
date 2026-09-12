@@ -146,6 +146,11 @@ namespace shadeActions {
         // sits behind `if (!finalDamage.empty())`. Nothing would be redrawn with
         // the newly compiled shaders. This also covers every window, every layer
         // and every fadeout on the monitor in one call.
+        //
+        // damageMonitor skips mirrors, and that is correct rather than a gap: a
+        // mirror is never damaged directly. renderMonitor damages each mirror
+        // from its SOURCE's frame damage on the way out, so damaging the sources
+        // here — which this loop does — is what carries a reload to them.
         for (auto& m : State::monitorState()->monitors()) if (m) g_pHyprRenderer->damageMonitor(m);
         HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] Shaders Reloaded from Disk!", CHyprColor(0.2f, 1.0f, 0.2f, 1.0f), 3000.0f);
     }
@@ -334,7 +339,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         // Same reason as reloadShaders: scheduleFrame() alone wakes the output
         // but leaves the damage ring clean, and renderMonitor() draws nothing.
         // A layer open animation on an otherwise idle monitor would never get
-        // its first frame.
+        // its first frame. A mirror cannot reach here — it renders through
+        // renderMirrored(), which never walks the layer path.
         if (auto mon = layer->m_monitor.lock())
             g_pHyprRenderer->damageMonitor(mon);
     }));

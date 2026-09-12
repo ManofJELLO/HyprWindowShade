@@ -1440,6 +1440,10 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
     // advancing the moment nothing else on that monitor happens to be moving —
     // which is why this only ever showed up on a second monitor that was
     // otherwise idle.
+    //
+    // damageMonitor's mirror guard costs nothing here: a mirror renders through
+    // renderMirrored() and never walks the layer or fadeout paths, so neither
+    // branch below is ever reached for one.
     if (animPath || stackUsesTime) {
         if (pWindow)
             g_pHyprRenderer->damageWindow(pWindow);
