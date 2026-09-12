@@ -484,6 +484,7 @@ Three sources, highest priority first:
 |---|---|---|
 | Rule / call `@sec` | `…/dissolve.glsl@0.6` | Appended to the path in a window rule `tag`, or in `layeropenanim` / `layercloseanim`. |
 | Shader `// @duration` | `// @duration 0.35` | Anywhere in the `.glsl` file. The effect's own natural length. |
+| Shader `// @overlay` | `// @overlay` | Anywhere in the `.glsl` file. Composite with Hyprland's own close animation instead of replacing it. |
 | Built-in default | — | **0.3s**, used when neither of the above says anything. |
 
 ```lua
@@ -503,6 +504,37 @@ screen for half a minute.
 initializers on uniforms, so there's no in-language way to declare a value the plugin can
 read *before* the shader ever runs, and it needs the number on the CPU side to know when
 the animation is over.
+
+### `// @overlay` — compositing instead of replacing
+
+By default a plugin close animation **replaces** Hyprland's own. For the declared duration
+the plugin pins the snapshot's alpha and holds its box still, so your shader owns the frame
+and `progress` runs 0 → 1 over a surface that is still the size it was.
+
+That is the default because the alternative loses time you asked for. Hyprland's `windowsOut`
+runs on its own schedule and collapses the snapshot's box to nothing — measured on a 0.2s
+`windowsOut`, from 2560x1080 on the first drawn frame to 14x11 on the last. A shader
+declaring `// @duration 1.5` against that spent its climax, the moment it is contracted to
+reach full transparency, inside a fourteen-pixel box.
+
+Add `// @overlay` to get the old behaviour back:
+
+```glsl
+// @duration 0.34
+// @overlay
+```
+
+Your shader then composites with Hyprland's close animation rather than standing in for it:
+the snapshot keeps Hyprland's fade alpha and its box shrinks on `windowsOut`'s schedule.
+Worth having when the shader only tints, wipes or distorts and leans on Hyprland's fade to
+actually remove the window — under the default such a shader would sit fully opaque for its
+whole duration and then vanish in one frame.
+
+It is a shader directive rather than a window rule tag or a config value for two reasons.
+The choice follows from how the shader is written, not from which window it happens to be
+applied to — a dissolve that drives its own alpha inherently wants the frame; a tint does
+not. And it is the one channel that reaches layer animations as well as window ones, since
+layer surfaces carry no rule tags at all.
 
 If a shader declares the `progress` uniform but no `// @duration`, the plugin falls back
 to 0.3s *and* toasts once to tell you — a shader written as an animation that never says

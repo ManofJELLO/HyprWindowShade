@@ -36,6 +36,16 @@ static const std::regex DURATION_RE(R"(//[ \t]*@duration[ \t]+([0-9]*\.?[0-9]+))
 // rather than a reinterpretation of @duration.
 static const std::regex SETTLE_RE(R"(//[ \t]*@settle[ \t]+([0-9]*\.?[0-9]+))");
 
+// An open/close animation can ask to composite with Hyprland's own animation
+// rather than replace it:
+//
+//     // @overlay
+//
+// A bare flag, so no capture group. Same comment-directive channel as @duration
+// and @settle, and for the same reason: it has to reach layer animations too,
+// and layers carry no rule tags.
+static const std::regex OVERLAY_RE(R"(//[ \t]*@overlay\b)");
+
 // The rounding mask appended below needs `v_texcoord` to locate the fragment
 // within the box. Shaders that don't declare it keep the plain wrapper.
 static const std::regex TEXCOORD_RE(R"(\bin\s+vec2\s+v_texcoord\s*;)");
@@ -72,6 +82,12 @@ static float parseDeclaredSettle(const std::string& src) {
 // Compile the fragment shader standalone purely to capture glGetShaderInfoLog
 // text. Only called after CShader::createProgram has already failed, so the
 // extra compile cost is paid once per broken edit, not per draw.
+// True when the shader carries `// @overlay`. Read off the ORIGINAL source, like
+// the other directives, before the auto-alpha wrapper appends anything.
+static bool parseDeclaredOverlay(const std::string& src) {
+    return std::regex_search(src, OVERLAY_RE);
+}
+
 static std::string captureFragmentLog(const std::string& src) {
     GLuint sh = glCreateShader(GL_FRAGMENT_SHADER);
     const char* csrc = src.c_str();
@@ -163,6 +179,7 @@ CompiledShader* getOrCompileShader(const std::string& shaderPath) {
     // wrapper appends anything.
     const float declaredDuration = parseDeclaredDuration(shaderCode);
     const float declaredSettle   = parseDeclaredSettle(shaderCode);
+    const bool  declaredOverlay  = parseDeclaredOverlay(shaderCode);
 
     // --- SHADER WRAPPING (AUTO-ALPHA) ---
     // Tolerant `void main()` matcher — handles whitespace, newlines, and an
@@ -308,6 +325,7 @@ CompiledShader* getOrCompileShader(const std::string& shaderPath) {
     entry.peakSizeVelLoc   = glGetUniformLocation(prog, "peak_size_velocity");
     entry.animDuration    = declaredDuration;
     entry.settleDuration  = declaredSettle;
+    entry.wantsOverlay    = declaredOverlay;
     // Continuous redraw is needed only when the shader actually binds `time`.
     // Using the location instead of substring matching avoids false positives
     // like "lifetime" or "uniform_time_offset".

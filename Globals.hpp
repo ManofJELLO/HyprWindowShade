@@ -407,6 +407,17 @@ struct CompiledShader {
     // animDuration this has no default: inventing a tail the shader never asked
     // for would keep a live window redrawing every frame for no reason.
     float     settleDuration  = 0.0f;
+    // `// @overlay` — opt back into compositing with Hyprland's own close
+    // animation instead of replacing it. Default (absent) is replace: the plugin
+    // pins the snapshot's alpha and holds its box still, so the shader owns the
+    // frame for its declared duration. A shader that only tints or wipes, and
+    // leans on Hyprland's fade to actually remove the window, wants this.
+    //
+    // A shader directive rather than a tag or a config value because the choice
+    // follows from how the shader is written, not from which window it is on, and
+    // because it is the one channel that reaches windows and layers alike —
+    // layers carry no rule tags at all.
+    bool      wantsOverlay    = false;
     time_t    sourceMtime     = 0; // mtime at compile time; lets us auto-evict on edit
     // When the mtime was last checked. The check is a stat() syscall and this
     // struct is looked up per stage per textured surface per frame, so it is

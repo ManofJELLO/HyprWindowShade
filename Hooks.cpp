@@ -1477,9 +1477,15 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
     // the pass element's copy is touched, never the animated variable, so
     // CWindowFadeout::done() still reports true on Hyprland's own timing and the
     // hold stays the only thing keeping the snapshot alive.
-    const bool  ownFade   = animMonitor && topIsAnim;
-    // Proof the close shader exists and reached the stack. renderBox() reads this
-    // to decide whether holding the snapshot still is safe.
+    // `// @overlay` in the animation shader opts back into compositing with
+    // Hyprland's own close animation. One gate covers both halves of "replace":
+    // with ownFade false the pass element keeps Hyprland's fade alpha, and
+    // shaderLive is never set, so renderBox() leaves the box to collapse on
+    // Hyprland's schedule exactly as it did before any of this.
+    const bool  overlay   = topIsAnim && nStages > 0 && stages[nStages - 1]->wantsOverlay;
+    const bool  ownFade   = animMonitor && topIsAnim && !overlay;
+    // Proof the close shader exists, reached the stack, and wants the frame.
+    // renderBox() reads this to decide whether holding the snapshot still is safe.
     if (ownFade && g_pCurrentFadeoutAnim) g_pCurrentFadeoutAnim->shaderLive = true;
     const float origElemA = elem ? elem->m_data.a : 1.0f;
     if (ownFade) elem->m_data.a = 1.0f;
