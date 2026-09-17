@@ -336,3 +336,43 @@ CompiledShader* getOrCompileShader(const std::string& shaderPath) {
     auto [insertedIt, _] = g_mCompiledCShaders.emplace(shaderPath, std::move(entry));
     return &insertedIt->second;
 }
+
+// --- GL-FREE DIRECTIVE READ ---
+// getOrCompileShader resolves `@duration` and `@overlay` as a side effect of
+// compiling, which is fine on the draw path but useless to a close: the layout
+// reflow that has to agree with the close shader's clock is started inside
+// CWindow::unmapWindow, a wayland event handler with no guarantee of a current
+// GL context. Compiling there would fail and poison the failure cache — the same
+// reason holdFadeoutOpen refuses to call getOrCompileShader.
+//
+// Both directives are plain comment scans over the source, so they are readable
+// without a context. A compiled entry that still matches the file on disk answers
+// for free; otherwise the source is read, which happens once per close rather
+// than per draw. Returns false only when the source cannot be read at all, which
+// the caller treats as "no close animation".
+bool declaredAnimTiming(const std::string& shaderPath, float& duration, bool& overlay) {
+    // The compiled entry is only trustworthy while it still matches the file.
+    // Unlike the draw path there is no throttle to justify here: this runs once
+    // per close, not per surface per frame, and serving a stale directive would
+    // mean an edited `@duration` took effect for the animation but not for the
+    // reflow timed against it.
+    if (auto it = g_mCompiledCShaders.find(shaderPath); it != g_mCompiledCShaders.end()) {
+        const time_t mtimeNow = fileMtime(shaderPath);
+        if (mtimeNow == 0 || it->second.sourceMtime == mtimeNow) {
+            duration = it->second.animDuration;
+            overlay  = it->second.wantsOverlay;
+            return true;
+        }
+    }
+
+    std::ifstream shaderFile(shaderPath);
+    if (!shaderFile.is_open()) return false;
+
+    std::stringstream buffer;
+    buffer << shaderFile.rdbuf();
+    const std::string src = buffer.str();
+
+    duration = parseDeclaredDuration(src);
+    overlay  = parseDeclaredOverlay(src);
+    return true;
+}

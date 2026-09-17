@@ -62,6 +62,11 @@ using Render::GL::CHyprOpenGLImpl;
 #include <hyprland/src/render/Framebuffer.hpp>
 #include <hyprland/src/render/gl/GLFramebuffer.hpp>
 
+// --- CLOSE-DRIVEN MOVE RETIMING ---
+// Needed to hand a survivor's move animation a plugin-owned speed. See
+// g_mRetimedMoves below for why a close has to touch this at all.
+#include <hyprland/src/config/shared/animation/AnimationTree.hpp>
+
 // --- SHARED GLOBALS ---
 extern HANDLE PHANDLE;
 extern std::vector<CHyprSignalListener> g_Listeners;
@@ -554,6 +559,74 @@ bool hkLayerFadeoutDone(void* thisptr);
 // one of those leaves the others disagreeing.
 CBox hkFadeoutRenderBox(void* thisptr);
 CBox hkLayerFadeoutRenderBox(void* thisptr);
+
+// Reads `// @duration` and `// @overlay` out of a shader without a GL context,
+// which the close path needs and getOrCompileShader cannot offer. False when the
+// source can't be read.
+bool declaredAnimTiming(const std::string& shaderPath, float& duration, bool& overlay);
+
+// --- CLOSE-DRIVEN MOVE RETIMING ---
+// Closing a tiled window frees its tile, and the neighbours animate into it on
+// `windowsMove`. Vanilla keeps that reflow in step with the close because
+// windowsOut and windowsMove both inherit from `windows` and resolve to the same
+// SAnimationPropertyConfig until someone overrides one — so out of the box the
+// two clocks are literally the same object and cannot disagree.
+//
+// A per-window `shader_close:` breaks that symmetry: it is the one close
+// duration the global config knows nothing about. A 1.5s dissolve over a 0.7s
+// reflow plays its second half across a workspace that settled long ago.
+//
+// So a close shader's duration becomes the reflow's duration too, and the two
+// co-terminate: the survivor lands on the frame the snapshot vanishes. Windows
+// with no close shader are never touched and keep vanilla timing exactly.
+//
+// The override is a plugin-owned config rather than an edit to the tree, because
+// on a stock config `windowsMove->pValues` IS `windows->pValues` — mutating it
+// would retime every window animation in the compositor. It has to be kept alive
+// here: CBaseAnimatedVariable holds its config by CWeakPointer and reads the
+// speed live on every frame, so a config that dies mid-animation leaves the
+// variable unable to animate at all.
+//
+// Restoring is polled from the per-frame render hook rather than driven by
+// setCallbackOnEnd/setCallbackOnBegin. A callback would be a std::function owned
+// by this .so living inside an object owned by Hyprland, and those objects
+// outlive an unload: after dlclose the next assignment to that variable calls
+// into freed code. That is not hypothetical — it is a hard SIGSEGV in
+// onAnimationBegin on the first window mapped after `hyprctl plugin unload`,
+// which is every dev reload and every hyprpm update. Nothing this plugin owns
+// gets installed into a Hyprland-owned object.
+struct RetimedMove {
+    Hyprutils::Memory::CSharedPointer<Hyprutils::Animation::SAnimationPropertyConfig> config;
+    // What the reflow was heading for. A goal that no longer matches means
+    // something redirected the window, so the retimed clock no longer applies.
+    Vector2D posGoal;
+    Vector2D sizeGoal;
+};
+extern std::unordered_map<Desktop::View::CWindow*, RetimedMove> g_mRetimedMoves;
+
+// Where every other window was heading at `window.close`, captured before the
+// layout detaches the closing window so the reflow it causes can be told apart
+// from motion that was already under way. Single-slot: window.close and the
+// fadeout's creation are 60-odd lines apart in the same CWindow::unmapWindow
+// call, with no chance to interleave. `closing` tags the owner anyway, so if a
+// nested close ever did clobber it the outer one simply declines to retime.
+struct PreCloseGoal {
+    Vector2D pos;
+    Vector2D size;
+};
+struct PreCloseSnapshot {
+    Desktop::View::CWindow*                                   closing = nullptr;
+    std::unordered_map<Desktop::View::CWindow*, PreCloseGoal> goals;
+};
+extern PreCloseSnapshot g_preCloseSnapshot;
+
+void capturePreCloseGoals(Desktop::View::CWindow* closing);
+// Called once per frame from the render hook: puts a window back on windowsMove
+// as soon as its reflow has finished or been superseded.
+void tickRetimedMoves();
+void retimeMovesForClose(Desktop::View::CWindow* closing, float durationSec);
+void restoreRetimedMove(Desktop::View::CWindow* raw);
+void restoreAllRetimedMoves();
 
 // Maps a pointer to a stable 0..1 value, so each window's animation differs.
 float animSeedFor(const void* p);

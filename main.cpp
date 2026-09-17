@@ -21,6 +21,8 @@ std::unordered_map<Desktop::View::CLayerSurface*, std::chrono::steady_clock::tim
 std::unordered_map<Desktop::IFadeout*, FadeoutAnim>   g_mFadeoutAnims;
 std::unordered_map<Desktop::View::CWindow*, MotionRecord> g_mWindowMotion;
 std::unordered_map<Desktop::View::CWindow*, OneShotAnim>  g_mWindowOneShots;
+std::unordered_map<Desktop::View::CWindow*, RetimedMove> g_mRetimedMoves;
+PreCloseSnapshot                                      g_preCloseSnapshot;
 CFunctionHook*                                        g_pGLDrawTexHook          = nullptr;
 CFunctionHook*                                        g_pUseShaderHook          = nullptr;
 CFunctionHook*                                        g_pFadeoutCreateHook      = nullptr;
@@ -331,6 +333,15 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         g_pHyprRenderer->damageWindow(window);
     }));
 
+    // Fires inside CWindow::unmapWindow, before the layout detaches the closing
+    // window — the last moment the workspace can be measured as it was. What the
+    // reflow does with that is decided later, once the fadeout exists and the
+    // close shader is known; see retimeMovesForClose.
+    g_Listeners.push_back(Event::bus()->m_events.window.close.listen([](PHLWINDOW window) {
+        if (!window) return;
+        try { capturePreCloseGoals(window.get()); } catch (...) {}
+    }));
+
     // Same for layer surfaces — bars, notifications, rofi/wofi. Layers have no
     // destroy event on the bus, so `closed` doubles as the cleanup point.
     g_Listeners.push_back(Event::bus()->m_events.layer.opened.listen([](PHLLS layer) {
@@ -400,6 +411,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_Listeners.push_back(Event::bus()->m_events.render.stage.listen([](eRenderStage stage) {
         if (stage != RENDER_PRE_WINDOWS) return;
         try { updateMotionRecords(); } catch (...) {}
+        // Cheap no-op unless a close is currently retiming a reflow.
+        try { tickRetimedMoves(); }    catch (...) {}
     }));
 
     // Drop entries keyed by raw CWindow* when the window is destroyed so they
@@ -415,6 +428,15 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         g_mWindowOpenTimes.erase(rawWin);
         g_mWindowMotion.erase(rawWin);
         g_mWindowOneShots.erase(rawWin);
+        // Drop, don't restore: the variables that referenced the retimed config
+        // died with the window, so there is nothing left to point back at
+        // windowsMove.
+        g_mRetimedMoves.erase(rawWin);
+        if (g_preCloseSnapshot.closing == rawWin) {
+            g_preCloseSnapshot.closing = nullptr;
+            g_preCloseSnapshot.goals.clear();
+        }
+        g_preCloseSnapshot.goals.erase(rawWin);
     }));
 
     // --- DISPATCHERS (.conf-style — Hyprland's native bind path) ---
@@ -517,6 +539,13 @@ APICALL EXPORT void PLUGIN_EXIT() {
     g_mLayerOpenTimes.clear();
     g_mWindowMotion.clear();
     g_mWindowOneShots.clear();
+    // Before the config objects go: an animated variable holds its config by
+    // CWeakPointer and cannot animate at all once that dangles, so a survivor
+    // left pointing at a freed config would stop animating for the rest of the
+    // session rather than merely finish this move on the wrong clock.
+    restoreAllRetimedMoves();
+    g_preCloseSnapshot.closing = nullptr;
+    g_preCloseSnapshot.goals.clear();
     // Any fadeout we were holding open falls back to Hyprland's own `done` as
     // soon as the hooks come off below.
     g_mFadeoutAnims.clear();

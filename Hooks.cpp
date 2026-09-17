@@ -5,6 +5,7 @@
 #include <cmath>
 #include <hyprland/src/desktop/Workspace.hpp>
 #include <hyprland/src/desktop/Workspace.hpp>
+#include <hyprutils/utils/ScopeGuard.hpp>
 #include <string_view>
 
 #include <cstdio>
@@ -180,6 +181,23 @@ static float resolveAnimDuration(const std::string& path, float ruleOverride) {
     if (cs && cs->progressLoc >= 0) warnMissingDuration(path, cs->sourceMtime);
 
     return DEFAULT_ANIM_DURATION;
+}
+
+// The same precedence without a GL context, for callers that run inside a
+// wayland event handler rather than a draw. Never warns: the draw path is where
+// a missing `@duration` gets noticed, and toasting from here would fire a second
+// time for the same shader. `overlay` reports the shader's `// @overlay`, which
+// decides whether the plugin owns the close clock at all. False when the source
+// can't be read, which the caller treats as "no usable close animation".
+static bool resolveAnimDurationNoGL(const std::string& path, float ruleOverride, float& duration, bool& overlay) {
+    float declared = -1.0f;
+    if (!declaredAnimTiming(path, declared, overlay)) return false;
+
+    if (ruleOverride > 0.0f)     duration = std::min(ruleOverride, MAX_ANIM_DURATION);
+    else if (declared > 0.0f)    duration = std::min(declared, MAX_ANIM_DURATION);
+    else                         duration = DEFAULT_ANIM_DURATION;
+
+    return true;
 }
 
 // Open animation for a live window. Returns the shader to use and sets the
@@ -1849,6 +1867,196 @@ CBox hkLayerFadeoutRenderBox(void* thisptr) {
     return ((TFadeoutRenderBox)g_pLayerFadeoutRenderBoxHook->m_original)(thisptr);
 }
 
+// --- CLOSE-DRIVEN MOVE RETIMING ---
+// Rationale lives on g_mRetimedMoves in Globals.hpp. The mechanics are here.
+
+void capturePreCloseGoals(Desktop::View::CWindow* closing) {
+    g_preCloseSnapshot.closing = closing;
+    g_preCloseSnapshot.goals.clear();
+
+    if (!closing) return;
+
+    // GOAL, not CURRENT: a window already in motion has a current position that
+    // changes every frame, so only the goal can say whether *this* close is what
+    // redirected it.
+    for (const auto& w : Desktop::windowState()->windows()) {
+        if (!w || !w->m_isMapped || w.get() == closing) continue;
+        g_preCloseSnapshot.goals[w.get()] = PreCloseGoal{
+            .pos  = w->position(Desktop::View::IGeometric::GEOMETRIC_GOAL),
+            .size = w->size(Desktop::View::IGeometric::GEOMETRIC_GOAL),
+        };
+    }
+}
+
+static void clearPreCloseGoals() {
+    g_preCloseSnapshot.closing = nullptr;
+    g_preCloseSnapshot.goals.clear();
+}
+
+// A copy of windowsMove with only the speed replaced, so the survivors keep the
+// user's bezier, style and enabled flag and change nothing but how long they
+// take. pValues/pParentAnimation point at the copy itself, which is the shape
+// CAnimationConfigTree::createNode gives a root node.
+static Hyprutils::Memory::CSharedPointer<Hyprutils::Animation::SAnimationPropertyConfig>
+makeRetimedMoveConfig(float durationSec) {
+    if (!Config::animationTree() || !Config::animationTree()->nodeExists("windowsMove")) return nullptr;
+
+    const auto MOVE = Config::animationTree()->getAnimationPropertyConfig("windowsMove");
+    if (!MOVE || !MOVE->pValues) return nullptr;
+
+    // internalSpeed is in deciseconds — the literal 7 in
+    // `animation = windowsMove, 1, 7, default`. getPercent() divides by it every
+    // frame, so it must stay comfortably positive; the shader duration is already
+    // clamped to (0, MAX_ANIM_DURATION] upstream, and the floor here only guards
+    // against a caller that skipped that.
+    const float speedDs = std::max(durationSec * 10.0f, 0.1f);
+
+    auto cfg = Hyprutils::Memory::makeShared<Hyprutils::Animation::SAnimationPropertyConfig>();
+    *cfg                  = *MOVE->pValues;
+    cfg->internalSpeed    = speedDs;
+    cfg->overridden       = true;
+    cfg->pValues          = cfg;
+    cfg->pParentAnimation = cfg;
+    return cfg;
+}
+
+void restoreRetimedMove(Desktop::View::CWindow* raw) {
+    auto it = g_mRetimedMoves.find(raw);
+    if (it == g_mRetimedMoves.end()) return;
+
+    // Walk the live list rather than dereferencing the key: this also runs from
+    // plugin teardown, where the window may be long gone. Erasing the entry drops
+    // the last reference to the config, which is exactly why the variables have
+    // to be pointed somewhere else first.
+    for (const auto& w : Desktop::windowState()->windows()) {
+        if (w.get() != raw) continue;
+
+        // windowsMove is where Hyprland itself parks a window's position/size
+        // config once it is neither opening nor closing — see
+        // CWindow::setAnimationsToMove() and setVector2DAnimToMove().
+        if (Config::animationTree() && Config::animationTree()->nodeExists("windowsMove")) {
+            const auto MOVE = Config::animationTree()->getAnimationPropertyConfig("windowsMove");
+            if (MOVE) {
+                if (auto& pos = w->positionAnimation(); pos) pos->setConfig(MOVE);
+                if (auto& siz = w->sizeAnimation();     siz) siz->setConfig(MOVE);
+            }
+        }
+        break;
+    }
+
+    g_mRetimedMoves.erase(it);
+}
+
+void restoreAllRetimedMoves() {
+    while (!g_mRetimedMoves.empty())
+        restoreRetimedMove(g_mRetimedMoves.begin()->first);
+}
+
+// Runs once per frame, and does nothing at all in the overwhelmingly common case
+// where nothing is retimed. A window comes off the retimed clock when its reflow
+// has finished, or when something redirected it — a move, a resize, a second
+// close — since at that point the motion on screen is no longer the one the
+// close shader was being matched to. Because the config is read live, handing it
+// back mid-flight simply retimes the remaining travel, which is what a fresh
+// windowsMove assignment would have done anyway.
+void tickRetimedMoves() {
+    if (g_mRetimedMoves.empty()) return;
+
+    const auto& state = Desktop::windowState();
+    if (!state) {
+        g_mRetimedMoves.clear();
+        return;
+    }
+
+    std::vector<Desktop::View::CWindow*> done;
+
+    for (const auto& [raw, retimed] : g_mRetimedMoves) {
+        bool found = false;
+
+        for (const auto& w : state->windows()) {
+            if (w.get() != raw) continue;
+            found = true;
+
+            auto& pos = w->positionAnimation();
+            auto& siz = w->sizeAnimation();
+            if (!pos || !siz) break;
+
+            const bool redirected = pos->goal() != retimed.posGoal || siz->goal() != retimed.sizeGoal;
+            const bool stopped    = !pos->isBeingAnimated() && !siz->isBeingAnimated();
+
+            if (redirected || stopped) done.push_back(raw);
+            break;
+        }
+
+        // The window is gone and window.destroy never reached us. Drop the entry
+        // rather than leave the config alive forever.
+        if (!found) done.push_back(raw);
+    }
+
+    for (auto* raw : done)
+        restoreRetimedMove(raw);
+}
+
+void retimeMovesForClose(Desktop::View::CWindow* closing, float durationSec) {
+    // A nested close clobbered the snapshot, or there never was one. Either way
+    // there is nothing trustworthy to compare against, so leave vanilla timing.
+    if (!closing || g_preCloseSnapshot.closing != closing) {
+        clearPreCloseGoals();
+        return;
+    }
+
+    auto cfg = makeRetimedMoveConfig(durationSec);
+    if (!cfg) {
+        clearPreCloseGoals();
+        return;
+    }
+
+    for (const auto& w : Desktop::windowState()->windows()) {
+        // The closing window is already unmapped by this point (unmapWindow drops
+        // m_isMapped well before it builds the fadeout), so it never reaches the
+        // body — and it must not, since its own variables are on windowsOut.
+        if (!w || !w->m_isMapped || w.get() == closing) continue;
+
+        auto snap = g_preCloseSnapshot.goals.find(w.get());
+        if (snap == g_preCloseSnapshot.goals.end()) continue; // mapped after the snapshot
+
+        if (w->position(Desktop::View::IGeometric::GEOMETRIC_GOAL) == snap->second.pos &&
+            w->size(Desktop::View::IGeometric::GEOMETRIC_GOAL)     == snap->second.size)
+            continue; // this close did not move it
+
+        auto& pos = w->positionAnimation();
+        auto& siz = w->sizeAnimation();
+        if (!pos || !siz) continue;
+
+        // Nothing to retime if the move was warped rather than animated — a
+        // disabled windowsMove, or a window that was already at its new goal.
+        if (!pos->isBeingAnimated() && !siz->isBeingAnimated()) continue;
+
+        // Retiming after the animation has begun is not a compromise: the config
+        // is read through a CWeakPointer on every getPercent(), and the assignment
+        // that started these happened microseconds ago inside the same
+        // unmapWindow call, so the curve restarts against the new speed with
+        // nothing visible elapsed.
+        //
+        // Both variables or neither. They share one config so they share one
+        // duration; retiming position alone would let a survivor finish sliding
+        // before it finished growing, which reads as a shear.
+        pos->setConfig(cfg);
+        siz->setConfig(cfg);
+
+        // The goals are remembered, not watched with a callback — see RetimedMove
+        // in Globals.hpp for why nothing of ours may be installed on a Hyprland
+        // object. tickRetimedMoves() compares against these every frame.
+        g_mRetimedMoves[w.get()] = RetimedMove{
+            .config   = cfg,
+            .posGoal  = pos->goal(),
+            .sizeGoal = siz->goal(),
+        };
+    }
+
+    clearPreCloseGoals();
+}
+
 // --- V0.56 HOOK: Desktop::CWindowFadeout::create ---
 // The one place where a fadeout and the window it came from are both in scope.
 // We tag the fadeout with that window's close shader; everything afterwards keys
@@ -1861,10 +2069,32 @@ hkFadeoutCreate(PHLWINDOW window, Hyprutils::Memory::CSharedPointer<Render::IFra
 
     pruneFadeoutAnims();
 
+    // Drop the pre-close snapshot on every path out of here. It is only valid for
+    // the close currently unwinding, and a window that produced no fadeout at all
+    // (noAnim, or nothing rendered it) never reaches the retiming below.
+    Hyprutils::Utils::CScopeGuard preCloseGuard([] { clearPreCloseGoals(); });
+
     if (!result || !window) return result;
 
     auto it = g_mWindowRuleShaders.find(window.get());
     if (it == g_mWindowRuleShaders.end() || it->second.closeAnim.empty()) return result;
+
+    // Give the reflow this close caused the close shader's own duration, so the
+    // survivor settles on the frame the snapshot goes. This runs here rather than
+    // around the layout detach because unmapWindow does the detach 60 lines
+    // earlier in this same call: the survivors are already animating, and an
+    // animated variable reads its speed live, so handing them a config now is
+    // indistinguishable from having handed it to them then.
+    {
+        float dur     = 0.0f;
+        bool  overlay = false;
+        // `// @overlay` means the shader composites with Hyprland's own close
+        // rather than replacing it, so windowsOut is still the real close clock
+        // and vanilla's reflow already agrees with it. Retiming there would
+        // desync the two rather than sync them.
+        if (resolveAnimDurationNoGL(it->second.closeAnim, it->second.closeAnimDuration, dur, overlay) && !overlay)
+            retimeMovesForClose(window.get(), dur);
+    }
 
     // Derived-to-base conversion, not a reinterpret: IFadeout has a virtual base,
     // so the compiler has to apply the right offset for the key to match what
