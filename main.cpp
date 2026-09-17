@@ -23,6 +23,7 @@ std::unordered_map<Desktop::View::CWindow*, MotionRecord> g_mWindowMotion;
 std::unordered_map<Desktop::View::CWindow*, OneShotAnim>  g_mWindowOneShots;
 std::unordered_map<Desktop::View::CWindow*, RetimedMove> g_mRetimedMoves;
 PreCloseSnapshot                                      g_preCloseSnapshot;
+PendingLayerRetime                                    g_pendingLayerRetime;
 CFunctionHook*                                        g_pGLDrawTexHook          = nullptr;
 CFunctionHook*                                        g_pUseShaderHook          = nullptr;
 CFunctionHook*                                        g_pFadeoutCreateHook      = nullptr;
@@ -339,7 +340,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     // close shader is known; see retimeMovesForClose.
     g_Listeners.push_back(Event::bus()->m_events.window.close.listen([](PHLWINDOW window) {
         if (!window) return;
-        try { capturePreCloseGoals(window.get()); } catch (...) {}
+        try { capturePreCloseGoals(window.get(), window.get()); } catch (...) {}
     }));
 
     // Same for layer surfaces — bars, notifications, rofi/wofi. Layers have no
@@ -359,6 +360,12 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_Listeners.push_back(Event::bus()->m_events.layer.closed.listen([](PHLLS layer) {
         if (!layer) return;
         g_mLayerOpenTimes.erase(layer.get());
+        // Emitted at the top of CLayerSurface::onUnmap, before the exclusive
+        // zone is given up — so this is the last moment the tiled windows can be
+        // measured as the layer left them. An exclusive-zone layer closing
+        // reflows them exactly the way a tiled window close does; a layer that
+        // reserved nothing moves nothing, and the snapshot costs one walk.
+        try { capturePreCloseGoals(layer.get()); } catch (...) {}
     }));
 
     // Seed the cache from the current focus: window.active only fires on a
@@ -432,8 +439,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         // died with the window, so there is nothing left to point back at
         // windowsMove.
         g_mRetimedMoves.erase(rawWin);
-        if (g_preCloseSnapshot.closing == rawWin) {
-            g_preCloseSnapshot.closing = nullptr;
+        if (g_preCloseSnapshot.owner == rawWin) {
+            g_preCloseSnapshot.owner = nullptr;
             g_preCloseSnapshot.goals.clear();
         }
         g_preCloseSnapshot.goals.erase(rawWin);
@@ -544,8 +551,9 @@ APICALL EXPORT void PLUGIN_EXIT() {
     // left pointing at a freed config would stop animating for the rest of the
     // session rather than merely finish this move on the wrong clock.
     restoreAllRetimedMoves();
-    g_preCloseSnapshot.closing = nullptr;
+    g_preCloseSnapshot.owner = nullptr;
     g_preCloseSnapshot.goals.clear();
+    g_pendingLayerRetime = PendingLayerRetime{};
     // Any fadeout we were holding open falls back to Hyprland's own `done` as
     // soon as the hooks come off below.
     g_mFadeoutAnims.clear();

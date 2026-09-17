@@ -604,27 +604,48 @@ struct RetimedMove {
 };
 extern std::unordered_map<Desktop::View::CWindow*, RetimedMove> g_mRetimedMoves;
 
-// Where every other window was heading at `window.close`, captured before the
-// layout detaches the closing window so the reflow it causes can be told apart
-// from motion that was already under way. Single-slot: window.close and the
-// fadeout's creation are 60-odd lines apart in the same CWindow::unmapWindow
-// call, with no chance to interleave. `closing` tags the owner anyway, so if a
-// nested close ever did clobber it the outer one simply declines to retime.
+// Where every other window was heading when the close began, captured before
+// anything reflows so the motion that close caused can be told apart from motion
+// that was already under way. Single-slot; `owner` tags whose close it belongs
+// to (a CWindow* or a CLayerSurface*, hence void*), so if anything ever did
+// clobber it the original close simply declines to retime rather than retiming
+// the wrong windows.
 struct PreCloseGoal {
     Vector2D pos;
     Vector2D size;
 };
 struct PreCloseSnapshot {
-    Desktop::View::CWindow*                                   closing = nullptr;
+    const void*                                               owner = nullptr;
     std::unordered_map<Desktop::View::CWindow*, PreCloseGoal> goals;
 };
 extern PreCloseSnapshot g_preCloseSnapshot;
 
-void capturePreCloseGoals(Desktop::View::CWindow* closing);
-// Called once per frame from the render hook: puts a window back on windowsMove
-// as soon as its reflow has finished or been superseded.
+// A layer close cannot retime at fadeout-creation time the way a window close
+// can, because CLayerSurface::onUnmap runs in the opposite order: it builds the
+// fadeout and only then calls arrangeLayersForMonitor, which is what recomputes
+// the reserved area and moves the tiled windows. So the layer path arms this and
+// the next frame does the work — by which point the arrange has long since run,
+// since it is synchronous within the same onUnmap call.
+//
+// Deferring costs one frame of reflow at the unretimed speed. That is invisible
+// (~16ms of a 200ms move) and it is read live anyway, so the remaining travel
+// retimes correctly — and it buys not having to hook arrangeLayersForMonitor,
+// which is also reached by monitor changes, layer maps and commits.
+struct PendingLayerRetime {
+    const void* owner    = nullptr;
+    float       duration = 0.0f;
+};
+extern PendingLayerRetime g_pendingLayerRetime;
+
+// `skip` is excluded from the snapshot outright — a closing window is still
+// mapped when its own close fires, and must never be treated as a survivor. A
+// closing layer has no window to skip.
+void capturePreCloseGoals(const void* owner, Desktop::View::CWindow* skip = nullptr);
+// Called once per frame from the render hook: runs any deferred layer retime,
+// then puts windows back on windowsMove as their reflows finish or are
+// superseded.
 void tickRetimedMoves();
-void retimeMovesForClose(Desktop::View::CWindow* closing, float durationSec);
+void retimeMovesForClose(const void* owner, float durationSec, Desktop::View::CWindow* skip = nullptr);
 void restoreRetimedMove(Desktop::View::CWindow* raw);
 void restoreAllRetimedMoves();
 

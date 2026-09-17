@@ -1870,17 +1870,17 @@ CBox hkLayerFadeoutRenderBox(void* thisptr) {
 // --- CLOSE-DRIVEN MOVE RETIMING ---
 // Rationale lives on g_mRetimedMoves in Globals.hpp. The mechanics are here.
 
-void capturePreCloseGoals(Desktop::View::CWindow* closing) {
-    g_preCloseSnapshot.closing = closing;
+void capturePreCloseGoals(const void* owner, Desktop::View::CWindow* skip) {
+    g_preCloseSnapshot.owner = owner;
     g_preCloseSnapshot.goals.clear();
 
-    if (!closing) return;
+    if (!owner) return;
 
     // GOAL, not CURRENT: a window already in motion has a current position that
     // changes every frame, so only the goal can say whether *this* close is what
     // redirected it.
     for (const auto& w : Desktop::windowState()->windows()) {
-        if (!w || !w->m_isMapped || w.get() == closing) continue;
+        if (!w || !w->m_isMapped || w.get() == skip) continue;
         g_preCloseSnapshot.goals[w.get()] = PreCloseGoal{
             .pos  = w->position(Desktop::View::IGeometric::GEOMETRIC_GOAL),
             .size = w->size(Desktop::View::IGeometric::GEOMETRIC_GOAL),
@@ -1889,8 +1889,9 @@ void capturePreCloseGoals(Desktop::View::CWindow* closing) {
 }
 
 static void clearPreCloseGoals() {
-    g_preCloseSnapshot.closing = nullptr;
+    g_preCloseSnapshot.owner = nullptr;
     g_preCloseSnapshot.goals.clear();
+    g_pendingLayerRetime = PendingLayerRetime{};
 }
 
 // A copy of windowsMove with only the speed replaced, so the survivors keep the
@@ -1952,6 +1953,22 @@ void restoreAllRetimedMoves() {
         restoreRetimedMove(g_mRetimedMoves.begin()->first);
 }
 
+// The deferred half of a layer close. Runs on the first frame after
+// CLayerSurface::onUnmap, by which point arrangeLayersForMonitor has recomputed
+// the reserved area and any tiled window it displaced is already moving.
+static void runPendingLayerRetime() {
+    if (!g_pendingLayerRetime.owner) return;
+
+    const auto pending   = g_pendingLayerRetime;
+    g_pendingLayerRetime = PendingLayerRetime{};
+
+    // A layer with no exclusive zone reserves nothing, so the arrange leaves
+    // every goal where it was and the comparison inside finds nothing to retime.
+    // That is the common case — rofi, notifications — and it costs one walk of
+    // the window list.
+    retimeMovesForClose(pending.owner, pending.duration);
+}
+
 // Runs once per frame, and does nothing at all in the overwhelmingly common case
 // where nothing is retimed. A window comes off the retimed clock when its reflow
 // has finished, or when something redirected it — a move, a resize, a second
@@ -1960,6 +1977,10 @@ void restoreAllRetimedMoves() {
 // back mid-flight simply retimes the remaining travel, which is what a fresh
 // windowsMove assignment would have done anyway.
 void tickRetimedMoves() {
+    // A layer's reflow is armed one frame earlier than a window's, so this runs
+    // first and its retimes are picked up by the same pass below.
+    runPendingLayerRetime();
+
     if (g_mRetimedMoves.empty()) return;
 
     const auto& state = Desktop::windowState();
@@ -1997,10 +2018,10 @@ void tickRetimedMoves() {
         restoreRetimedMove(raw);
 }
 
-void retimeMovesForClose(Desktop::View::CWindow* closing, float durationSec) {
-    // A nested close clobbered the snapshot, or there never was one. Either way
+void retimeMovesForClose(const void* owner, float durationSec, Desktop::View::CWindow* skip) {
+    // Another close clobbered the snapshot, or there never was one. Either way
     // there is nothing trustworthy to compare against, so leave vanilla timing.
-    if (!closing || g_preCloseSnapshot.closing != closing) {
+    if (!owner || g_preCloseSnapshot.owner != owner) {
         clearPreCloseGoals();
         return;
     }
@@ -2012,10 +2033,10 @@ void retimeMovesForClose(Desktop::View::CWindow* closing, float durationSec) {
     }
 
     for (const auto& w : Desktop::windowState()->windows()) {
-        // The closing window is already unmapped by this point (unmapWindow drops
+        // A closing window is already unmapped by this point (unmapWindow drops
         // m_isMapped well before it builds the fadeout), so it never reaches the
         // body — and it must not, since its own variables are on windowsOut.
-        if (!w || !w->m_isMapped || w.get() == closing) continue;
+        if (!w || !w->m_isMapped || w.get() == skip) continue;
 
         auto snap = g_preCloseSnapshot.goals.find(w.get());
         if (snap == g_preCloseSnapshot.goals.end()) continue; // mapped after the snapshot
@@ -2128,10 +2149,32 @@ hkLayerFadeoutCreate(PHLLS layer, Hyprutils::Memory::CSharedPointer<Render::IFra
 
     pruneFadeoutAnims();
 
-    if (!result || !layer) return result;
+    // Unlike the window path this does NOT clear the pre-close snapshot on the
+    // way out: the reflow it describes has not happened yet. onUnmap builds this
+    // fadeout and only afterwards calls arrangeLayersForMonitor, so the snapshot
+    // has to survive into the next frame for runPendingLayerRetime to use it.
+    if (!result || !layer) {
+        clearPreCloseGoals();
+        return result;
+    }
 
     const AnimSpec* spec = lookupLayerEntry(g_mLayerCloseAnims, layer->m_namespace);
-    if (!spec || spec->path.empty()) return result;
+    if (!spec || spec->path.empty()) {
+        clearPreCloseGoals();
+        return result;
+    }
+
+    // Arm the deferred retime. A layer only reflows anything if it reserved an
+    // exclusive zone; whether it did is decided by the arrange that has not run
+    // yet, so that question is left to the goal comparison next frame.
+    {
+        float dur     = 0.0f;
+        bool  overlay = false;
+        if (resolveAnimDurationNoGL(spec->path, spec->duration, dur, overlay) && !overlay)
+            g_pendingLayerRetime = PendingLayerRetime{.owner = layer.get(), .duration = dur};
+        else
+            clearPreCloseGoals();
+    }
 
     // m_geometry is monitor-local already — CLayerSurface adds the monitor position
     // to it everywhere it wants a global box — so it only needs scaling, and the
