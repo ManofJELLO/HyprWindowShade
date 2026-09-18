@@ -3,8 +3,8 @@
 #include <hyprland/src/layout/supplementary/DragController.hpp>
 #include <algorithm>
 #include <cmath>
-#include <hyprland/src/desktop/Workspace.hpp>
-#include <hyprland/src/desktop/Workspace.hpp>
+#include <hyprland/src/workspace/HLWorkspace.hpp>
+#include <hyprland/src/workspace/HLWorkspace.hpp>
 #include <hyprutils/utils/ScopeGuard.hpp>
 #include <string_view>
 
@@ -84,7 +84,7 @@ static const std::string* resolveShaderPath(const PHLWINDOW& pWindow, const PHLL
         if (auto it = g_mWindowRuleShaders.find(rawWin); it != g_mWindowRuleShaders.end()) {
             const auto& state      = it->second;
             const bool  isActive   = Desktop::focusState()->isWindowActive(pWindow);
-            const bool  isFloating = rawWin->m_isFloating;
+            const bool  isFloating = rawWin->isFloating();
             if      (isFloating  && !state.floating.empty())  return &state.floating;
             else if (!isFloating && !state.tiled.empty())     return &state.tiled;
             else if (isActive    && !state.active.empty())    return &state.active;
@@ -92,8 +92,8 @@ static const std::string* resolveShaderPath(const PHLWINDOW& pWindow, const PHLL
             else if (!state.fallback.empty())                 return &state.fallback;
         }
 
-        const auto& initClass    = rawWin->m_initialClass;
-        const auto& currentClass = rawWin->m_class;
+        const auto& initClass    = rawWin->metadata().initialAppID();
+        const auto& currentClass = rawWin->metadata().appID();
         auto classIt = g_mWindowClassShaderMap.find(initClass);
         if (classIt == g_mWindowClassShaderMap.end()) classIt = g_mWindowClassShaderMap.find(currentClass);
         if (classIt != g_mWindowClassShaderMap.end()) return &classIt->second;
@@ -920,8 +920,8 @@ static int collectBaseLayers(const PHLWINDOW& pWindow, const PHLLS& pLS, const s
         // opt-out is `+shader_replace:1`, handled by the caller.
         const std::string* classShader = nullptr;
         {
-            const auto& initClass    = rawWin->m_initialClass;
-            const auto& currentClass = rawWin->m_class;
+            const auto& initClass    = rawWin->metadata().initialAppID();
+            const auto& currentClass = rawWin->metadata().appID();
             auto        classIt      = g_mWindowClassShaderMap.find(initClass);
             if (classIt == g_mWindowClassShaderMap.end()) classIt = g_mWindowClassShaderMap.find(currentClass);
             if (classIt != g_mWindowClassShaderMap.end()) classShader = &classIt->second;
@@ -936,7 +936,7 @@ static int collectBaseLayers(const PHLWINDOW& pWindow, const PHLLS& pLS, const s
         if (auto it = g_mWindowRuleShaders.find(rawWin); it != g_mWindowRuleShaders.end()) {
             const auto& state      = it->second;
             const bool  isActive   = Desktop::focusState()->isWindowActive(pWindow);
-            const bool  isFloating = rawWin->m_isFloating;
+            const bool  isFloating = rawWin->isFloating();
 
             // Fullscreen drops EVERYTHING by default — rule layers, class
             // shaders and imperative toggles alike. A fullscreen window is
@@ -1491,7 +1491,7 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
     // by a frozen frame was already invisible and nobody saw it. On a rotated
     // monitor runIntermediateStages declines, our shader is the on-screen draw,
     // and plugin_alpha resolves to 1.0 because a fadeout has no window to ask for
-    // alphaTotal() — so the same frozen frame stayed fully opaque and read as
+    // presentation().alphaTotal() — so the same frozen frame stayed fully opaque and read as
     // "the animation stopped two thirds through and left the window behind".
     //
     // Gated on topIsAnim so a close shader that failed to compile still fades on
@@ -1561,7 +1561,7 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
             // property of putting the finished result on screen, so it is
             // applied once by the top stage — folding it into every layer would
             // compound it (0.5 opacity over three stages would land at 0.125).
-            const float currentAlpha = g_bIntermediatePass ? 1.0f : (contextWindow ? contextWindow->alphaTotal() : 1.0f);
+            const float currentAlpha = g_bIntermediatePass ? 1.0f : (contextWindow ? contextWindow->presentation().alphaTotal() : 1.0f);
             glUniform1f(activeEntry->alphaLoc, currentAlpha);
         }
         if (activeEntry->resolutionLoc >= 0) {
@@ -1611,7 +1611,7 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
             glUniform1f(activeEntry->isActiveLoc, v);
         }
         if (activeEntry->isFloatingLoc >= 0) {
-            const float v = (contextWindow && contextWindow->m_isFloating) ? 1.0f : 0.0f;
+            const float v = (contextWindow && contextWindow->isFloating()) ? 1.0f : 0.0f;
             glUniform1f(activeEntry->isFloatingLoc, v);
         }
         if (activeEntry->isFullscreenLoc >= 0) {
@@ -1637,8 +1637,8 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
             // fully opaque: the dim belongs to the finished result reaching the
             // screen, and folding it into every layer would compound it.
             float tint = 1.0f;
-            if (!g_bIntermediatePass && contextWindow && contextWindow->m_dimPercent)
-                tint = 1.0f - contextWindow->m_dimPercent->value();
+            if (!g_bIntermediatePass && contextWindow && contextWindow->presentation().dimPercent())
+                tint = 1.0f - contextWindow->presentation().dimPercent();
             glUniform1f(activeEntry->dimLoc, std::clamp(tint, 0.0f, 1.0f));
         }
         // --- TRANSFORM UNIFORMS ---
@@ -1883,7 +1883,7 @@ void capturePreCloseGoals(const void* owner, Desktop::View::CWindow* skip) {
     // changes every frame, so only the goal can say whether *this* close is what
     // redirected it.
     for (const auto& w : state->windows()) {
-        if (!w || !w->m_isMapped || w.get() == skip) continue;
+        if (!w || !w->mapped() || w.get() == skip) continue;
         g_preCloseSnapshot.goals[w.get()] = PreCloseGoal{
             .pos  = w->position(Desktop::View::IGeometric::GEOMETRIC_GOAL),
             .size = w->size(Desktop::View::IGeometric::GEOMETRIC_GOAL),
@@ -2088,12 +2088,12 @@ bool retimeMovesForClose(const void* owner, float durationSec, Desktop::View::CW
 
     for (const auto& w : state->windows()) {
         // On the window path the closing window is already unmapped here
-        // (unmapWindow drops m_isMapped well before it builds the fadeout), so
+        // (unmapWindow drops mapped() well before it builds the fadeout), so
         // it never reaches the body — and it must not, since its own variables
         // are on windowsOut. `skip` covers the window whose own close this is,
         // which is still mapped when the snapshot is taken. A layer close has
         // neither, and passes nullptr.
-        if (!w || !w->m_isMapped || w.get() == skip) continue;
+        if (!w || !w->mapped() || w.get() == skip) continue;
 
         auto snap = g_preCloseSnapshot.goals.find(w.get());
         if (snap == g_preCloseSnapshot.goals.end()) continue; // mapped after the snapshot

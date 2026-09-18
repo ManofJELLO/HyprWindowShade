@@ -124,7 +124,7 @@ namespace shadeActions {
         else                                   g_mWindowClassShaderMap[cls] = path;
 
         for (auto& w : Desktop::windowState()->windows())
-            if (w && (w->m_initialClass == cls || w->m_class == cls))
+            if (w && (w->metadata().initialAppID() == cls || w->metadata().appID() == cls))
                 g_pHyprRenderer->damageWindow(w);
     }
 
@@ -135,7 +135,7 @@ namespace shadeActions {
             g_mWindowClassShaderMap[cls] = path;
 
         for (auto& w : Desktop::windowState()->windows())
-            if (w && (w->m_initialClass == cls || w->m_class == cls))
+            if (w && (w->metadata().initialAppID() == cls || w->metadata().appID() == cls))
                 g_pHyprRenderer->damageWindow(w);
     }
 
@@ -428,7 +428,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     g_Listeners.push_back(Event::bus()->m_events.window.floating.listen([](PHLWINDOW window) {
         if (!window) return;
-        latchTransformFlavour(window.get(), window->m_isFloating ? FLAVOUR_FLOAT : FLAVOUR_TILE);
+        latchTransformFlavour(window.get(), window->isFloating() ? FLAVOUR_FLOAT : FLAVOUR_TILE);
         g_pHyprRenderer->damageWindow(window);
     }));
 
