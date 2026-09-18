@@ -28,7 +28,7 @@ authors = ["ManofJELLO"]
 # builds that. Bump the pin when you want a release to reach users, and expect
 # the bump itself to land one commit behind whatever it points at.
 commit_pins = [
-    ["efb50993780079460b0cbed1363e2166a2de1d9f", "2fff00dd5e190e6b5b36ac6e5aa728985be28813"], # 0.56.2
+    ["efb50993780079460b0cbed1363e2166a2de1d9f", "a4c6b8af424a189072427c4c90ef2938e1b481d3"], # 0.56.2
 ]
 
 [HyprWindowShade]
