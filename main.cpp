@@ -32,6 +32,7 @@ CFunctionHook*                                        g_pLayerFadeoutCreateHook 
 CFunctionHook*                                        g_pLayerFadeoutDoneHook   = nullptr;
 CFunctionHook*                                        g_pFadeoutRenderBoxHook      = nullptr;
 CFunctionHook*                                        g_pLayerFadeoutRenderBoxHook = nullptr;
+CFunctionHook*                                        g_pArrangeLayersHook         = nullptr;
 
 // Tracks the most recently activated window so togglewindowshader doesn't have
 // to linear-scan Desktop::windowState()->windows() asking isWindowActive on each.
@@ -320,6 +321,27 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                      CHyprColor(1.0f, 0.7f, 0.2f, 1.0f), 8000.0f);
     }
 
+    // --- V0.56 HOOK 5: arrangeLayersForMonitor (optional) ---
+    // Lets a closing layer's reflow be retimed inside the same onUnmap call that
+    // caused it, rather than a frame later where unrelated motion could be
+    // mistaken for it. Purely additive: without it layer closes keep vanilla
+    // reflow timing and everything else is unaffected.
+    auto  methodsArrange = HyprlandAPI::findFunctionsByName(PHANDLE, "arrangeLayersForMonitor");
+    void* arrangeAddr    = nullptr;
+    for (auto& m : methodsArrange) {
+        if (m.signature.find("13IHyprRenderer23arrangeLayersForMonitor") != std::string::npos) {
+            arrangeAddr = m.address;
+            break;
+        }
+    }
+    if (arrangeAddr) {
+        g_pArrangeLayersHook = HyprlandAPI::createFunctionHook(PHANDLE, arrangeAddr, (void*)&hkArrangeLayersForMonitor);
+        g_pArrangeLayersHook->hook();
+    } else {
+        HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] arrangeLayersForMonitor not found — layer closes won't retime the reflow.",
+                                     CHyprColor(1.0f, 0.7f, 0.2f, 1.0f), 8000.0f);
+    }
+
     // --- LISTENERS ---
     g_Listeners.push_back(Event::bus()->m_events.window.updateRules.listen([](PHLWINDOW window) {
         try { applyShaderRulesSafe(window); } catch (...) {}
@@ -577,6 +599,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
     if (g_pLayerFadeoutDoneHook)   HyprlandAPI::removeFunctionHook(PHANDLE, g_pLayerFadeoutDoneHook);
     if (g_pFadeoutRenderBoxHook)      HyprlandAPI::removeFunctionHook(PHANDLE, g_pFadeoutRenderBoxHook);
     if (g_pLayerFadeoutRenderBoxHook) HyprlandAPI::removeFunctionHook(PHANDLE, g_pLayerFadeoutRenderBoxHook);
+    if (g_pArrangeLayersHook)         HyprlandAPI::removeFunctionHook(PHANDLE, g_pArrangeLayersHook);
 
     HyprlandAPI::removeDispatcher(PHANDLE, "layershader");
     HyprlandAPI::removeDispatcher(PHANDLE, "togglelayershader");

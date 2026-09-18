@@ -1876,10 +1876,13 @@ void capturePreCloseGoals(const void* owner, Desktop::View::CWindow* skip) {
 
     if (!owner) return;
 
+    const auto& state = Desktop::windowState();
+    if (!state) return;
+
     // GOAL, not CURRENT: a window already in motion has a current position that
     // changes every frame, so only the goal can say whether *this* close is what
     // redirected it.
-    for (const auto& w : Desktop::windowState()->windows()) {
+    for (const auto& w : state->windows()) {
         if (!w || !w->m_isMapped || w.get() == skip) continue;
         g_preCloseSnapshot.goals[w.get()] = PreCloseGoal{
             .pos  = w->position(Desktop::View::IGeometric::GEOMETRIC_GOAL),
@@ -1921,52 +1924,99 @@ makeRetimedMoveConfig(float durationSec) {
     return cfg;
 }
 
+// Points a still-live window's position/size back at windowsMove, which is where
+// Hyprland itself parks them once a window is neither opening nor closing — see
+// CWindow::setAnimationsToMove() and setVector2DAnimToMove(). False means the
+// window is still alive and still referencing the retimed config, so the entry
+// that owns that config must NOT be dropped: the variables hold it by
+// CWeakPointer, and releasing the last shared reference under them leaves them
+// unable to animate at all.
+static bool handBackToWindowsMove(Desktop::View::CWindow* raw) {
+    const auto& state = Desktop::windowState();
+    if (!state) return true; // no windows left to point anywhere
+
+    for (const auto& w : state->windows()) {
+        if (w.get() != raw) continue;
+
+        if (!Config::animationTree() || !Config::animationTree()->nodeExists("windowsMove")) return false;
+
+        const auto MOVE = Config::animationTree()->getAnimationPropertyConfig("windowsMove");
+        if (!MOVE) return false;
+
+        if (auto& pos = w->positionAnimation(); pos) pos->setConfig(MOVE);
+        if (auto& siz = w->sizeAnimation();     siz) siz->setConfig(MOVE);
+        return true;
+    }
+
+    return true; // window is gone; its variables went with it
+}
+
 void restoreRetimedMove(Desktop::View::CWindow* raw) {
     auto it = g_mRetimedMoves.find(raw);
     if (it == g_mRetimedMoves.end()) return;
 
     // Walk the live list rather than dereferencing the key: this also runs from
-    // plugin teardown, where the window may be long gone. Erasing the entry drops
-    // the last reference to the config, which is exactly why the variables have
-    // to be pointed somewhere else first.
-    for (const auto& w : Desktop::windowState()->windows()) {
-        if (w.get() != raw) continue;
-
-        // windowsMove is where Hyprland itself parks a window's position/size
-        // config once it is neither opening nor closing — see
-        // CWindow::setAnimationsToMove() and setVector2DAnimToMove().
-        if (Config::animationTree() && Config::animationTree()->nodeExists("windowsMove")) {
-            const auto MOVE = Config::animationTree()->getAnimationPropertyConfig("windowsMove");
-            if (MOVE) {
-                if (auto& pos = w->positionAnimation(); pos) pos->setConfig(MOVE);
-                if (auto& siz = w->sizeAnimation();     siz) siz->setConfig(MOVE);
-            }
-        }
-        break;
-    }
+    // plugin teardown, where the window may be long gone.
+    if (!handBackToWindowsMove(raw)) return; // keep the config alive and retry
 
     g_mRetimedMoves.erase(it);
 }
 
 void restoreAllRetimedMoves() {
-    while (!g_mRetimedMoves.empty())
-        restoreRetimedMove(g_mRetimedMoves.begin()->first);
+    // Drained by move rather than by repeatedly restoring the first entry, so
+    // teardown terminates even if a hand-back cannot be performed. At this point
+    // the plugin is going away regardless: a variable still pointing at one of
+    // these configs would be left with an expired weak pointer, which reads as
+    // "not enabled" and warps rather than crashing.
+    auto pending = std::move(g_mRetimedMoves);
+    g_mRetimedMoves.clear();
+
+    for (const auto& [raw, retimed] : pending)
+        handBackToWindowsMove(raw);
 }
 
-// The deferred half of a layer close. Runs on the first frame after
-// CLayerSurface::onUnmap, by which point arrangeLayersForMonitor has recomputed
-// the reserved area and any tiled window it displaced is already moving.
+// The second half of a layer close, run from the arrange hook — still inside
+// CLayerSurface::onUnmap, so nothing else can have moved a window since the goals
+// were captured.
+//
+// onUnmap reaches arrangeLayersForMonitor TWICE, measured ~0.1ms apart: the first
+// pass still has the zone reserved and leaves every goal alone, the second is the
+// one that actually reflows. So the arm is only spent once a retime really
+// happened; a pass that changes nothing leaves it armed for the next one. A layer
+// that reserved nothing never spends it at all, which is what the frame-boundary
+// drop below is for.
 static void runPendingLayerRetime() {
     if (!g_pendingLayerRetime.owner) return;
 
-    const auto pending   = g_pendingLayerRetime;
-    g_pendingLayerRetime = PendingLayerRetime{};
+    if (!retimeMovesForClose(g_pendingLayerRetime.owner, g_pendingLayerRetime.duration))
+        return;
 
-    // A layer with no exclusive zone reserves nothing, so the arrange leaves
-    // every goal where it was and the comparison inside finds nothing to retime.
-    // That is the common case — rofi, notifications — and it costs one walk of
-    // the window list.
-    retimeMovesForClose(pending.owner, pending.duration);
+    g_pendingLayerRetime = PendingLayerRetime{};
+    clearPreCloseGoals();
+}
+
+// --- V0.56 HOOK: Render::IHyprRenderer::arrangeLayersForMonitor ---
+typedef void (*TArrangeLayers)(void*, const MONITORID&);
+
+void hkArrangeLayersForMonitor(void* thisptr, const MONITORID& id) {
+    ((TArrangeLayers)g_pArrangeLayersHook->m_original)(thisptr, id);
+
+    // Only a layer close that declared a shader arms this, so every other caller
+    // — monitor changes, layer maps, commits — falls straight through.
+    runPendingLayerRetime();
+}
+
+// An arm must never outlive the close that created it. Every arrange it cares
+// about happens inside CLayerSurface::onUnmap, which runs to completion long
+// before a frame is drawn — so anything still armed here belongs to a layer that
+// reserved nothing, or to a compositor with no arrange hook installed. Dropping
+// it at the frame boundary is what keeps "whose goal changed" honest: the
+// comparison can only ever span one close's own call stack, never an event loop
+// iteration in which a window map or a movewindow could be mistaken for it.
+static void dropStaleLayerArm() {
+    if (!g_pendingLayerRetime.owner) return;
+    g_pendingLayerRetime = PendingLayerRetime{};
+    clearPreCloseGoals();
 }
 
 // Runs once per frame, and does nothing at all in the overwhelmingly common case
@@ -1977,12 +2027,12 @@ static void runPendingLayerRetime() {
 // back mid-flight simply retimes the remaining travel, which is what a fresh
 // windowsMove assignment would have done anyway.
 void tickRetimedMoves() {
-    // A layer's reflow is armed one frame earlier than a window's, so this runs
-    // first and its retimes are picked up by the same pass below.
-    runPendingLayerRetime();
+    dropStaleLayerArm();
 
     if (g_mRetimedMoves.empty()) return;
 
+    // No window state means no variables left to hand back; the entries would be
+    // restoring into nothing. Drop them and let the configs go with them.
     const auto& state = Desktop::windowState();
     if (!state) {
         g_mRetimedMoves.clear();
@@ -2000,7 +2050,14 @@ void tickRetimedMoves() {
 
             auto& pos = w->positionAnimation();
             auto& siz = w->sizeAnimation();
-            if (!pos || !siz) break;
+            if (!pos || !siz) {
+                // Nothing left to hand back, but the entry still has to go —
+                // leaving it would pin the config for the rest of the session and
+                // never return the window to windowsMove if the variables come
+                // back.
+                done.push_back(raw);
+                break;
+            }
 
             const bool redirected = pos->goal() != retimed.posGoal || siz->goal() != retimed.sizeGoal;
             const bool stopped    = !pos->isBeingAnimated() && !siz->isBeingAnimated();
@@ -2018,24 +2075,24 @@ void tickRetimedMoves() {
         restoreRetimedMove(raw);
 }
 
-void retimeMovesForClose(const void* owner, float durationSec, Desktop::View::CWindow* skip) {
+bool retimeMovesForClose(const void* owner, float durationSec, Desktop::View::CWindow* skip) {
     // Another close clobbered the snapshot, or there never was one. Either way
     // there is nothing trustworthy to compare against, so leave vanilla timing.
-    if (!owner || g_preCloseSnapshot.owner != owner) {
-        clearPreCloseGoals();
-        return;
-    }
+    if (!owner || g_preCloseSnapshot.owner != owner) return false;
 
-    auto cfg = makeRetimedMoveConfig(durationSec);
-    if (!cfg) {
-        clearPreCloseGoals();
-        return;
-    }
+    const auto& state = Desktop::windowState();
+    auto        cfg   = makeRetimedMoveConfig(durationSec);
+    if (!state || !cfg) return false;
 
-    for (const auto& w : Desktop::windowState()->windows()) {
-        // A closing window is already unmapped by this point (unmapWindow drops
-        // m_isMapped well before it builds the fadeout), so it never reaches the
-        // body — and it must not, since its own variables are on windowsOut.
+    bool retimedAny = false;
+
+    for (const auto& w : state->windows()) {
+        // On the window path the closing window is already unmapped here
+        // (unmapWindow drops m_isMapped well before it builds the fadeout), so
+        // it never reaches the body — and it must not, since its own variables
+        // are on windowsOut. `skip` covers the window whose own close this is,
+        // which is still mapped when the snapshot is taken. A layer close has
+        // neither, and passes nullptr.
         if (!w || !w->m_isMapped || w.get() == skip) continue;
 
         auto snap = g_preCloseSnapshot.goals.find(w.get());
@@ -2054,10 +2111,12 @@ void retimeMovesForClose(const void* owner, float durationSec, Desktop::View::CW
         if (!pos->isBeingAnimated() && !siz->isBeingAnimated()) continue;
 
         // Retiming after the animation has begun is not a compromise: the config
-        // is read through a CWeakPointer on every getPercent(), and the assignment
-        // that started these happened microseconds ago inside the same
-        // unmapWindow call, so the curve restarts against the new speed with
-        // nothing visible elapsed.
+        // is read through a CWeakPointer on every getPercent(), so the curve
+        // simply reprices against the new speed. How long it has been running by
+        // then differs by path — microseconds for a window close, which retimes
+        // inside the same unmapWindow call that started the move, and up to one
+        // frame for a layer close, which cannot run until the arrange has. Both
+        // are far inside a single frame of the move they are retiming.
         //
         // Both variables or neither. They share one config so they share one
         // duration; retiming position alone would let a survivor finish sliding
@@ -2073,9 +2132,10 @@ void retimeMovesForClose(const void* owner, float durationSec, Desktop::View::CW
             .posGoal  = pos->goal(),
             .sizeGoal = siz->goal(),
         };
+        retimedAny = true;
     }
 
-    clearPreCloseGoals();
+    return retimedAny;
 }
 
 // --- V0.56 HOOK: Desktop::CWindowFadeout::create ---

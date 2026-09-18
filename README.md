@@ -1008,6 +1008,36 @@ Two consequences worth knowing:
   you don't have to match your config's fade-out animation. If Hyprland's fadeout
   animation is disabled entirely, no snapshot is created and close animations won't run.
 
+### The reflow is timed to your shader
+
+Closing a tiled window frees its tile, and the neighbours slide into it on
+`animation = windowsMove`. Vanilla keeps those two in step for free: `windowsOut` and
+`windowsMove` both inherit from `windows`, and an un-overridden child resolves to its
+parent's values, so on a stock config they are literally the same setting and cannot
+disagree.
+
+A `shader_close:` shader is the one close duration your config knows nothing about, so it
+breaks that. A 1.5s dissolve over a 0.2s reflow spends most of itself playing across a
+workspace that settled a second ago.
+
+So **a close shader's `@duration` becomes the reflow's duration too**, and the two end
+together: the neighbour lands on the frame the snapshot vanishes. Specifics:
+
+- Only windows the close actually displaced are affected, and only for that one move.
+  They go back on `windowsMove` the moment it finishes.
+- A window with no `shader_close:` is never touched, so anything without a close shader
+  keeps vanilla timing exactly.
+- `// @overlay` opts out. There Hyprland's own `windowsOut` is still the real close
+  clock, so vanilla's reflow already agrees with it and retiming would pull them apart.
+- If something redirects a window mid-reflow — you move it, open another window, close a
+  second one — it reverts to `windowsMove` immediately rather than finishing on the
+  close shader's clock.
+- The same applies to a **layer** with an exclusive zone. A bar closing gives its
+  reserved space back to the tiled windows, and a `layercloseanim` shader times that
+  reflow the same way. A layer that reserves nothing moves nothing, so it changes nothing.
+
+If you want the old behaviour for a particular shader, `// @overlay` is the switch.
+
 ### The snapshot covers the whole monitor
 
 This is the one real difference between writing an open animation and writing a close

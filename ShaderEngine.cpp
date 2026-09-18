@@ -351,6 +351,17 @@ CompiledShader* getOrCompileShader(const std::string& shaderPath) {
 // than per draw. Returns false only when the source cannot be read at all, which
 // the caller treats as "no close animation".
 bool declaredAnimTiming(const std::string& shaderPath, float& duration, bool& overlay) {
+    // A shader already known not to compile has no animation to time anything
+    // against, so report it as unusable rather than reading a duration out of it.
+    // Without this a close shader with a GLSL typo — which draws nothing at all,
+    // since it never reaches the stack — would still stretch every survivor's
+    // reflow to its declared duration, turning a broken effect into a workspace
+    // that reflows in slow motion. Same mtime rule as the success cache: once the
+    // file is saved again the entry stops matching and the shader gets another go.
+    if (auto fit = g_mFailedShaderMtimes.find(shaderPath); fit != g_mFailedShaderMtimes.end()) {
+        if (fit->second == fileMtime(shaderPath)) return false;
+    }
+
     // The compiled entry is only trustworthy while it still matches the file.
     // Unlike the draw path there is no throttle to justify here: this runs once
     // per close, not per surface per frame, and serving a stale directive would

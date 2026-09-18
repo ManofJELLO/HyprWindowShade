@@ -624,18 +624,34 @@ extern PreCloseSnapshot g_preCloseSnapshot;
 // can, because CLayerSurface::onUnmap runs in the opposite order: it builds the
 // fadeout and only then calls arrangeLayersForMonitor, which is what recomputes
 // the reserved area and moves the tiled windows. So the layer path arms this and
-// the next frame does the work — by which point the arrange has long since run,
-// since it is synchronous within the same onUnmap call.
+// the arrange hook consumes it the instant that call returns.
 //
-// Deferring costs one frame of reflow at the unretimed speed. That is invisible
-// (~16ms of a 200ms move) and it is read live anyway, so the remaining travel
-// retimes correctly — and it buys not having to hook arrangeLayersForMonitor,
-// which is also reached by monitor changes, layer maps and commits.
+// It has to be that hook and not the next frame. The whole method here is "whose
+// goal changed", and that only means "this close moved it" while nothing else
+// can have run in between. The window path gets that for free — capture and
+// compare are both inside one unmapWindow call. Waiting for a frame would open a
+// full event-loop iteration in which a window mapping, a `movewindow`, or a
+// workspace change could move something and have it charged to the layer; worse,
+// on an idle or DPMS-off output no frame arrives at all and the comparison runs
+// against arbitrarily stale goals. Hooking the arrange closes the gap completely.
+//
+// onUnmap reaches the arrange twice — the first pass still has the zone reserved
+// and moves nothing — so the arm is spent only once a retime actually happens,
+// and is dropped outright at the next frame boundary if it never does.
 struct PendingLayerRetime {
     const void* owner    = nullptr;
     float       duration = 0.0f;
 };
 extern PendingLayerRetime g_pendingLayerRetime;
+
+// --- V0.56 HOOK: Render::IHyprRenderer::arrangeLayersForMonitor ---
+// The reflow a closing layer causes: it recomputes the monitor's reserved area
+// and ends in invalidateMonitorGeometries. Gated entirely on a layer close
+// having armed g_pendingLayerRetime, because monitor changes, layer maps and
+// commits reach this too. Optional, like the fadeout hooks — without it layer
+// closes simply don't retime, and window closes are unaffected.
+void hkArrangeLayersForMonitor(void* thisptr, const MONITORID& id);
+extern CFunctionHook* g_pArrangeLayersHook;
 
 // `skip` is excluded from the snapshot outright — a closing window is still
 // mapped when its own close fires, and must never be treated as a survivor. A
@@ -645,7 +661,9 @@ void capturePreCloseGoals(const void* owner, Desktop::View::CWindow* skip = null
 // then puts windows back on windowsMove as their reflows finish or are
 // superseded.
 void tickRetimedMoves();
-void retimeMovesForClose(const void* owner, float durationSec, Desktop::View::CWindow* skip = nullptr);
+// True when it actually retimed something, which is how the layer path tells the
+// no-op first arrange from the real one.
+bool retimeMovesForClose(const void* owner, float durationSec, Desktop::View::CWindow* skip = nullptr);
 void restoreRetimedMove(Desktop::View::CWindow* raw);
 void restoreAllRetimedMoves();
 
