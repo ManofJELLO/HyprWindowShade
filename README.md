@@ -13,11 +13,12 @@ Rather not edit the config by hand? [HyprWindowShade-GUI](https://github.com/Man
 Four of the effects, in order: [reading mode](#keybind-examples) toggled onto Chrome by
 class, [pixelate](#layer-shaders) toggled onto the `mpvpaper` wallpaper layer, rofi
 opening and closing with its own
-[layer animations](#layer-surfaces-rofiwofi-notifications-bars), and a jelly
-[wobble](#move-and-resize-animations) as a terminal is moved and resized. The glitch on
-the unfocused windows runs throughout.
+[layer animations](#layer-surfaces-rofiwofi-notifications-bars), and Hyprland's own
+[wobble](#hyprlands-wobble) on a glitching terminal as it is moved and resized — the
+plugin's shading rides along on the deformed window. The glitch on the unfocused
+windows runs throughout.
 
-The GIF is cut down and dithered to keep the page light. The full 31s reel at 1280p is
+The GIF is cut down and dithered to keep the page light. The full 28s reel at 1280p is
 [`docs/demo.mp4`](docs/demo.mp4) — GitHub will not play it inline, so that link
 downloads it.
 
@@ -240,6 +241,12 @@ Layers are applied bottom-to-top in this order:
 | 5 | `+shader_active:` or `+shader_inactive:` |
 | 6 | `+shader_fullscreen:` |
 | 7 | `+shader_open:` / `+shader_close:` |
+| 8 | Hyprland's own `decoration:wobble` and motion blur |
+
+Layer 8 is not the plugin's. Hyprland draws the finished window — every layer above
+already applied — into a buffer of its own and deforms that, so wobble bends the shaded
+window rather than replacing its look. A close animation is the one exception:
+Hyprland never wobbles the snapshot a closing window leaves behind.
 
 Nothing about the shaders themselves has to change for this to work. Each layer
 is a separate GL program that reads the layer below it through its own `tex`
@@ -619,9 +626,9 @@ and a notification are placed by their anchors and stay there, so there is no ve
 to report and `+shader_move:` / `+shader_resize:` have no layer equivalent.
 
 The practical consequence: **a shader that derives its amplitude from velocity is a
-no-op on a layer**, silently. Point `wobble.glsl` at `rofi` and nothing happens — it
-scales its displacement by `peak_velocity`, which is zero, so it renders the surface
-untouched. There is no error, because reading zero from a uniform is not a failure.
+no-op on a layer**, silently. Point a jelly-style shader at `rofi` and nothing
+happens — if it scales its displacement by `peak_velocity`, which is zero, it renders
+the surface untouched. There is no error, because reading zero from a uniform is not a failure.
 
 To get that look on a layer, drive it off `progress` in a `layeropenanim` /
 `layercloseanim` instead — `progress` runs 0 → 1 across the animation and is the layer's
@@ -640,11 +647,24 @@ animation is the clock, so the shader runs for exactly as long as the motion doe
 
 ```lua
 hl.window_rule({
-    name  = "wobble-on-move",
+    name  = "glitch-on-move",
     match = { class = "kitty" },
-    tag   = "+shader_move:/home/USERNAME/.config/hypr/shaders/wobble.glsl",
+    tag   = "+shader_move:/home/USERNAME/.config/hypr/shaders/chromaGlitch.glsl",
 })
 ```
+
+### Hyprland's wobble
+
+For a jelly wobble, use Hyprland's own (0.57 and later) rather than a shader:
+
+```lua
+hl.config({ decoration = { wobble = { enabled = true } } })
+```
+
+It deforms the window's real geometry, so unlike a fragment shader it can overshoot
+the window's box, and it composes with everything here as the
+[last layer of the stack](#stacking). `+shader_move:` is then for what geometry can't
+do — tints, glitches, trails — and both run together on the same move.
 
 ### Only animated transformations trigger them
 
@@ -684,8 +704,8 @@ running, even with `misc:animate_mouse_windowdragging` enabled. So during a drag
 
 ### The settle tail
 
-A move ends abruptly. To keep an effect running after it — so jelly can wobble to a
-stop — declare a tail:
+A move ends abruptly. To keep an effect running after it — so it can ring down rather
+than cut off — declare a tail:
 
 ```glsl
 // @settle 0.45
@@ -701,7 +721,7 @@ An `@<sec>` suffix on a transform rule sets the **settle**, not a duration — t
 no duration to override:
 
 ```lua
-tag = "+shader_move:/path/wobble.glsl@0.6"
+tag = "+shader_move:/path/to/move_effect.glsl@0.6"
 ```
 
 ### Making it deform rather than slide
@@ -727,7 +747,7 @@ vec2  uv     = v_texcoord - dir * ripple * amplitude / surface_size;
 
 ```lua
 hl.window_rule({
-    name  = "wobble-on-workspace",
+    name  = "slide-on-workspace",
     match = { class = "kitty" },
     tag   = "+shader_workspace:/home/USERNAME/.config/hypr/shaders/slide.glsl",
 })
@@ -821,7 +841,8 @@ makes a resize deform instead of slide.
 
 A fragment shader **cannot draw outside the window's box**, so content pushed past an
 edge has to be faded out rather than drawn. The silhouette appears to bend, but true
-corner overshoot would need the drawn quad to be larger than the window.
+corner overshoot would need the drawn quad to be larger than the window — which is
+what [Hyprland's wobble](#hyprlands-wobble) does.
 
 ---
 
