@@ -1115,19 +1115,12 @@ static SP<Render::ITexture> runIntermediateStages(Render::CRenderContext& ctx, C
     const CBox      savedClipBox  = R.clipBox;
     const Vector2D  savedUVTL     = R.primarySurfaceUVTopLeft;
     const Vector2D  savedUVBR     = R.primarySurfaceUVBottomRight;
-    GLint           savedViewport[4] = {0, 0, 0, 0};
-    glGetIntegerv(GL_VIEWPORT, savedViewport);
     // Read the real GL state rather than trusting a cache, but put it back
     // through Hyprland's setters — it caches enable/disable per capability and
     // skips redundant calls, so a raw glEnable behind its back leaves it
     // convinced the state is something it isn't for the rest of the frame.
     const bool      savedScissor = glIsEnabled(GL_SCISSOR_TEST) == GL_TRUE;
     const bool      savedBlend   = glIsEnabled(GL_BLEND) == GL_TRUE;
-    // The framebuffer is restored by raw id: m_data.currentFB is the
-    // tracker, not necessarily what is actually bound, and getting this wrong
-    // means drawing the rest of the frame into our scratch target.
-    GLint           savedFBO = 0;
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &savedFBO);
 
     R.renderModif = {};
     R.clipBox     = {};
@@ -1158,38 +1151,46 @@ static SP<Render::ITexture> runIntermediateStages(Render::CRenderContext& ctx, C
     g_bIntermediatePass         = true;
 
     SP<Render::ITexture> cur = src;
-    for (int i = 0; i < count; ++i) {
-        auto& fb = fbs.fb[i % 2];
+    {
+        // Framebuffer bindings and the viewport go back through Hyprland's own
+        // guard, never a raw glBindFramebuffer. V0.57 caches the bound framebuffer
+        // in CHyprOpenGLImpl, and fb.bind() below updates that cache; a raw restore
+        // put GL back but left the cache naming our stage target. The next guard
+        // Hyprland opened — the blur behind waybar, every frame — saved that stale
+        // name and "restored" it, so the bar drew into our scratch buffer and
+        // vanished from the screen for as long as any shaded surface was visible.
+        Render::GL::CFramebufferBindingGuard fbGuard{g_pHyprRenderer->glBackend()};
+        for (int i = 0; i < count; ++i) {
+            auto& fb = fbs.fb[i % 2];
 
-        fb.bind();
-        Render::GL::g_pHyprOpenGL->setViewport(0, 0, (GLsizei)w, (GLsizei)h);
-        Render::GL::g_pHyprOpenGL->setCapStatus(GL_SCISSOR_TEST, false);
-        // Overwrite rather than blend: the stage output *is* the new texture,
-        // not something composited over what the target happened to hold.
-        Render::GL::g_pHyprOpenGL->blend(false);
+            fb.bind();
+            Render::GL::g_pHyprOpenGL->setViewport(0, 0, (GLsizei)w, (GLsizei)h);
+            Render::GL::g_pHyprOpenGL->setCapStatus(GL_SCISSOR_TEST, false);
+            // Overwrite rather than blend: the stage output *is* the new texture,
+            // not something composited over what the target happened to hold.
+            Render::GL::g_pHyprOpenGL->blend(false);
 
-        g_pCurrentCompiledShader = stages[i];
+            g_pCurrentCompiledShader = stages[i];
 
-        const bool isAnimStage   = (i == animIndex);
-        g_pCurrentAnimProgress   = isAnimStage ? savedProgress : -1.0f;
-        g_pCurrentSettle         = isAnimStage ? savedSettle   : -1.0f;
-        g_pCurrentOneShotKind    = isAnimStage ? savedOneShot   : TRANSFORM_NONE;
+            const bool isAnimStage   = (i == animIndex);
+            g_pCurrentAnimProgress   = isAnimStage ? savedProgress : -1.0f;
+            g_pCurrentSettle         = isAnimStage ? savedSettle   : -1.0f;
+            g_pCurrentOneShotKind    = isAnimStage ? savedOneShot   : TRANSFORM_NONE;
 
-        CHyprOpenGLImpl::STextureRenderData data;
-        data.a        = 1.0f;
-        data.damage   = &R.damage;
-        data.allowDim = false;
-        Render::GL::g_pHyprOpenGL->renderTexture(ctx, cur, box, data);
+            CHyprOpenGLImpl::STextureRenderData data;
+            data.a        = 1.0f;
+            data.damage   = &R.damage;
+            data.allowDim = false;
+            Render::GL::g_pHyprOpenGL->renderTexture(ctx, cur, box, data);
 
-        cur = fb.getTexture();
+            cur = fb.getTexture();
+        }
     }
 
     g_bIntermediatePass    = false;
     g_pCurrentAnimProgress = savedProgress;
     g_pCurrentSettle       = savedSettle;
     g_pCurrentOneShotKind  = savedOneShot;
-
-    glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)savedFBO);
 
     R.currentFB                   = savedFB;
     R.damage                      = savedDamage;
@@ -1198,7 +1199,6 @@ static SP<Render::ITexture> runIntermediateStages(Render::CRenderContext& ctx, C
     R.primarySurfaceUVTopLeft     = savedUVTL;
     R.primarySurfaceUVBottomRight = savedUVBR;
 
-    Render::GL::g_pHyprOpenGL->setViewport(savedViewport[0], savedViewport[1], savedViewport[2], savedViewport[3]);
     Render::GL::g_pHyprOpenGL->setCapStatus(GL_SCISSOR_TEST, savedScissor);
     Render::GL::g_pHyprOpenGL->blend(savedBlend);
 
