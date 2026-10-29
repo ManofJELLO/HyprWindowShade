@@ -26,7 +26,9 @@ using Render::GL::CHyprOpenGLImpl;
 // --- PLUGIN SYSTEM ---
 #include <hyprland/src/plugins/HookSystem.hpp>
 #include <hyprland/src/plugins/PluginAPI.hpp>
-#include <hyprland/src/desktop/view/Window.hpp>
+#include <hyprland/src/desktop/view/window/Window.hpp>
+#include <hyprland/src/desktop/view/window/WindowPresentation.hpp>
+#include <hyprland/src/desktop/view/window/WindowMetadata.hpp>
 #include <hyprland/src/desktop/view/LayerSurface.hpp>
 #include <hyprland/src/desktop/view/View.hpp>
 #include <hyprland/src/desktop/view/WLSurface.hpp>
@@ -57,6 +59,7 @@ using Render::GL::CHyprOpenGLImpl;
 // hook CWindowFadeout::create to learn which window a fadeout belongs to, then
 // match the snapshot texture at draw time.
 #include <hyprland/src/desktop/state/FadingOutState.hpp>
+#include <hyprland/src/render/scene/SceneSelection.hpp>
 #include <hyprland/src/desktop/state/WindowFadeout.hpp>
 #include <hyprland/src/desktop/state/LayerFadeout.hpp>
 #include <hyprland/src/render/Framebuffer.hpp>
@@ -491,6 +494,11 @@ extern PHLLSREF            g_pCurrentRenderLayer;
 // resolve+compile lookup per surface), consumed by hkUseShader so it can apply
 // the shader and push uniforms without doing a second find on g_mCompiledCShaders.
 extern CompiledShader*     g_pCurrentCompiledShader;
+// Render context of the draw in progress. V0.57 moved the per-draw render data
+// off the renderer and into a context threaded through every draw call, and
+// useShader is not handed it — so hkGLDrawTex publishes it for hkUseShader.
+// Only valid while hkGLDrawTex is on the stack; null otherwise.
+extern Render::CRenderContext* g_pCurrentRenderCtx;
 // Progress (0..1) of the one-shot animation covering the surface being drawn,
 // or <0 when none applies. Resolved in hkGLDrawTex, pushed by hkUseShader.
 extern float               g_pCurrentAnimProgress;
@@ -530,7 +538,7 @@ extern float               g_pCurrentRoundPower;
 
 // --- FUNCTION DECLARATIONS ---
 CompiledShader*                             getOrCompileShader(const std::string& shaderPath);
-void                                        hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement> element, const CRegion& damage);
+void                                        hkGLDrawTex(void* thisptr, Render::CRenderContext& ctx, Hyprutils::Memory::CWeakPointer<CTexPassElement> element, const CRegion& damage);
 Hyprutils::Memory::CWeakPointer<CShader>    hkUseShader(CHyprOpenGLImpl* thisptr, Hyprutils::Memory::CWeakPointer<CShader> prog);
 void                                        applyShaderRulesSafe(PHLWINDOW pWindow);
 void                                        latchTransformFlavour(Desktop::View::CWindow* raw, uint8_t flavour);
@@ -539,7 +547,8 @@ void                                        latchTransformFlavour(Desktop::View:
 // window's shader; hkFadeoutDone holds that fadeout open until the shader has
 // had its full duration.
 Hyprutils::Memory::CSharedPointer<Desktop::CWindowFadeout>
-     hkFadeoutCreate(PHLWINDOW window, Hyprutils::Memory::CSharedPointer<Render::IFramebuffer> snapshot, float sourceAlpha);
+     hkFadeoutCreate(PHLWINDOW window, Hyprutils::Memory::CSharedPointer<Render::IFramebuffer> snapshot, float sourceAlpha,
+                     Hyprutils::Memory::CSharedPointer<Render::IFramebuffer> workspaceSnapshot);
 bool hkFadeoutDone(void* thisptr);
 
 // Layer-surface equivalents. CLayerFadeout mirrors CWindowFadeout exactly, and

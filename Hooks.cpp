@@ -3,8 +3,7 @@
 #include <hyprland/src/layout/supplementary/DragController.hpp>
 #include <algorithm>
 #include <cmath>
-#include <hyprland/src/desktop/Workspace.hpp>
-#include <hyprland/src/desktop/Workspace.hpp>
+#include <hyprland/src/workspace/HLWorkspace.hpp>
 #include <hyprutils/utils/ScopeGuard.hpp>
 #include <string_view>
 
@@ -17,6 +16,7 @@
 PHLWINDOWREF        g_pCurrentRenderWindow;
 PHLLSREF            g_pCurrentRenderLayer;
 CompiledShader*     g_pCurrentCompiledShader = nullptr;
+Render::CRenderContext* g_pCurrentRenderCtx  = nullptr;
 float               g_pCurrentAnimProgress   = -1.0f;
 float               g_pCurrentAnimSeed       = -1.0f;
 const MotionRecord* g_pCurrentMotion         = nullptr;
@@ -84,7 +84,7 @@ static const std::string* resolveShaderPath(const PHLWINDOW& pWindow, const PHLL
         if (auto it = g_mWindowRuleShaders.find(rawWin); it != g_mWindowRuleShaders.end()) {
             const auto& state      = it->second;
             const bool  isActive   = Desktop::focusState()->isWindowActive(pWindow);
-            const bool  isFloating = rawWin->m_isFloating;
+            const bool  isFloating = rawWin->isFloating();
             if      (isFloating  && !state.floating.empty())  return &state.floating;
             else if (!isFloating && !state.tiled.empty())     return &state.tiled;
             else if (isActive    && !state.active.empty())    return &state.active;
@@ -92,8 +92,8 @@ static const std::string* resolveShaderPath(const PHLWINDOW& pWindow, const PHLL
             else if (!state.fallback.empty())                 return &state.fallback;
         }
 
-        const auto& initClass    = rawWin->m_initialClass;
-        const auto& currentClass = rawWin->m_class;
+        const auto& initClass    = rawWin->metadata().initialAppID();
+        const auto& currentClass = rawWin->metadata().appID();
         auto classIt = g_mWindowClassShaderMap.find(initClass);
         if (classIt == g_mWindowClassShaderMap.end()) classIt = g_mWindowClassShaderMap.find(currentClass);
         if (classIt != g_mWindowClassShaderMap.end()) return &classIt->second;
@@ -295,8 +295,16 @@ static const std::string* resolveCloseAnim(const SP<Render::ITexture>& tex, PHLM
 
     for (const auto& f : state->fadeouts()) {
         if (!f) continue;
-        const auto fb = f->framebuffer();
-        if (!fb || fb->getTexture().get() != tex.get()) continue;
+        // A window fadeout also carries a second snapshot while a workspace is
+        // being screen-shared (V0.57): the workspace capture draws that one, not
+        // the monitor's, and the close shader has to play in the stream too.
+        // Same monitor-sized geometry, so everything below holds for either.
+        // A layer fadeout hands back its monitor snapshot for both.
+        const auto fb   = f->framebuffer();
+        const auto wsFb = f->framebuffer(Render::eSceneMode::WORKSPACE_WINDOWS);
+        const bool isFb   = fb && fb->getTexture().get() == tex.get();
+        const bool isWsFb = wsFb && wsFb->getTexture().get() == tex.get();
+        if (!isFb && !isWsFb) continue;
 
         auto it = g_mFadeoutAnims.find(f.get());
         if (it == g_mFadeoutAnims.end()) return nullptr;
@@ -920,8 +928,8 @@ static int collectBaseLayers(const PHLWINDOW& pWindow, const PHLLS& pLS, const s
         // opt-out is `+shader_replace:1`, handled by the caller.
         const std::string* classShader = nullptr;
         {
-            const auto& initClass    = rawWin->m_initialClass;
-            const auto& currentClass = rawWin->m_class;
+            const auto& initClass    = rawWin->metadata().initialAppID();
+            const auto& currentClass = rawWin->metadata().appID();
             auto        classIt      = g_mWindowClassShaderMap.find(initClass);
             if (classIt == g_mWindowClassShaderMap.end()) classIt = g_mWindowClassShaderMap.find(currentClass);
             if (classIt != g_mWindowClassShaderMap.end()) classShader = &classIt->second;
@@ -936,7 +944,7 @@ static int collectBaseLayers(const PHLWINDOW& pWindow, const PHLLS& pLS, const s
         if (auto it = g_mWindowRuleShaders.find(rawWin); it != g_mWindowRuleShaders.end()) {
             const auto& state      = it->second;
             const bool  isActive   = Desktop::focusState()->isWindowActive(pWindow);
-            const bool  isFloating = rawWin->m_isFloating;
+            const bool  isFloating = rawWin->isFloating();
 
             // Fullscreen drops EVERYTHING by default — rule layers, class
             // shaders and imperative toggles alike. A fullscreen window is
@@ -993,8 +1001,8 @@ static int collectBaseLayers(const PHLWINDOW& pWindow, const PHLLS& pLS, const s
 //
 // Returns nullptr when the chain can't run, in which case the caller falls back
 // to drawing the top stage alone — degraded, but never broken.
-static SP<Render::ITexture> runIntermediateStages(CompiledShader* const* stages, int count, const SP<Render::ITexture>& src,
-                                                  int animIndex = -1) {
+static SP<Render::ITexture> runIntermediateStages(Render::CRenderContext& ctx, CompiledShader* const* stages, int count,
+                                                  const SP<Render::ITexture>& src, int animIndex = -1) {
     if (count <= 0 || !src || !Render::GL::g_pHyprOpenGL || !g_pHyprRenderer) return nullptr;
 
     // A rotated or flipped source buffer would need the targets' dimensions
@@ -1060,7 +1068,7 @@ static SP<Render::ITexture> runIntermediateStages(CompiledShader* const* stages,
         fb.setImageDescription(src->m_imageDescription);
     }
 
-    auto& R = g_pHyprRenderer->m_renderData;
+    auto& R = ctx.m_data;
 
     // Coordinate space of the projection currently in force. A rotated monitor
     // needs the box transformed to match, and this does not do it — the blit
@@ -1079,7 +1087,23 @@ static SP<Render::ITexture> runIntermediateStages(CompiledShader* const* stages,
     // it just isn't the same enum, and -Wenum-compare is right to say so.
     const auto mon = R.pMonitor.lock();
     if (!mon || mon->m_transform != WL_OUTPUT_TRANSFORM_NORMAL) return nullptr;
-    const Vector2D projSpace = mon->m_pixelSize;
+
+    // The target the projection maps onto is not always the monitor. V0.57
+    // renders a window with a transformer attached — wobble, motion blur — into
+    // a window-sized work buffer under RPT_EXPORT, and every surface of that
+    // window reaches this hook from inside it. Sizing the blit from the monitor
+    // there scaled each stage up by monitor/window, so the shaded window came
+    // out zoomed into its top-left corner for as long as it wobbled. Mirror
+    // IHyprRenderer::projectBoxToTarget instead: the monitor for RPT_MONITOR,
+    // the bound buffer otherwise. RPT_OUTPUT projects through the output's scale
+    // matrix rather than a plain size, so it is declined like a rotation.
+    Vector2D projSpace;
+    switch (R.projectionType) {
+        case Render::RPT_MONITOR: projSpace = mon->m_transformedSize; break;
+        case Render::RPT_EXPORT:
+        case Render::RPT_FB:      projSpace = R.fbSize; break;
+        default:                  return nullptr;
+    }
     if (projSpace.x < 1 || projSpace.y < 1) return nullptr;
 
     // Everything here describes where and how the *window* is being drawn on the
@@ -1099,7 +1123,7 @@ static SP<Render::ITexture> runIntermediateStages(CompiledShader* const* stages,
     // convinced the state is something it isn't for the rest of the frame.
     const bool      savedScissor = glIsEnabled(GL_SCISSOR_TEST) == GL_TRUE;
     const bool      savedBlend   = glIsEnabled(GL_BLEND) == GL_TRUE;
-    // The framebuffer is restored by raw id: m_renderData.currentFB is the
+    // The framebuffer is restored by raw id: m_data.currentFB is the
     // tracker, not necessarily what is actually bound, and getting this wrong
     // means drawing the rest of the frame into our scratch target.
     GLint           savedFBO = 0;
@@ -1114,13 +1138,12 @@ static SP<Render::ITexture> runIntermediateStages(CompiledShader* const* stages,
     R.primarySurfaceUVTopLeft     = Vector2D(-1, -1);
     R.primarySurfaceUVBottomRight = Vector2D(-1, -1);
 
-    // The projection in force belongs to the monitor and was built back in
-    // begin(); it cannot be swapped out this late (projectionType is only read
-    // there, and overwriting targetProjection renders nothing at all). So
-    // rather than fighting it, the blit is expressed in its coordinate space: a
-    // box covering the whole monitor maps to the whole target, and since the
-    // viewport is the framebuffer, that lands the source texture on the
-    // framebuffer 1:1 whatever its own size is.
+    // The projection in force was set up by whoever bound the current target;
+    // it cannot be swapped out this late (overwriting targetProjection renders
+    // nothing at all). So rather than fighting it, the blit is expressed in its
+    // coordinate space: a box covering the whole target maps to the whole
+    // target, and since the viewport is the framebuffer, that lands the source
+    // texture on the framebuffer 1:1 whatever its own size is.
     const CBox box(0.0, 0.0, projSpace.x, projSpace.y);
 
     // Intermediate stages render their finished state: `progress` belongs to the
@@ -1156,7 +1179,7 @@ static SP<Render::ITexture> runIntermediateStages(CompiledShader* const* stages,
         data.a        = 1.0f;
         data.damage   = &R.damage;
         data.allowDim = false;
-        Render::GL::g_pHyprOpenGL->renderTexture(cur, box, data);
+        Render::GL::g_pHyprOpenGL->renderTexture(ctx, cur, box, data);
 
         cur = fb.getTexture();
     }
@@ -1182,10 +1205,16 @@ static SP<Render::ITexture> runIntermediateStages(CompiledShader* const* stages,
     return cur;
 }
 
-// --- V0.56 HOOK: CGLElementRenderer::draw(CTexPassElement, CRegion) ---
-typedef void (*TGLDrawTex)(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement> element, const CRegion& damage);
+// --- V0.57 HOOK: CGLElementRenderer::draw(CRenderContext, CTexPassElement, CRegion) ---
+typedef void (*TGLDrawTex)(void* thisptr, Render::CRenderContext& ctx, Hyprutils::Memory::CWeakPointer<CTexPassElement> element, const CRegion& damage);
 
-void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement> element, const CRegion& damage) {
+void hkGLDrawTex(void* thisptr, Render::CRenderContext& ctx, Hyprutils::Memory::CWeakPointer<CTexPassElement> element, const CRegion& damage) {
+    // Restored on exit rather than cleared, so it can never outlive the draw
+    // that owns it — the context is a reference, not ours to keep.
+    Render::CRenderContext* const prevCtx = g_pCurrentRenderCtx;
+    g_pCurrentRenderCtx                   = &ctx;
+    Hyprutils::Utils::CScopeGuard ctxGuard([prevCtx] { g_pCurrentRenderCtx = prevCtx; });
+
     // V0.56: CRenderPass owns its elements as UP<IPassElement>, so this WP is a
     // weak-over-unique. CWeakPointer::lock() hard-asserts on that case
     // (WeakPtr.hpp:181 -> std::terminate) and takes the whole compositor down on
@@ -1220,7 +1249,7 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
                 if (!pWindow) {
                     const auto type = view->type();
                     if (type == Desktop::View::VIEW_TYPE_SUBSURFACE || type == Desktop::View::VIEW_TYPE_POPUP)
-                        pWindow = g_pHyprRenderer->m_renderData.currentWindow.lock();
+                        pWindow = ctx.m_data.currentWindow.lock();
 
                     // The renderer only publishes currentWindow while it is
                     // walking a window's own tree. A popup snapshotted for its
@@ -1265,7 +1294,7 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
         g_pCurrentMotion         = nullptr;
         g_pCurrentElemSize       = Vector2D(0, 0);
         g_pCurrentWindowRect     = CBox{0.0, 0.0, 1.0, 1.0};
-        ((TGLDrawTex)g_pGLDrawTexHook->m_original)(thisptr, element, damage);
+        ((TGLDrawTex)g_pGLDrawTexHook->m_original)(thisptr, ctx, element, damage);
         return;
     }
 
@@ -1413,7 +1442,7 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
             // The animation is the top stage when there is one; tell the chain
             // so it keeps its progress instead of rendering its finished state.
             const int animIdx = topIsAnim ? nStages - 1 : -1;
-            if (auto composed = runIntermediateStages(stages, offscreen, elem->m_data.tex, animIdx)) {
+            if (auto composed = runIntermediateStages(ctx, stages, offscreen, elem->m_data.tex, animIdx)) {
                 originalTex      = elem->m_data.tex;
                 elem->m_data.tex = composed;
                 nativeFinal      = wantsNativeFinal;
@@ -1512,7 +1541,7 @@ void hkGLDrawTex(void* thisptr, Hyprutils::Memory::CWeakPointer<CTexPassElement>
     const float origElemA = elem ? elem->m_data.a : 1.0f;
     if (ownFade) elem->m_data.a = 1.0f;
 
-    ((TGLDrawTex)g_pGLDrawTexHook->m_original)(thisptr, element, damage);
+    ((TGLDrawTex)g_pGLDrawTexHook->m_original)(thisptr, ctx, element, damage);
 
     // The element belongs to the pass, not to us — put its texture back before
     // anything else in the frame looks at it.
@@ -1561,12 +1590,12 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
             // property of putting the finished result on screen, so it is
             // applied once by the top stage — folding it into every layer would
             // compound it (0.5 opacity over three stages would land at 0.125).
-            const float currentAlpha = g_bIntermediatePass ? 1.0f : (contextWindow ? contextWindow->alphaTotal() : 1.0f);
+            const float currentAlpha = g_bIntermediatePass ? 1.0f : (contextWindow ? contextWindow->presentation().alphaTotal() : 1.0f);
             glUniform1f(activeEntry->alphaLoc, currentAlpha);
         }
         if (activeEntry->resolutionLoc >= 0) {
             Vector2D res(0, 0);
-            if (auto mon = g_pHyprRenderer->m_renderData.pMonitor.lock())
+            if (auto mon = g_pCurrentRenderCtx ? g_pCurrentRenderCtx->m_data.pMonitor.lock() : nullptr)
                 res = mon->m_pixelSize;
             glUniform2f(activeEntry->resolutionLoc, (float)res.x, (float)res.y);
         }
@@ -1611,7 +1640,7 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
             glUniform1f(activeEntry->isActiveLoc, v);
         }
         if (activeEntry->isFloatingLoc >= 0) {
-            const float v = (contextWindow && contextWindow->m_isFloating) ? 1.0f : 0.0f;
+            const float v = (contextWindow && contextWindow->isFloating()) ? 1.0f : 0.0f;
             glUniform1f(activeEntry->isFloatingLoc, v);
         }
         if (activeEntry->isFullscreenLoc >= 0) {
@@ -1637,8 +1666,8 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
             // fully opaque: the dim belongs to the finished result reaching the
             // screen, and folding it into every layer would compound it.
             float tint = 1.0f;
-            if (!g_bIntermediatePass && contextWindow && contextWindow->m_dimPercent)
-                tint = 1.0f - contextWindow->m_dimPercent->value();
+            if (!g_bIntermediatePass && contextWindow)
+                tint = 1.0f - contextWindow->presentation().dimPercent();
             glUniform1f(activeEntry->dimLoc, std::clamp(tint, 0.0f, 1.0f));
         }
         // --- TRANSFORM UNIFORMS ---
@@ -1883,7 +1912,7 @@ void capturePreCloseGoals(const void* owner, Desktop::View::CWindow* skip) {
     // changes every frame, so only the goal can say whether *this* close is what
     // redirected it.
     for (const auto& w : state->windows()) {
-        if (!w || !w->m_isMapped || w.get() == skip) continue;
+        if (!w || !w->mapped() || w.get() == skip) continue;
         g_preCloseSnapshot.goals[w.get()] = PreCloseGoal{
             .pos  = w->position(Desktop::View::IGeometric::GEOMETRIC_GOAL),
             .size = w->size(Desktop::View::IGeometric::GEOMETRIC_GOAL),
@@ -2093,7 +2122,7 @@ bool retimeMovesForClose(const void* owner, float durationSec, Desktop::View::CW
         // are on windowsOut. `skip` covers the window whose own close this is,
         // which is still mapped when the snapshot is taken. A layer close has
         // neither, and passes nullptr.
-        if (!w || !w->m_isMapped || w.get() == skip) continue;
+        if (!w || !w->mapped() || w.get() == skip) continue;
 
         auto snap = g_preCloseSnapshot.goals.find(w.get());
         if (snap == g_preCloseSnapshot.goals.end()) continue; // mapped after the snapshot
@@ -2138,15 +2167,20 @@ bool retimeMovesForClose(const void* owner, float durationSec, Desktop::View::CW
     return retimedAny;
 }
 
-// --- V0.56 HOOK: Desktop::CWindowFadeout::create ---
+// --- V0.57 HOOK: Desktop::CWindowFadeout::create ---
 // The one place where a fadeout and the window it came from are both in scope.
 // We tag the fadeout with that window's close shader; everything afterwards keys
 // off the fadeout, because the window is already gone.
-typedef Hyprutils::Memory::CSharedPointer<Desktop::CWindowFadeout> (*TFadeoutCreate)(PHLWINDOW, Hyprutils::Memory::CSharedPointer<Render::IFramebuffer>, float);
+// V0.57 added `workspaceSnapshot` (window pixels for the workspace scene
+// modes). It has a default argument, but defaults are a call-site convenience —
+// the symbol always takes four, so the hook must too, and pass it on untouched.
+typedef Hyprutils::Memory::CSharedPointer<Desktop::CWindowFadeout> (*TFadeoutCreate)(PHLWINDOW, Hyprutils::Memory::CSharedPointer<Render::IFramebuffer>, float,
+                                                                                     Hyprutils::Memory::CSharedPointer<Render::IFramebuffer>);
 
 Hyprutils::Memory::CSharedPointer<Desktop::CWindowFadeout>
-hkFadeoutCreate(PHLWINDOW window, Hyprutils::Memory::CSharedPointer<Render::IFramebuffer> snapshot, float sourceAlpha) {
-    auto result = ((TFadeoutCreate)g_pFadeoutCreateHook->m_original)(window, snapshot, sourceAlpha);
+hkFadeoutCreate(PHLWINDOW window, Hyprutils::Memory::CSharedPointer<Render::IFramebuffer> snapshot, float sourceAlpha,
+                Hyprutils::Memory::CSharedPointer<Render::IFramebuffer> workspaceSnapshot) {
+    auto result = ((TFadeoutCreate)g_pFadeoutCreateHook->m_original)(window, snapshot, sourceAlpha, workspaceSnapshot);
 
     pruneFadeoutAnims();
 

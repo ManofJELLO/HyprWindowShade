@@ -1,6 +1,6 @@
 #include "Globals.hpp"
 
-// Hyprland (v0.56) links liblua.so.5.5 and /usr/include/lua.h is 5.5; symbols
+// Hyprland (v0.57) links liblua.so.5.5 and /usr/include/lua.h is 5.5; symbols
 // resolve from the host process at dlopen, so we don't link -llua ourselves.
 #include <lua.hpp>
 
@@ -38,48 +38,9 @@ CFunctionHook*                                        g_pArrangeLayersHook      
 // to linear-scan Desktop::windowState()->windows() asking isWindowActive on each.
 static PHLWINDOWREF g_lastActiveWindow;
 
-// --- HELPERS ---
-static inline void trimInPlace(std::string& s) {
-    size_t start = s.find_first_not_of(" \t");
-    if (start == std::string::npos) { s.clear(); return; }
-    s.erase(0, start);
-    while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
-}
-
-// Splits "<key> <value...>" into trimmed (key, value). Returns false if no separator.
-// Recognizes a leading double-quoted key so class names or layer namespaces that
-// contain whitespace work via the .conf dispatchers, matching the per-arg shape
-// Lua callers already get. Escapes inside the quoted string are not supported —
-// keep it to plain whitespace handling, which is all the realistic case needs.
-static bool splitTwo(const std::string& args, std::string& key, std::string& value) {
-    size_t pos = 0;
-    while (pos < args.size() && (args[pos] == ' ' || args[pos] == '\t')) pos++;
-    if (pos >= args.size()) return false;
-
-    size_t keyEnd;
-    if (args[pos] == '"') {
-        const size_t closing = args.find('"', pos + 1);
-        if (closing == std::string::npos) return false;
-        key    = args.substr(pos + 1, closing - pos - 1);
-        keyEnd = closing + 1;
-    } else {
-        const size_t ws = args.find_first_of(" \t", pos);
-        if (ws == std::string::npos) return false;
-        key    = args.substr(pos, ws - pos);
-        keyEnd = ws;
-    }
-
-    if (keyEnd >= args.size()) return false;
-    value = args.substr(keyEnd);
-    trimInPlace(value);
-    return !value.empty();
-}
-
-// --- SHARED DISPATCH/LUA ACTIONS ---
-// Each function below is the canonical body of one shader action. Both the
-// .conf-style dispatcher lambdas (which still parse one string via splitTwo)
-// and the Lua C wrappers (which read separate args from the Lua stack) call
-// these — keeping behavior identical across both call sites.
+// --- SHADER ACTIONS ---
+// Each function below is the canonical body of one shader action, called by
+// the Lua C wrappers further down.
 namespace shadeActions {
     static void setLayerShader(const std::string& ns, const std::string& path) {
         if (path == "clear" || path == "none") g_mLayerNamespaceShaderMap.erase(ns);
@@ -124,7 +85,7 @@ namespace shadeActions {
         else                                   g_mWindowClassShaderMap[cls] = path;
 
         for (auto& w : Desktop::windowState()->windows())
-            if (w && (w->m_initialClass == cls || w->m_class == cls))
+            if (w && (w->metadata().initialAppID() == cls || w->metadata().appID() == cls))
                 g_pHyprRenderer->damageWindow(w);
     }
 
@@ -135,7 +96,7 @@ namespace shadeActions {
             g_mWindowClassShaderMap[cls] = path;
 
         for (auto& w : Desktop::windowState()->windows())
-            if (w && (w->m_initialClass == cls || w->m_class == cls))
+            if (w && (w->metadata().initialAppID() == cls || w->metadata().appID() == cls))
                 g_pHyprRenderer->damageWindow(w);
     }
 
@@ -163,8 +124,9 @@ namespace shadeActions {
 // --- LUA C WRAPPERS ---
 // Registered via HyprlandAPI::addLuaFunction so users on Lua-based Hyprland
 // configs can bind keys like: function() hl.plugin.HyprWindowShade.<name>(...) end
-// (Native Hyprland dispatchers from plugins aren't surfaced to the Lua config
-// layer, per vaxry — Lua functions are the supported workaround.)
+// (Plugin dispatchers aren't surfaced to the Lua config layer, per vaxry, and
+// since 0.57 Lua is the only config format — so these are the plugin's whole
+// action surface.)
 static int luaLayerShader(lua_State* L) {
     shadeActions::setLayerShader(luaL_checkstring(L, 1), luaL_checkstring(L, 2));
     return 0;
@@ -204,7 +166,7 @@ APICALL EXPORT std::string PLUGIN_API_VERSION() { return HYPRLAND_API_VERSION; }
 APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     PHANDLE = handle;
 
-    // --- V0.56 HOOK 1: CGLElementRenderer::draw(CTexPassElement, CRegion) ---
+    // --- V0.57 HOOK 1: CGLElementRenderer::draw(CRenderContext, CTexPassElement, CRegion) ---
     // The concrete, exported method that draws every textured surface element.
     // Hyprland's findFunctionsByName matches the MANGLED `nm -D -j` dump but fills
     // SFunctionMatch::demangled by line index into a second, demangled dump — and its
@@ -428,7 +390,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     g_Listeners.push_back(Event::bus()->m_events.window.floating.listen([](PHLWINDOW window) {
         if (!window) return;
-        latchTransformFlavour(window.get(), window->m_isFloating ? FLAVOUR_FLOAT : FLAVOUR_TILE);
+        latchTransformFlavour(window.get(), window->isFloating() ? FLAVOUR_FLOAT : FLAVOUR_TILE);
         g_pHyprRenderer->damageWindow(window);
     }));
 
@@ -437,8 +399,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     // differentiated CPU-side — a fragment shader has no memory between frames —
     // and doing it here rather than in the draw hook means a window with
     // subsurfaces gets one velocity instead of one per surface.
-    g_Listeners.push_back(Event::bus()->m_events.render.stage.listen([](eRenderStage stage) {
-        if (stage != RENDER_PRE_WINDOWS) return;
+    g_Listeners.push_back(Event::bus()->m_events.render.stage.listen([](const Event::SRenderStageEvent& ev) {
+        if (ev.stage != RENDER_PRE_WINDOWS) return;
         try { updateMotionRecords(); } catch (...) {}
         // Cheap no-op unless a close is currently retiming a reflow.
         try { tickRetimedMoves(); }    catch (...) {}
@@ -468,73 +430,6 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         g_preCloseSnapshot.goals.erase(rawWin);
     }));
 
-    // --- DISPATCHERS (.conf-style — Hyprland's native bind path) ---
-
-    // A dispatcher that can't parse its arguments has to say so: SDispatchResult
-    // defaults to success = true, so returning a bare {} made `hyprctl dispatch
-    // layershader rofi` print "ok" while doing nothing at all.
-
-    HyprlandAPI::addDispatcherV2(PHANDLE, "layershader", [](std::string args) -> SDispatchResult {
-        std::string ns, path;
-        if (!splitTwo(args, ns, path))
-            return SDispatchResult{.success = false, .error = "usage: layershader <namespace> <path|clear|none>"};
-        shadeActions::setLayerShader(ns, path);
-        return SDispatchResult{};
-    });
-
-    HyprlandAPI::addDispatcherV2(PHANDLE, "togglelayershader", [](std::string args) -> SDispatchResult {
-        std::string ns, path;
-        if (!splitTwo(args, ns, path))
-            return SDispatchResult{.success = false, .error = "usage: togglelayershader <namespace> <path>"};
-        shadeActions::toggleLayerShader(ns, path);
-        return SDispatchResult{};
-    });
-
-    HyprlandAPI::addDispatcherV2(PHANDLE, "togglewindowshader", [](std::string path) -> SDispatchResult {
-        trimInPlace(path);
-        if (path.empty())
-            return SDispatchResult{.success = false, .error = "usage: togglewindowshader <path|clear|none>"};
-        shadeActions::toggleWindowShader(path);
-        return SDispatchResult{};
-    });
-
-    HyprlandAPI::addDispatcherV2(PHANDLE, "classshader", [](std::string args) -> SDispatchResult {
-        std::string cls, path;
-        if (!splitTwo(args, cls, path))
-            return SDispatchResult{.success = false, .error = "usage: classshader <class> <path|clear|none>"};
-        shadeActions::setClassShader(cls, path);
-        return SDispatchResult{};
-    });
-
-    HyprlandAPI::addDispatcherV2(PHANDLE, "toggleclassshader", [](std::string args) -> SDispatchResult {
-        std::string cls, path;
-        if (!splitTwo(args, cls, path))
-            return SDispatchResult{.success = false, .error = "usage: toggleclassshader <class> <path>"};
-        shadeActions::toggleClassShader(cls, path);
-        return SDispatchResult{};
-    });
-
-    HyprlandAPI::addDispatcherV2(PHANDLE, "layeropenanim", [](std::string args) -> SDispatchResult {
-        std::string ns, path;
-        if (!splitTwo(args, ns, path))
-            return SDispatchResult{.success = false, .error = "usage: layeropenanim <namespace> <path[@sec]|clear|none>"};
-        shadeActions::setLayerOpenAnim(ns, path);
-        return SDispatchResult{};
-    });
-
-    HyprlandAPI::addDispatcherV2(PHANDLE, "layercloseanim", [](std::string args) -> SDispatchResult {
-        std::string ns, path;
-        if (!splitTwo(args, ns, path))
-            return SDispatchResult{.success = false, .error = "usage: layercloseanim <namespace> <path[@sec]|clear|none>"};
-        shadeActions::setLayerCloseAnim(ns, path);
-        return SDispatchResult{};
-    });
-
-    HyprlandAPI::addDispatcherV2(PHANDLE, "reloadshaders", [](std::string) -> SDispatchResult {
-        shadeActions::reloadShaders();
-        return SDispatchResult{};
-    });
-
     // --- LUA FUNCTIONS (hl.plugin.HyprWindowShade.* — for Lua-based configs) ---
     // Removed automatically on plugin unload (per PluginAPI.hpp), but PLUGIN_EXIT
     // calls removeLuaFunction defensively to keep teardown symmetric.
@@ -550,7 +445,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     // Version is deliberately empty: releases are GitHub tags, and hyprpm ships
     // whatever commit `commit_pins` names. A number maintained here would be a
     // second source of truth that silently drifts from both.
-    return {"HyprWindowShade", "Native CShader Injection (v0.56)", "ManofJELLO", ""};
+    return {"HyprWindowShade", "Native CShader Injection (v0.57)", "ManofJELLO", ""};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
@@ -600,15 +495,6 @@ APICALL EXPORT void PLUGIN_EXIT() {
     if (g_pFadeoutRenderBoxHook)      HyprlandAPI::removeFunctionHook(PHANDLE, g_pFadeoutRenderBoxHook);
     if (g_pLayerFadeoutRenderBoxHook) HyprlandAPI::removeFunctionHook(PHANDLE, g_pLayerFadeoutRenderBoxHook);
     if (g_pArrangeLayersHook)         HyprlandAPI::removeFunctionHook(PHANDLE, g_pArrangeLayersHook);
-
-    HyprlandAPI::removeDispatcher(PHANDLE, "layershader");
-    HyprlandAPI::removeDispatcher(PHANDLE, "togglelayershader");
-    HyprlandAPI::removeDispatcher(PHANDLE, "togglewindowshader");
-    HyprlandAPI::removeDispatcher(PHANDLE, "classshader");
-    HyprlandAPI::removeDispatcher(PHANDLE, "toggleclassshader");
-    HyprlandAPI::removeDispatcher(PHANDLE, "layeropenanim");
-    HyprlandAPI::removeDispatcher(PHANDLE, "layercloseanim");
-    HyprlandAPI::removeDispatcher(PHANDLE, "reloadshaders");
 
     HyprlandAPI::removeLuaFunction(PHANDLE, "HyprWindowShade", "layershader");
     HyprlandAPI::removeLuaFunction(PHANDLE, "HyprWindowShade", "togglelayershader");

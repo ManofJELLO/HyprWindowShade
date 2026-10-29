@@ -1,5 +1,5 @@
 #!/bin/bash
-# build.sh - v0.56 build script for HyprWindowShade
+# build.sh - v0.57 build script for HyprWindowShade
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
