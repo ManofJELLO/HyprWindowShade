@@ -29,7 +29,7 @@ authors = ["ManofJELLO"]
 # the bump itself to land one commit behind whatever it points at.
 commit_pins = [
     ["efb50993780079460b0cbed1363e2166a2de1d9f", "a4c6b8af424a189072427c4c90ef2938e1b481d3"], # 0.56.2
-    ["0aa6745f705f2c4b0a5004eb019ef76e5bbdb426", "d99fc55c869269c35aa57312a39896ee43968a74"], # 0.57.0
+    ["0aa6745f705f2c4b0a5004eb019ef76e5bbdb426", "88ae166b1317d5b5d308c2e14f6d2d5f9ae2c755"], # 0.57.0
 ]
 
 [HyprWindowShade]
