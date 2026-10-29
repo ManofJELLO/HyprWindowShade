@@ -948,7 +948,7 @@ Declare any of these in your fragment shader and the plugin will populate them e
 |---|---|---|
 | `time` | `float` | seconds since plugin start (monotonic) |
 | `plugin_alpha` | `float` | `window->alphaTotal()` for the window being drawn |
-| `resolution` | `vec2` | active monitor pixel size |
+| `resolution` | `vec2` | active monitor pixel size, in the monitor's rotated orientation (1080x2560 for a 2560x1080 panel at 90°) |
 | `surface_size` | `vec2` | the drawn view's own size: the window's logical box, the layer's box, or — for a [close animation](#the-snapshot-covers-the-whole-monitor) — the monitor-sized snapshot texture it is sampling |
 | `mouse` | `vec2` | pointer position in compositor coords |
 | `is_active` | `float` | 1.0 if focused, else 0.0 |
@@ -999,9 +999,9 @@ names yourself, and don't write to `fragColor` expecting them to be absent.
 >
 > The wrapper's `plugin_alpha` / `plugin_round` / `plugin_dim` multiplies are dead code
 > on that path — the values are 1.0 / 0 and do nothing. They exist for the fallback:
-> `runIntermediateStages` declines a rotated monitor or a rotated source buffer rather
-> than getting them subtly wrong, and there the shader *is* the on-screen draw. Without
-> them a vertical-monitor user would get square corners and no dim.
+> `runIntermediateStages` declines a rotated source buffer, or a render target whose
+> projection rotates, rather than getting them subtly wrong, and there the shader *is*
+> the on-screen draw. Without them those surfaces would get square corners and no dim.
 
 ---
 
@@ -1080,10 +1080,10 @@ window's part of it lands where the window was. So during a close animation `v_t
 spans that whole snapshot and the closing view occupies only the sub-rect it used to sit
 in. `surface_size` reports the snapshot texture, not the window.
 
-On a rotated monitor the snapshot is stored panel-oriented — 2560x1080 on a 90-degree
-2560x1080 panel, not 1080x2560 — because `v_texcoord` runs across the texture rather than
-across the box it is drawn into. `window_rect` already accounts for that, which is the
-whole reason to use it instead of deriving a position yourself.
+On a rotated monitor the snapshot is stored in the monitor's rotated orientation —
+1080x2560 on a 90-degree 2560x1080 panel — the same space the windows are laid out in.
+`window_rect` already accounts for the monitor's shape and rotation, which is the whole
+reason to use it instead of deriving a position yourself.
 
 For anything that only samples `tex` at `v_texcoord` — a dissolve driven by alpha, a
 colour shift, film grain — this makes no difference. It matters the moment your shader is

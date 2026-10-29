@@ -299,7 +299,8 @@ static const std::string* resolveCloseAnim(const SP<Render::ITexture>& tex, PHLM
         // being screen-shared (V0.57): the workspace capture draws that one, not
         // the monitor's, and the close shader has to play in the stream too.
         // Same monitor-sized geometry, so everything below holds for either.
-        // A layer fadeout hands back its monitor snapshot for both.
+        // A layer fadeout has no workspace snapshot — framebuffer(WORKSPACE_WINDOWS)
+        // returns null for it — so only `isFb` can match a layer.
         const auto fb   = f->framebuffer();
         const auto wsFb = f->framebuffer(Render::eSceneMode::WORKSPACE_WINDOWS);
         const bool isFb   = fb && fb->getTexture().get() == tex.get();
@@ -327,33 +328,19 @@ static const std::string* resolveCloseAnim(const SP<Render::ITexture>& tex, PHLM
         //
         // The texture's own size is the honest answer, and it is constant for the
         // life of the fade. v_texcoord spans the TEXTURE, not the box it is drawn
-        // into: Hyprland reconciles the two by composing MONITOR_INVERTED into
-        // glMatrix, which transforms positions only, while the UVs come from the
-        // untransformed unit quad. m_transformedSize was the tempting answer and
-        // is wrong on exactly the monitors this matters on — at 90 degrees the
-        // snapshot texture is the panel, 2560x1080, while m_transformedSize is
-        // 1080x2560, so it had the axes the wrong way round.
+        // into.
         g_pCurrentElemSize = tex->m_size;
 
         // The captured rect is monitor-local device px in TRANSFORMED space, and
-        // the texture is in panel space, so the monitor transform has to be
-        // applied before normalising — the two differ by a transpose at 90/270.
-        // Verified on hardware before this was written: a window at (69,1049)
-        // 942x511 on a 90-degree monitor previously produced a window_rect whose
-        // block rendered at (438,322) 184x1922, x and y swapped.
-        //
-        // Hyprutils' own box transform does the mapping, the same call
-        // CMonitor::onConnect uses to go from transformed space to panel space.
-        // invertTransform matches the direction Hyprland composes into glMatrix.
-        // At transform 0 this is the identity, so the ordinary case is untouched.
-        if (anim.srcSize.x > 0 && anim.srcSize.y > 0 && outMonitor) {
-            const Vector2D xfmd = outMonitor->m_transformedSize;
+        // so is the snapshot: V0.57 allocates it at m_transformedSize and renders
+        // the scene unrotated (RPT_MONITOR has an identity target projection; the
+        // rotation is applied only at RPT_OUTPUT). Normalising directly is
+        // therefore right at every transform. V0.56 snapshotted the panel, and
+        // the transpose this used to apply for that would now swap x and y.
+        if (anim.srcSize.x > 0 && anim.srcSize.y > 0) {
             const Vector2D texSz = tex->m_size;
-            if (xfmd.x > 0 && xfmd.y > 0 && texSz.x > 0 && texSz.y > 0) {
-                CBox r{anim.srcPos.x, anim.srcPos.y, anim.srcSize.x, anim.srcSize.y};
-                r.transform(Math::wlTransformToHyprutils(Math::invertTransform(outMonitor->m_transform)), xfmd.x, xfmd.y);
-                g_pCurrentWindowRect = CBox{r.x / texSz.x, r.y / texSz.y, r.w / texSz.x, r.h / texSz.y};
-            }
+            if (texSz.x > 0 && texSz.y > 0)
+                g_pCurrentWindowRect = CBox{anim.srcPos.x / texSz.x, anim.srcPos.y / texSz.y, anim.srcSize.x / texSz.x, anim.srcSize.y / texSz.y};
         }
         return &anim.path;
     }
@@ -1070,23 +1057,22 @@ static SP<Render::ITexture> runIntermediateStages(Render::CRenderContext& ctx, C
 
     auto& R = ctx.m_data;
 
-    // Coordinate space of the projection currently in force. A rotated monitor
-    // needs the box transformed to match, and this does not do it — the blit
-    // below assumes the projection does not rotate, which holds only at
-    // transform 0.
+    // Coordinate space of the projection currently in force. The blit below
+    // assumes that projection does not rotate.
     //
-    // This is not a gap in Hyprland: it separates m_pixelSize (the physical
-    // panel, e.g. 2560x1080) from m_transformedSize (the logical space windows
-    // live in, 1080x2560 at 90 degrees) and carries the rotation in the monitor
-    // projection, which is exactly right and hands us everything needed. The
-    // work simply is not done here. Verified by rotating a real monitor: the
-    // fallback path renders correctly, so a rotated setup loses Hyprland's
-    // blur/CM/discard/motion-blur on shaded surfaces but nothing else.
+    // V0.57 composes the scene in the monitor's TRANSFORMED space and rotates
+    // only once, at RPT_OUTPUT: RPT_MONITOR and RPT_EXPORT both have an identity
+    // target projection over an unrotated output projection, so a rotated
+    // monitor needs nothing extra there. V0.56 carried the rotation in the
+    // monitor projection itself, which is why this used to decline every
+    // rotated monitor. RPT_FB still rotates (getFBProjection), so it is the one
+    // case left to decline.
     // Monitors carry a wl_output_transform, textures a Hyprutils eTransform.
     // The two NORMAL constants are both 0, so mixing them up still behaves —
     // it just isn't the same enum, and -Wenum-compare is right to say so.
     const auto mon = R.pMonitor.lock();
-    if (!mon || mon->m_transform != WL_OUTPUT_TRANSFORM_NORMAL) return nullptr;
+    if (!mon) return nullptr;
+    if (R.projectionType == Render::RPT_FB && mon->m_transform != WL_OUTPUT_TRANSFORM_NORMAL) return nullptr;
 
     // The target the projection maps onto is not always the monitor. V0.57
     // renders a window with a transformer attached — wobble, motion blur — into
@@ -1109,7 +1095,9 @@ static SP<Render::ITexture> runIntermediateStages(Render::CRenderContext& ctx, C
     // Everything here describes where and how the *window* is being drawn on the
     // monitor. An intermediate stage is a 1:1 blit into an offscreen target, so
     // all of it has to be neutralised and put back afterwards.
-    const auto      savedFB       = R.currentFB;
+    // R.currentFB is deliberately left alone: the stage targets are bound
+    // through fb.bind(), which never touches it (only IHyprRenderer::bindFB
+    // does), so it keeps naming the on-screen target throughout.
     const CRegion   savedDamage   = R.damage;
     const auto      savedModif    = R.renderModif;
     const CBox      savedClipBox  = R.clipBox;
@@ -1163,8 +1151,8 @@ static SP<Render::ITexture> runIntermediateStages(Render::CRenderContext& ctx, C
         for (int i = 0; i < count; ++i) {
             auto& fb = fbs.fb[i % 2];
 
+            // Sets the viewport to the target's size too.
             fb.bind();
-            Render::GL::g_pHyprOpenGL->setViewport(0, 0, (GLsizei)w, (GLsizei)h);
             Render::GL::g_pHyprOpenGL->setCapStatus(GL_SCISSOR_TEST, false);
             // Overwrite rather than blend: the stage output *is* the new texture,
             // not something composited over what the target happened to hold.
@@ -1192,7 +1180,6 @@ static SP<Render::ITexture> runIntermediateStages(Render::CRenderContext& ctx, C
     g_pCurrentSettle       = savedSettle;
     g_pCurrentOneShotKind  = savedOneShot;
 
-    R.currentFB                   = savedFB;
     R.damage                      = savedDamage;
     R.renderModif                 = savedModif;
     R.clipBox                     = savedClipBox;
@@ -1209,11 +1196,48 @@ static SP<Render::ITexture> runIntermediateStages(Render::CRenderContext& ctx, C
 typedef void (*TGLDrawTex)(void* thisptr, Render::CRenderContext& ctx, Hyprutils::Memory::CWeakPointer<CTexPassElement> element, const CRegion& damage);
 
 void hkGLDrawTex(void* thisptr, Render::CRenderContext& ctx, Hyprutils::Memory::CWeakPointer<CTexPassElement> element, const CRegion& damage) {
-    // Restored on exit rather than cleared, so it can never outlive the draw
-    // that owns it — the context is a reference, not ours to keep.
-    Render::CRenderContext* const prevCtx = g_pCurrentRenderCtx;
-    g_pCurrentRenderCtx                   = &ctx;
-    Hyprutils::Utils::CScopeGuard ctxGuard([prevCtx] { g_pCurrentRenderCtx = prevCtx; });
+    // Every per-draw global is restored on exit rather than cleared. The context
+    // can never outlive the draw that owns it — it is a reference, not ours to
+    // keep — and if a textured draw ever runs inside another (V0.57's
+    // transformer and matte paths issue pass elements of their own), the outer
+    // draw gets its shader, window and uniforms back instead of returning to
+    // useShader with them wiped. At the top level the saved values are the
+    // initial ones, so the clears further down still describe the idle state.
+    struct SDrawGlobals {
+        Render::CRenderContext* ctx;
+        PHLWINDOWREF            window;
+        PHLLSREF                layer;
+        CompiledShader*         shader;
+        float                   progress, seed, settle;
+        uint8_t                 oneShot;
+        const MotionRecord*     motion;
+        Vector2D                boxSize, elemSize;
+        CBox                    windowRect;
+        float                   round, roundPower;
+        FadeoutAnim*            fadeout;
+    };
+    const SDrawGlobals saved{g_pCurrentRenderCtx, g_pCurrentRenderWindow, g_pCurrentRenderLayer, g_pCurrentCompiledShader,
+                             g_pCurrentAnimProgress, g_pCurrentAnimSeed, g_pCurrentSettle, g_pCurrentOneShotKind, g_pCurrentMotion,
+                             g_pCurrentBoxSize, g_pCurrentElemSize, g_pCurrentWindowRect, g_pCurrentRound, g_pCurrentRoundPower,
+                             g_pCurrentFadeoutAnim};
+    g_pCurrentRenderCtx = &ctx;
+    Hyprutils::Utils::CScopeGuard ctxGuard([&saved] {
+        g_pCurrentRenderCtx      = saved.ctx;
+        g_pCurrentRenderWindow   = saved.window;
+        g_pCurrentRenderLayer    = saved.layer;
+        g_pCurrentCompiledShader = saved.shader;
+        g_pCurrentAnimProgress   = saved.progress;
+        g_pCurrentAnimSeed       = saved.seed;
+        g_pCurrentSettle         = saved.settle;
+        g_pCurrentOneShotKind    = saved.oneShot;
+        g_pCurrentMotion         = saved.motion;
+        g_pCurrentBoxSize        = saved.boxSize;
+        g_pCurrentElemSize       = saved.elemSize;
+        g_pCurrentWindowRect     = saved.windowRect;
+        g_pCurrentRound          = saved.round;
+        g_pCurrentRoundPower     = saved.roundPower;
+        g_pCurrentFadeoutAnim    = saved.fadeout;
+    });
 
     // V0.56: CRenderPass owns its elements as UP<IPassElement>, so this WP is a
     // weak-over-unique. CWeakPointer::lock() hard-asserts on that case
@@ -1447,13 +1471,13 @@ void hkGLDrawTex(void* thisptr, Render::CRenderContext& ctx, Hyprutils::Memory::
                 elem->m_data.tex = composed;
                 nativeFinal      = wantsNativeFinal;
             }
-            // If the chain could not run — a rotated monitor or a rotated
-            // source buffer, which runIntermediateStages declines rather than
-            // getting subtly wrong — we fall back to binding the top stage as
-            // the on-screen draw. That path is why the wrapper still re-applies
-            // alpha, rounding and dim: they are dead code on the native path,
-            // and the only thing standing between a vertical-monitor user and
-            // square corners on the fallback one.
+            // If the chain could not run — a rotated source buffer, or a
+            // projection that rotates, which runIntermediateStages declines
+            // rather than getting subtly wrong — we fall back to binding the top
+            // stage as the on-screen draw. That path is why the wrapper still
+            // re-applies alpha, rounding and dim: they are dead code on the
+            // native path, and the only thing standing between those surfaces
+            // and square corners on the fallback one.
         }
     }
 
@@ -1518,8 +1542,9 @@ void hkGLDrawTex(void* thisptr, Render::CRenderContext& ctx, Hyprutils::Memory::
     // This is what made the bug monitor-transform-specific. On the native path
     // Hyprland's own program applies that alpha, so a close animation truncated
     // by a frozen frame was already invisible and nobody saw it. On a rotated
-    // monitor runIntermediateStages declines, our shader is the on-screen draw,
-    // and plugin_alpha resolves to 1.0 because a fadeout has no window to ask for
+    // monitor V0.56's runIntermediateStages declined, our shader was the
+    // on-screen draw (it still is wherever the chain declines), and
+    // plugin_alpha resolved to 1.0 because a fadeout has no window to ask for
     // alphaTotal() — so the same frozen frame stayed fully opaque and read as
     // "the animation stopped two thirds through and left the window behind".
     //
@@ -1594,9 +1619,13 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
             glUniform1f(activeEntry->alphaLoc, currentAlpha);
         }
         if (activeEntry->resolutionLoc >= 0) {
+            // m_transformedSize, not m_pixelSize: V0.57 composes the scene in the
+            // monitor's rotated orientation and only turns it to the panel at
+            // output, so this is the space gl_FragCoord runs in on screen. The
+            // two are identical at transform 0.
             Vector2D res(0, 0);
             if (auto mon = g_pCurrentRenderCtx ? g_pCurrentRenderCtx->m_data.pMonitor.lock() : nullptr)
-                res = mon->m_pixelSize;
+                res = mon->m_transformedSize;
             glUniform2f(activeEntry->resolutionLoc, (float)res.x, (float)res.y);
         }
         if (activeEntry->surfaceSizeLoc >= 0) {
@@ -1617,11 +1646,10 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
             // No scale conversion here, deliberately. 68c1f46 multiplied the
             // window branch by m_scale to put everything in device pixels, on the
             // premise that surface_size is "the size of what v_texcoord spans".
-            // That premise is false twice over. The axis order was wrong for a
-            // rotated snapshot (see resolveCloseAnim), and v_texcoord spans the
-            // client's BUFFER, whose scale need not match the monitor's: an
-            // XWayland or non-HiDPI app on a scale-2 monitor submits an 800x600
-            // buffer for an 800x600 logical window, so the conversion reported
+            // That premise is false: v_texcoord spans the client's BUFFER,
+            // whose scale need not match the monitor's: an XWayland or
+            // non-HiDPI app on a scale-2 monitor submits an 800x600 buffer for
+            // an 800x600 logical window, so the conversion reported
             // 1600x1200 for 800x600 texels and halved every displacement written
             // against the documented contract.
             //

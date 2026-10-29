@@ -42,13 +42,24 @@ static PHLWINDOWREF g_lastActiveWindow;
 // Each function below is the canonical body of one shader action, called by
 // the Lua C wrappers further down.
 namespace shadeActions {
+    // A layer has no window to damage, and a namespace (or the catch-all) can
+    // match surfaces on any output, so every monitor is dirtied — the same call
+    // reloadShaders makes, for the same reason. Without it an idle desktop keeps
+    // drawing the old shader until something else on that monitor moves.
+    static void damageAllMonitors() {
+        for (auto& m : State::monitorState()->monitors()) if (m) g_pHyprRenderer->damageMonitor(m);
+    }
+
     static void setLayerShader(const std::string& ns, const std::string& path) {
         if (path == "clear" || path == "none") g_mLayerNamespaceShaderMap.erase(ns);
         else                                   g_mLayerNamespaceShaderMap[ns] = path;
+        damageAllMonitors();
     }
 
     // Layer open/close animations. Same "clear"/"none" convention as the layer
     // shader setters above; the path may carry an `@<sec>` duration override.
+    // No damage: these are read when a layer next opens or closes, so nothing
+    // already on screen changes.
     static void setLayerOpenAnim(const std::string& ns, const std::string& arg) {
         if (arg == "clear" || arg == "none") g_mLayerOpenAnims.erase(ns);
         else                                 g_mLayerOpenAnims[ns] = parseAnimSpec(arg);
@@ -64,6 +75,7 @@ namespace shadeActions {
             g_mLayerNamespaceShaderMap.erase(ns);
         else
             g_mLayerNamespaceShaderMap[ns] = path;
+        damageAllMonitors();
     }
 
     static void toggleWindowShader(const std::string& path) {
@@ -116,7 +128,7 @@ namespace shadeActions {
         // mirror is never damaged directly. renderMonitor damages each mirror
         // from its SOURCE's frame damage on the way out, so damaging the sources
         // here — which this loop does — is what carries a reload to them.
-        for (auto& m : State::monitorState()->monitors()) if (m) g_pHyprRenderer->damageMonitor(m);
+        damageAllMonitors();
         HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] Shaders Reloaded from Disk!", CHyprColor(0.2f, 1.0f, 0.2f, 1.0f), 3000.0f);
     }
 }
@@ -127,32 +139,50 @@ namespace shadeActions {
 // (Plugin dispatchers aren't surfaced to the Lua config layer, per vaxry, and
 // since 0.57 Lua is the only config format — so these are the plugin's whole
 // action surface.)
+//
+// Every argument is read into a plain `const char*` before the action is
+// called. luaL_checkstring raises a Lua error by longjmp, and liblua is C: if
+// it ran inside the argument list, a std::string already built for another
+// argument would be jumped over without its destructor running.
 static int luaLayerShader(lua_State* L) {
-    shadeActions::setLayerShader(luaL_checkstring(L, 1), luaL_checkstring(L, 2));
+    const char* a = luaL_checkstring(L, 1);
+    const char* b = luaL_checkstring(L, 2);
+    shadeActions::setLayerShader(a, b);
     return 0;
 }
 static int luaToggleLayerShader(lua_State* L) {
-    shadeActions::toggleLayerShader(luaL_checkstring(L, 1), luaL_checkstring(L, 2));
+    const char* a = luaL_checkstring(L, 1);
+    const char* b = luaL_checkstring(L, 2);
+    shadeActions::toggleLayerShader(a, b);
     return 0;
 }
 static int luaToggleWindowShader(lua_State* L) {
-    shadeActions::toggleWindowShader(luaL_checkstring(L, 1));
+    const char* path = luaL_checkstring(L, 1);
+    shadeActions::toggleWindowShader(path);
     return 0;
 }
 static int luaClassShader(lua_State* L) {
-    shadeActions::setClassShader(luaL_checkstring(L, 1), luaL_checkstring(L, 2));
+    const char* a = luaL_checkstring(L, 1);
+    const char* b = luaL_checkstring(L, 2);
+    shadeActions::setClassShader(a, b);
     return 0;
 }
 static int luaToggleClassShader(lua_State* L) {
-    shadeActions::toggleClassShader(luaL_checkstring(L, 1), luaL_checkstring(L, 2));
+    const char* a = luaL_checkstring(L, 1);
+    const char* b = luaL_checkstring(L, 2);
+    shadeActions::toggleClassShader(a, b);
     return 0;
 }
 static int luaLayerOpenAnim(lua_State* L) {
-    shadeActions::setLayerOpenAnim(luaL_checkstring(L, 1), luaL_checkstring(L, 2));
+    const char* a = luaL_checkstring(L, 1);
+    const char* b = luaL_checkstring(L, 2);
+    shadeActions::setLayerOpenAnim(a, b);
     return 0;
 }
 static int luaLayerCloseAnim(lua_State* L) {
-    shadeActions::setLayerCloseAnim(luaL_checkstring(L, 1), luaL_checkstring(L, 2));
+    const char* a = luaL_checkstring(L, 1);
+    const char* b = luaL_checkstring(L, 2);
+    shadeActions::setLayerCloseAnim(a, b);
     return 0;
 }
 static int luaReloadShaders(lua_State* L) {

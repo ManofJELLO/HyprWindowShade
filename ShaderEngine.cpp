@@ -196,7 +196,7 @@ CompiledShader* getOrCompileShader(const std::string& shaderPath) {
         // Hyprland draws the composed result with its own program, which
         // applies all three natively — there these multiplies see 1.0 / 0 and
         // do nothing. They matter when runIntermediateStages declines the job
-        // (a rotated monitor, a rotated source buffer), where our shader is
+        // (a rotated source buffer, a projection that rotates), where our shader is
         // the on-screen draw and nothing else would put them back.
         //
         // Only when the shader declares `v_texcoord`, which the mask needs to
