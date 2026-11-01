@@ -7,7 +7,17 @@ NC='\033[0m'
 
 PLUGIN_DIR="$HOME/.local/share/hyprland/plugins"
 PLUGIN_PATH="$PLUGIN_DIR/HyprWindowShade.so"
-HEADERS="/var/cache/hyprpm/$USER/headersRoot"
+# Default to hyprpm's header tree. HYPRLAND_HEADERS overrides it with any prefix
+# laid out the same way — `<prefix>/include/hyprland/src/version.h` plus a
+# pkgconfig dir — which is what a source install of Hyprland produces:
+#
+#   HYPRLAND_HEADERS=/opt/hyprland ./build.sh --build-only
+#
+# Needed because hyprpm only has headers for the Hyprland IT installed. Build
+# the compositor yourself and hyprpm's tree is either absent or, worse, left
+# behind on the previous release — in which case the commit check below is the
+# thing that catches it, and this is how you point the build at the real tree.
+HEADERS="${HYPRLAND_HEADERS:-/var/cache/hyprpm/$USER/headersRoot}"
 
 # --build-only compiles and runs every verification, then stops without
 # unloading, installing, or loading anything. Use it to compile-check against a
@@ -22,13 +32,18 @@ esac
 
 echo -e "${GREEN}Starting build for HyprWindowShade...${NC}"
 
-# HYPRLAND_API_VERSION is the literal "0.1", so Hyprland will happily load a
-# plugin built against the wrong commit and then die on the ABI mismatch.
-# Check the header commit against the running compositor before touching anything.
-echo "[Check] Verifying hyprpm headers..."
+# HYPRLAND_API_VERSION only moves when the plugin ABI itself changes — it went
+# "0.1" → "0.2" across the whole of 0.57 — so it cannot tell two commits of one
+# release apart. It is a coarse guard, not a fine one: a plugin built against
+# the wrong COMMIT of the right release passes it and is then rejected on the
+# version-ABI string, which begins with the compositor's commit hash. Check the
+# header commit against the running compositor before touching anything.
+echo "[Check] Verifying Hyprland headers at $HEADERS..."
 if [ ! -d "$HEADERS/include/hyprland/src" ]; then
-    echo -e "${RED}[Error] hyprpm headers not found at $HEADERS${NC}"
+    echo -e "${RED}[Error] Hyprland headers not found at $HEADERS${NC}"
     echo "        Run: hyprpm update"
+    echo "        Or, for a source-installed Hyprland, point the build at its prefix:"
+    echo "          HYPRLAND_HEADERS=/opt/hyprland $0 ${1:-}"
     exit 1
 fi
 
@@ -45,6 +60,7 @@ if [ "$HDR_COMMIT" != "$RUN_COMMIT" ]; then
     echo "        headers:    $HDR_COMMIT"
     echo "        compositor: $RUN_COMMIT"
     echo "        Run: hyprpm update"
+    echo "        Or set HYPRLAND_HEADERS to a prefix matching the running compositor."
     exit 1
 fi
 
@@ -58,10 +74,15 @@ echo "[Build] Running make..."
 # second copy here meant the dev loop and everyone else's install could drift
 # apart silently — so this just calls it, with the same environment hyprpm uses.
 #
-# PKG_CONFIG_PATH points pkg-config at the hyprpm header tree, matching the
-# commit check above. Without it pkg-config resolves to /usr/include/hyprland
-# instead; either tree works alone, but mixing them will not compile.
-export PKG_CONFIG_PATH="$HEADERS/share/pkgconfig:$PKG_CONFIG_PATH"
+# PKG_CONFIG_PATH points pkg-config at the header tree checked above. Without it
+# pkg-config resolves to /usr/include/hyprland instead; either tree works alone,
+# but mixing them will not compile.
+#
+# lib/pkgconfig as well as share/: hyprpm ships only hyprland.pc, under share/,
+# but a source install also puts aquamarine.pc / hyprutils.pc / hyprgraphics.pc
+# in the prefix — and hyprland.pc Requires them, so leaving lib/ out makes
+# `pkg-config --cflags hyprland` fail on an otherwise complete prefix.
+export PKG_CONFIG_PATH="$HEADERS/share/pkgconfig:$HEADERS/lib/pkgconfig:$PKG_CONFIG_PATH"
 if ! make all TARGET="$BUILD_TMP"; then
     echo -e "${RED}[Error] Build failed. Nothing was unloaded; the running plugin is untouched.${NC}"
     rm -f "$BUILD_TMP"
