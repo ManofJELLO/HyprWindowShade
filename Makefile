@@ -20,6 +20,11 @@
 # at dlopen (see main.cpp). Hyprland 0.57 links liblua5.5, so prefer that name
 # and only fall back to the unversioned alias, which on some distros points at
 # an older series.
+#
+# No module at all is NOT an error: Arch and others put lua.hpp straight in
+# /usr/include, where the compiler finds it with no flag, and some ship no .pc
+# file. Then we add nothing and let the default include path decide; if the
+# header really is missing, the compile names lua.hpp itself.
 LUA_PKG := $(firstword $(foreach p,lua5.5 lua-5.5 lua55 lua,\
              $(shell pkg-config --exists $(p) && echo $(p))))
 
@@ -35,15 +40,12 @@ SRC     := $(wildcard *.cpp)
 # -O3 is deliberate: hkGLDrawTex/hkUseShader run per textured surface per frame.
 CXXFLAGS += -shared -fPIC -O3 -std=c++23 -fno-gnu-unique
 CXXFLAGS += $(shell pkg-config --cflags hyprland)
+ifneq ($(LUA_PKG),)
 CXXFLAGS += $(shell pkg-config --cflags $(LUA_PKG))
+endif
 LDLIBS   += -lGLESv2 -lEGL -lGL
 
 all: $(TARGET)
-
-ifeq ($(LUA_PKG),)
-$(error No lua pkg-config module found (tried lua5.5, lua-5.5, lua55, lua). \
-Install the Lua 5.5 development headers — e.g. liblua5.5-dev)
-endif
 
 $(TARGET): $(SRC)
 	$(CXX) $(CXXFLAGS) $(SRC) -o $@ $(LDLIBS)
