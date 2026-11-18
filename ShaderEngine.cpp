@@ -297,6 +297,7 @@ CompiledShader* getOrCompileShader(const std::string& shaderPath) {
     entry.paletteLoc      = glGetUniformLocation(prog, "umbriel_palette");
     entry.holeLoc         = glGetUniformLocation(prog, "umbriel_border_hole");
     entry.radiusLoc       = glGetUniformLocation(prog, "umbriel_border_radius");
+    entry.cornerRadiusLoc = glGetUniformLocation(prog, "umbriel_corner_radius");
     if (prog == 0) {
         std::string log = captureFragmentLog(shaderCode);
         std::string msg = "[HyprWindowShade] Shader Compile FAILED: " + shaderPath;

@@ -1686,6 +1686,8 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
             glUniform4f(activeEntry->holeLoc, 0.0f, 0.0f, 1.0f, 1.0f);
             glUniform4f(activeEntry->radiusLoc, g_pCurrentRound / scaleNow, g_pCurrentRound / scaleNow,
                         g_pCurrentRound / scaleNow, g_pCurrentRound / scaleNow);
+            glUniform4f(activeEntry->cornerRadiusLoc, g_pCurrentRound / scaleNow, g_pCurrentRound / scaleNow,
+                        g_pCurrentRound / scaleNow, g_pCurrentRound / scaleNow);
         }
         if (activeEntry->mouseLoc >= 0 && Pointer::mgr()) {
             const Vector2D p = Pointer::mgr()->position();
@@ -2639,6 +2641,10 @@ void hkBorderDraw(void* thisptr, Render::CRenderContext& ctx, Hyprutils::Memory:
     newBox.height += 2 * (scaledBorderSize + padPx);
 
     const int roundPx = elem->m_data.round + (elem->m_data.round == 0 ? 0 : scaledBorderSize);
+    // umbriel_border_radius is the HOLE radius (the window's own rounding, the
+    // contour the border art follows) — NOT the outer canvas radius. Paired
+    // window overlays bind the same value, so their art continues the border's
+    // across the rim on any user's config.
 
     const auto& glMatrix = g_pHyprRenderer->projectBoxToTarget(ctx, newBox);
 
@@ -2660,8 +2666,6 @@ void hkBorderDraw(void* thisptr, Render::CRenderContext& ctx, Hyprutils::Memory:
     const float thickLogical = (scaledBorderSize + padPx) / scale;
     const float holeX = thickLogical / logicalW, holeY = thickLogical / logicalH;
     const float holeW = 1.0 - 2.0 * holeX, holeH = 1.0 - 2.0 * holeY;
-    const float radiusLogical = roundPx / scale;
-
     cs->shader->setUniformMatrix3fv(SHADER_PROJ, 1, GL_TRUE, glMatrix.getMatrix());
     if (cs->timeLoc >= 0) {
         const float t = std::chrono::duration_cast<std::chrono::duration<float>>(
@@ -2677,8 +2681,10 @@ void hkBorderDraw(void* thisptr, Render::CRenderContext& ctx, Hyprutils::Memory:
         glUniform2f(cs->surfaceSizeLoc, logicalW, logicalH);
     if (cs->holeLoc >= 0)
         glUniform4f(cs->holeLoc, holeX, holeY, holeW, holeH);
-    if (cs->radiusLoc >= 0)
-        glUniform4f(cs->radiusLoc, radiusLogical, radiusLogical, radiusLogical, radiusLogical);
+    if (cs->radiusLoc >= 0) {
+        const float holeRadiusLogical = elem->m_data.round / scale;
+        glUniform4f(cs->radiusLoc, holeRadiusLogical, holeRadiusLogical, holeRadiusLogical, holeRadiusLogical);
+    }
     if (cs->scaleLoc >= 0)
         glUniform1f(cs->scaleLoc, scale);
     if (cs->expandLoc >= 0)

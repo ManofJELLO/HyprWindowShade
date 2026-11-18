@@ -426,6 +426,7 @@ struct CompiledShader {
     GLint     scaleLoc        = -1; // float: monitor scale
     GLint     paletteCountLoc = -1; // int: theme palette count, 0 for now
     GLint     paletteLoc      = -1; // vec4[4]: fallback palette stops
+    GLint     cornerRadiusLoc = -1; // vec4: per-corner rounding for window shaders that declare umbriel_corner_radius
     GLint     expandLoc       = -1; // vec2: declared padding, normalised to the canvas
     int       paddingPx       = 0;  // declared `// @padding <px>` beyond the ring
     bool      usesTime        = false;
