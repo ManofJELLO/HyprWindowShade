@@ -6,6 +6,10 @@
 #include <hyprland/src/workspace/HLWorkspace.hpp>
 #include <hyprutils/utils/ScopeGuard.hpp>
 #include <string_view>
+
+// Forward declaration: the palette helper lives further down, after the
+// window-pass draw hook that also uses it.
+static void bindThemePalette(GLint countLoc, GLint paletteLoc);
 #include <sys/stat.h>
 
 #include <cstdio>
@@ -1667,6 +1671,8 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
             // one coherent field across a window instead of per-surface.
             glUniform2f(activeEntry->surfaceSizeLoc, (float)sz.x, (float)sz.y);
         }
+        if (activeEntry->paletteCountLoc >= 0 || activeEntry->paletteLoc >= 0)
+            bindThemePalette(activeEntry->paletteCountLoc, activeEntry->paletteLoc);
         if (activeEntry->mouseLoc >= 0 && Pointer::mgr()) {
             const Vector2D p = Pointer::mgr()->position();
             glUniform2f(activeEntry->mouseLoc, (float)p.x, (float)p.y);
@@ -2505,6 +2511,42 @@ void applyShaderRulesSafe(PHLWINDOW pWindow) {
     }
 }
 
+// --- THEME PALETTE BINDING (shared by the border and window passes) ---------
+// Re-stats the palette file with a light throttle so a theme tool can rewrite
+// it live; missing or malformed file -> built-in fallback. Both passes bind
+// the same 4 stops (Umbriel's order: accent_primary, accent_secondary,
+// warning, error) so paired border/overlay effects stay in phase.
+static void bindThemePalette(GLint countLoc, GLint paletteLoc);
+static void bindThemePalette(GLint countLoc, GLint paletteLoc) {
+    static const float fallback[16] = {0.07f, 0.12f, 0.19f, 1.0f, 0.45f, 0.95f, 1.0f, 1.0f,
+                                       0.25f, 0.70f, 0.95f, 1.0f, 0.60f, 0.92f, 1.0f, 1.0f};
+    static std::chrono::steady_clock::time_point s_paletteStat{};
+    static time_t s_paletteMtime = 0;
+    if (std::chrono::steady_clock::now() - s_paletteStat > std::chrono::milliseconds(400)) {
+        s_paletteStat = std::chrono::steady_clock::now();
+        const char* home = getenv("HOME");
+        if (home) {
+            std::string palPath = std::string(home) + "/.config/hypr/shaders/umbriel/palette.txt";
+            struct stat st {};
+            if (::stat(palPath.c_str(), &st) == 0) {
+                if (st.st_mtime != s_paletteMtime) {
+                    s_paletteMtime = st.st_mtime;
+                    loadThemePaletteFile();
+                }
+            } else if (g_themePaletteLoaded) {
+                s_paletteMtime = 0;
+                g_themePaletteLoaded = false; // file gone: back to fallback
+            }
+        }
+    }
+    if (countLoc >= 0)
+        // Count must be 4: with 0 umbriel_palette_at returns the wrapper's
+        // hard-coded colour and ignores the bound palette.
+        glUniform1i(countLoc, 4);
+    if (paletteLoc >= 0)
+        glUniform4fv(paletteLoc, 4, g_themePaletteLoaded ? g_themePalette : fallback);
+}
+
 // --- BORDER PASS HOOK (Umbriel-style ring pass) ---
 // CGLElementRenderer::draw(CRenderContext, CBorderPassElement, CRegion) draws
 // every border ring. For windows with a border shader assigned, replace the
@@ -2627,40 +2669,8 @@ void hkBorderDraw(void* thisptr, Render::CRenderContext& ctx, Hyprutils::Memory:
         glUniform1f(cs->scaleLoc, scale);
     if (cs->expandLoc >= 0)
         glUniform2f(cs->expandLoc, padPx / logicalW, padPx / logicalH);
-    if (cs->paletteCountLoc >= 0)
-        // We always bind a full 4-stop palette (theme file or fallback), so the
-        // count must be 4: with 0 the wrapper's umbriel_palette_at returns its
-        // own hard-coded colour and ignores what we bind.
-        glUniform1i(cs->paletteCountLoc, 4);
-    if (cs->paletteLoc >= 0) {
-        // Theme palette bridge: re-stat the palette file with a light throttle;
-        // a theme tool can rewrite it live. Missing or malformed file -> the
-        // built-in fallback below (stop 0 doubles as dual-orbit's steady base
-        // ring, so it is deliberately dark; the later stops are bright
-        // ice-cyan so the orbiting highlights pop against it).
-        static const float fallback[16] = {0.07f, 0.12f, 0.19f, 1.0f, 0.45f, 0.95f, 1.0f, 1.0f,
-                                           0.25f, 0.70f, 0.95f, 1.0f, 0.60f, 0.92f, 1.0f, 1.0f};
-        static std::chrono::steady_clock::time_point s_paletteStat{};
-        static time_t s_paletteMtime = 0;
-        if (std::chrono::steady_clock::now() - s_paletteStat > std::chrono::milliseconds(400)) {
-            s_paletteStat = std::chrono::steady_clock::now();
-            const char* home = getenv("HOME");
-            if (home) {
-                std::string palPath = std::string(home) + "/.config/hypr/shaders/umbriel/palette.txt";
-                struct stat st {};
-                if (::stat(palPath.c_str(), &st) == 0) {
-                    if (st.st_mtime != s_paletteMtime) {
-                        s_paletteMtime = st.st_mtime;
-                        loadThemePaletteFile();
-                    }
-                } else if (g_themePaletteLoaded) {
-                    s_paletteMtime = 0;
-                    g_themePaletteLoaded = false; // file gone: back to fallback
-                }
-            }
-        }
-        glUniform4fv(cs->paletteLoc, 4, g_themePaletteLoaded ? g_themePalette : fallback);
-    }
+    if (cs->paletteCountLoc >= 0 || cs->paletteLoc >= 0)
+        bindThemePalette(cs->paletteCountLoc, cs->paletteLoc);
 
     // Continuous redraw while the shader binds `time` — but only the ring:
     // damageWindow would repaint the whole window (blur included) every frame

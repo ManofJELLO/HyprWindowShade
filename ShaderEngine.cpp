@@ -289,6 +289,10 @@ CompiledShader* getOrCompileShader(const std::string& shaderPath) {
     entry.shader->createProgram(Render::GL::g_pHyprOpenGL->m_shaders->TEXVERTSRC320, shaderCode, true, true);
 
     const GLuint prog = entry.shader->program();
+    // Window-pass shaders may declare the theme palette too (Umbriel's paired
+    // window overlays read the same stops the border effect sees).
+    entry.paletteCountLoc = glGetUniformLocation(prog, "umbriel_palette_count");
+    entry.paletteLoc      = glGetUniformLocation(prog, "umbriel_palette");
     if (prog == 0) {
         std::string log = captureFragmentLog(shaderCode);
         std::string msg = "[HyprWindowShade] Shader Compile FAILED: " + shaderPath;
