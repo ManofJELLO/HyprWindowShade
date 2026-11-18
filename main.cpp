@@ -16,6 +16,7 @@ std::map<std::string, std::string>                    g_mLayerNamespaceShaderMap
 std::map<std::string, std::string>                    g_mWindowClassShaderMap;
 std::map<std::string, std::string>                    g_mWindowClassBorderShaderMap;
 std::string                                           g_sActiveBorderShader;
+std::string                                           g_sActiveWindowShader;
 bool                                                  g_bSuppressNativeBorder = false;
 CFunctionHook*                                        g_pShadowHook           = nullptr;
 std::map<std::string, CompiledShader>                 g_mCompiledCShaders;
@@ -240,6 +241,17 @@ namespace shadeActions {
         damageAllMonitors();
     }
 
+    // Active-focus window shader: same convention as setActiveBorderShader —
+    // the overlay follows the focused window, pairing with the active border
+    // for the Umbriel preset model (ring outside + effect painted over the
+    // content). "clear"/"none" turns the mode off; every change damages all
+    // monitors because the effect moves with focus.
+    static void setActiveWindowShader(const std::string& path) {
+        if (path == "clear" || path == "none") g_sActiveWindowShader.clear();
+        else                                   g_sActiveWindowShader = path;
+        damageAllMonitors();
+    }
+
     static void setClassShader(const std::string& cls, const std::string& path) {
         if (path == "clear" || path == "none") g_mWindowClassShaderMap.erase(cls);
         else                                   g_mWindowClassShaderMap[cls] = path;
@@ -329,6 +341,11 @@ static int luaClassBorderShader(lua_State* L) {
 static int luaActiveBorderShader(lua_State* L) {
     const char* path = luaL_checkstring(L, 1);
     shadeActions::setActiveBorderShader(path);
+    return 0;
+}
+static int luaActiveWindowShader(lua_State* L) {
+    const char* path = luaL_checkstring(L, 1);
+    shadeActions::setActiveWindowShader(path);
     return 0;
 }
 static int luaToggleClassShader(lua_State* L) {
@@ -684,6 +701,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "bordershader",       &luaToggleBorderShader);
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "classbordershader",  &luaClassBorderShader);
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "activebordershader", &luaActiveBorderShader);
+    HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "activewindowshader", &luaActiveWindowShader);
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "layeropenanim",      &luaLayerOpenAnim);
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "layercloseanim",     &luaLayerCloseAnim);
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "reloadshaders",      &luaReloadShaders);
@@ -707,6 +725,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
     g_mWindowBorderShaders.clear();
     g_mWindowClassBorderShaderMap.clear();
     g_sActiveBorderShader.clear();
+    g_sActiveWindowShader.clear();
     g_mLayerNamespaceShaderMap.clear();
     g_mWindowClassShaderMap.clear();
     g_mFailedShaderMtimes.clear();

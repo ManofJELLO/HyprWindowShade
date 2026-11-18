@@ -468,6 +468,11 @@ extern std::string                                g_sActiveBorderShader;
 // band around every window. Cleared together with the mode.
 extern bool                                       g_bSuppressNativeBorder;
 extern std::string                                g_sActiveBorderShader;
+// Active-focus window (overlay) shader: same model as the active border
+// shader — the effect follows whichever window has focus, so a border preset
+// and its window overlay (Umbriel's paired kinds) teleport together. Empty
+// = off.
+extern std::string                                g_sActiveWindowShader;
 
 // Layer surfaces (bars, notifications, rofi/wofi) have no rule tags in v0.56, so
 // their animations are keyed by namespace like the rest of the layer API rather

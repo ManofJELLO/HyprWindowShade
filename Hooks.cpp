@@ -946,6 +946,11 @@ static int collectBaseLayers(const PHLWINDOW& pWindow, const PHLLS& pLS, const s
             } else {
                 if (classShader)                                out[n++] = classShader;
                 if (!state.fallback.empty())                    out[n++] = &state.fallback;
+                // Active-focus overlay: below the imperative toggle (an
+                // explicit per-window assignment wins), above the rest — same
+                // precedence the active border shader has. Stacks as one more
+                // layer; the cap guard keeps the caller's animation slot free.
+                if (!g_sActiveWindowShader.empty() && isActive && n < MAX_SHADER_STAGES - 1) out[n++] = &g_sActiveWindowShader;
                 if (manualShader)                               out[n++] = manualShader;
                 if (isFloating)  { if (!state.floating.empty())  out[n++] = &state.floating; }
                 else             { if (!state.tiled.empty())     out[n++] = &state.tiled; }
@@ -957,6 +962,8 @@ static int collectBaseLayers(const PHLWINDOW& pWindow, const PHLLS& pLS, const s
             // No rules at all, so there is nothing to opt this window into
             // being shaded while fullscreen — and opting in is the only way.
             if (classShader)                                    out[n++] = classShader;
+            if (!g_sActiveWindowShader.empty() && n < MAX_SHADER_STAGES - 1 &&
+                Desktop::focusState()->isWindowActive(pWindow)) out[n++] = &g_sActiveWindowShader;
             if (manualShader)                                   out[n++] = manualShader;
         }
 
