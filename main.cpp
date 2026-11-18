@@ -18,6 +18,41 @@ std::map<std::string, std::string>                    g_mWindowClassBorderShader
 std::string                                           g_sActiveBorderShader;
 std::string                                           g_sActiveWindowShader;
 bool                                                  g_bSuppressNativeBorder = false;
+float                                                 g_themePalette[16] = {0.07f, 0.12f, 0.19f, 1.0f, 0.45f, 0.95f, 1.0f, 1.0f,
+                                                                            0.25f, 0.70f, 0.95f, 1.0f, 0.60f, 0.92f, 1.0f, 1.0f};
+bool                                                  g_themePaletteLoaded = false;
+
+// (Re)reads the palette file into g_themePalette. 4 lines of "r g b a" floats
+// in 0..1; '#' comments and blank lines skipped. Returns true when a valid
+// file was loaded (false = keep the built-in fallback in g_themePalette).
+bool loadThemePaletteFile() {
+    const char* home = getenv("HOME");
+    if (!home) return false;
+    static std::string path;
+    if (path.empty()) path = std::string(home) + "/.config/hypr/shaders/umbriel/palette.txt";
+    std::ifstream f(path);
+    if (!f.is_open()) return false;
+    float pal[16];
+    for (int i = 0; i < 4; ++i) {
+        std::string line;
+        bool got = false;
+        while (std::getline(f, line)) {
+            const size_t p = line.find_first_not_of(" \t\r");
+            if (p == std::string::npos || line[p] == '#') continue; // blank or comment
+            std::istringstream ss(line.substr(p));
+            bool lineOk = true;
+            for (int c = 0; c < 4; ++c)
+                if (!(ss >> pal[i * 4 + c])) { lineOk = false; break; }
+            if (!lineOk) return false; // malformed data line: keep the fallback
+            got = true;
+            break;
+        }
+        if (!got) return false;
+    }
+    for (int i = 0; i < 16; ++i) g_themePalette[i] = pal[i];
+    g_themePaletteLoaded = true;
+    return true;
+}
 CFunctionHook*                                        g_pShadowHook           = nullptr;
 std::map<std::string, CompiledShader>                 g_mCompiledCShaders;
 std::map<std::string, time_t>                         g_mFailedShaderMtimes;
@@ -691,7 +726,10 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     // need right after — so while any border assignment is active, the widest
     // declared ring (and its gap compensation) is re-applied here, after the
     // reload finished.
-    g_Listeners.push_back(Event::bus()->m_events.config.reloaded.listen([]() { shadeActions::reassertBorderGeomAfterReload(); }));
+    g_Listeners.push_back(Event::bus()->m_events.config.reloaded.listen([]() {
+        shadeActions::reassertBorderGeomAfterReload();
+        loadThemePaletteFile(); // a theme switch rewrites the palette file
+    }));
 
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "layershader",        &luaLayerShader);
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "togglelayershader",  &luaToggleLayerShader);

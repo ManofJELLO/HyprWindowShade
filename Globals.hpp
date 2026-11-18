@@ -371,6 +371,10 @@ void updateMotionRecords();
 struct CompiledShader {
     Hyprutils::Memory::CSharedPointer<CShader> shader;
     GLint     timeLoc         = -1;
+    // `// @speed <n>` — premultiplies the seconds bound to `time`, matching
+    // Umbriel's contract (src/view/effects.cpp: seconds * preset->speed).
+    // Dual-orbit ships speed 6.0; a shader written for raw seconds omits it.
+    float     timeSpeed       = 1.0f;
     GLint     alphaLoc        = -1;
     GLint     resolutionLoc   = -1; // vec2: current monitor pixel size
     GLint     surfaceSizeLoc  = -1; // vec2: the view's own size; 0,0 when unknown
@@ -473,6 +477,16 @@ extern std::string                                g_sActiveBorderShader;
 // and its window overlay (Umbriel's paired kinds) teleport together. Empty
 // = off.
 extern std::string                                g_sActiveWindowShader;
+
+// Theme palette bridge: when ~/.config/hypr/shaders/umbriel/palette.txt exists
+// (4 lines of "r g b a" floats in 0..1), border shaders read it instead of the
+// built-in fallback — the same contract Umbriel has with its config palette.
+// A theme tool (hve) can write the file on theme changes.
+extern float                                      g_themePalette[16];
+extern bool                                       g_themePaletteLoaded;
+// (Re)reads the palette file into g_themePalette. Returns true when a valid
+// file was loaded (false = keep the built-in fallback).
+bool                                              loadThemePaletteFile();
 
 // Layer surfaces (bars, notifications, rofi/wofi) have no rule tags in v0.56, so
 // their animations are keyed by namespace like the rest of the layer API rather

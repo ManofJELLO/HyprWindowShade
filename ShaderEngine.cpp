@@ -88,6 +88,20 @@ static bool parseDeclaredOverlay(const std::string& src) {
     return std::regex_search(src, OVERLAY_RE);
 }
 
+// `// @speed <n>` — Umbriel's preset-speed contract: the host premultiplies
+// umbriel_time by the preset's speed (src/view/effects.cpp: seconds *
+// preset->speed). Our port feeds raw seconds, so the directive does the same
+// job here. Defaults to 1 (raw seconds).
+static const std::regex SPEED_RE(R"(//[ \t]*@speed[ \t]+([0-9]*\.?[0-9]+))");
+static float parseDeclaredSpeed(const std::string& src) {
+    std::smatch m;
+    if (!std::regex_search(src, m, SPEED_RE)) return 1.0f;
+    try {
+        const float s = std::stof(m[1].str());
+        return s > 0.0f ? s : 1.0f;
+    } catch (...) { return 1.0f; }
+}
+
 static std::string captureFragmentLog(const std::string& src) {
     GLuint sh = glCreateShader(GL_FRAGMENT_SHADER);
     const char* csrc = src.c_str();
@@ -330,6 +344,7 @@ CompiledShader* getOrCompileShader(const std::string& shaderPath) {
     // Using the location instead of substring matching avoids false positives
     // like "lifetime" or "uniform_time_offset".
     entry.usesTime    = (entry.timeLoc >= 0);
+    entry.timeSpeed   = parseDeclaredSpeed(shaderCode);
     entry.sourceMtime = currentMtime;
     entry.lastStatAt  = now;
 
@@ -624,6 +639,7 @@ CompiledShader* getOrCompileBorderShader(const std::string& shaderPath) {
     entry.radiusLoc       = glGetUniformLocation(prog, "umbriel_border_radius");
     entry.scaleLoc        = glGetUniformLocation(prog, "umbriel_scale");
     entry.usesTime        = (entry.timeLoc >= 0);
+    entry.timeSpeed       = parseDeclaredSpeed(shaderCode);
     entry.sourceMtime     = currentMtime;
     entry.lastStatAt      = now;
 

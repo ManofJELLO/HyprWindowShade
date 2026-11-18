@@ -6,6 +6,7 @@
 #include <hyprland/src/workspace/HLWorkspace.hpp>
 #include <hyprutils/utils/ScopeGuard.hpp>
 #include <string_view>
+#include <sys/stat.h>
 
 #include <cstdio>
 
@@ -1615,7 +1616,7 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
             const float t = std::chrono::duration_cast<std::chrono::duration<float>>(
                                 std::chrono::steady_clock::now() - g_pluginStartTime)
                                 .count();
-            glUniform1f(activeEntry->timeLoc, t);
+            glUniform1f(activeEntry->timeLoc, t * activeEntry->timeSpeed);
         }
         if (activeEntry->alphaLoc >= 0) {
             // Offscreen stages always render fully opaque. Window opacity is a
@@ -2610,7 +2611,7 @@ void hkBorderDraw(void* thisptr, Render::CRenderContext& ctx, Hyprutils::Memory:
         const float t = std::chrono::duration_cast<std::chrono::duration<float>>(
                             std::chrono::steady_clock::now() - g_pluginStartTime)
                             .count();
-        glUniform1f(cs->timeLoc, t);
+        glUniform1f(cs->timeLoc, t * cs->timeSpeed);
     }
     if (cs->seedLoc >= 0)
         glUniform1f(cs->seedLoc, animSeedFor(pWindow.get()));
@@ -2627,15 +2628,38 @@ void hkBorderDraw(void* thisptr, Render::CRenderContext& ctx, Hyprutils::Memory:
     if (cs->expandLoc >= 0)
         glUniform2f(cs->expandLoc, padPx / logicalW, padPx / logicalH);
     if (cs->paletteCountLoc >= 0)
-        glUniform1i(cs->paletteCountLoc, 0);
+        // We always bind a full 4-stop palette (theme file or fallback), so the
+        // count must be 4: with 0 the wrapper's umbriel_palette_at returns its
+        // own hard-coded colour and ignores what we bind.
+        glUniform1i(cs->paletteCountLoc, 4);
     if (cs->paletteLoc >= 0) {
-        // A fixed 4-stop fallback standing in for the theme palette this pass
-        // cannot read. Stop 0 doubles as dual-orbit's steady base ring, so it
-        // is deliberately dark; the later stops are bright ice-cyan so the
-        // orbiting highlights pop against it.
-        const float palette[16] = {0.07f, 0.12f, 0.19f, 1.0f, 0.45f, 0.95f, 1.0f, 1.0f,
-                                   0.25f, 0.70f, 0.95f, 1.0f, 0.60f, 0.92f, 1.0f, 1.0f};
-        glUniform4fv(cs->paletteLoc, 4, palette);
+        // Theme palette bridge: re-stat the palette file with a light throttle;
+        // a theme tool can rewrite it live. Missing or malformed file -> the
+        // built-in fallback below (stop 0 doubles as dual-orbit's steady base
+        // ring, so it is deliberately dark; the later stops are bright
+        // ice-cyan so the orbiting highlights pop against it).
+        static const float fallback[16] = {0.07f, 0.12f, 0.19f, 1.0f, 0.45f, 0.95f, 1.0f, 1.0f,
+                                           0.25f, 0.70f, 0.95f, 1.0f, 0.60f, 0.92f, 1.0f, 1.0f};
+        static std::chrono::steady_clock::time_point s_paletteStat{};
+        static time_t s_paletteMtime = 0;
+        if (std::chrono::steady_clock::now() - s_paletteStat > std::chrono::milliseconds(400)) {
+            s_paletteStat = std::chrono::steady_clock::now();
+            const char* home = getenv("HOME");
+            if (home) {
+                std::string palPath = std::string(home) + "/.config/hypr/shaders/umbriel/palette.txt";
+                struct stat st {};
+                if (::stat(palPath.c_str(), &st) == 0) {
+                    if (st.st_mtime != s_paletteMtime) {
+                        s_paletteMtime = st.st_mtime;
+                        loadThemePaletteFile();
+                    }
+                } else if (g_themePaletteLoaded) {
+                    s_paletteMtime = 0;
+                    g_themePaletteLoaded = false; // file gone: back to fallback
+                }
+            }
+        }
+        glUniform4fv(cs->paletteLoc, 4, g_themePaletteLoaded ? g_themePalette : fallback);
     }
 
     // Continuous redraw while the shader binds `time` — but only the ring:
