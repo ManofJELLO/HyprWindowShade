@@ -1673,6 +1673,20 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
         }
         if (activeEntry->paletteCountLoc >= 0 || activeEntry->paletteLoc >= 0)
             bindThemePalette(activeEntry->paletteCountLoc, activeEntry->paletteLoc);
+        if (activeEntry->radiusLoc >= 0 || activeEntry->holeLoc >= 0) {
+            // Paired-overlay geometry: the window itself is the hole (full
+            // 0..1), and the corner radius is whatever Hyprland is rounding
+            // this surface with, in logical px — the same value the border
+            // pass derives from its own element. Hard-coded radii in paired
+            // overlays would drift from the border at other users' configs.
+            float scaleNow = 1.0f;
+            if (g_pCurrentRenderCtx)
+                if (auto mon = g_pCurrentRenderCtx->m_data.pMonitor.lock())
+                    scaleNow = mon->m_scale;
+            glUniform4f(activeEntry->holeLoc, 0.0f, 0.0f, 1.0f, 1.0f);
+            glUniform4f(activeEntry->radiusLoc, g_pCurrentRound / scaleNow, g_pCurrentRound / scaleNow,
+                        g_pCurrentRound / scaleNow, g_pCurrentRound / scaleNow);
+        }
         if (activeEntry->mouseLoc >= 0 && Pointer::mgr()) {
             const Vector2D p = Pointer::mgr()->position();
             glUniform2f(activeEntry->mouseLoc, (float)p.x, (float)p.y);

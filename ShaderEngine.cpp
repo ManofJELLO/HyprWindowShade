@@ -290,9 +290,13 @@ CompiledShader* getOrCompileShader(const std::string& shaderPath) {
 
     const GLuint prog = entry.shader->program();
     // Window-pass shaders may declare the theme palette too (Umbriel's paired
-    // window overlays read the same stops the border effect sees).
+    // window overlays read the same stops the border effect sees), and the
+    // border geometry uniforms: paired overlays mirror the border's ring, so
+    // they need the same corner radius Hyprland is about to round with.
     entry.paletteCountLoc = glGetUniformLocation(prog, "umbriel_palette_count");
     entry.paletteLoc      = glGetUniformLocation(prog, "umbriel_palette");
+    entry.holeLoc         = glGetUniformLocation(prog, "umbriel_border_hole");
+    entry.radiusLoc       = glGetUniformLocation(prog, "umbriel_border_radius");
     if (prog == 0) {
         std::string log = captureFragmentLog(shaderCode);
         std::string msg = "[HyprWindowShade] Shader Compile FAILED: " + shaderPath;
