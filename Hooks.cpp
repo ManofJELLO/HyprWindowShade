@@ -2496,3 +2496,187 @@ void applyShaderRulesSafe(PHLWINDOW pWindow) {
         g_mWindowRuleShaders.erase(rawWin);
     }
 }
+
+// --- BORDER PASS HOOK (Umbriel-style ring pass) ---
+// CGLElementRenderer::draw(CRenderContext, CBorderPassElement, CRegion) draws
+// every border ring. For windows with a border shader assigned, replace the
+// native border draw entirely — like Umbriel replaces its native ring — with
+// the compiled border shader running over the same ring canvas. Without a
+// border shader this returns Hyprland's own draw untouched.
+typedef void (*TBorderDraw)(void* thisptr, Render::CRenderContext& ctx, Hyprutils::Memory::CWeakPointer<CBorderPassElement> element, const CRegion& damage);
+
+void hkBorderDraw(void* thisptr, Render::CRenderContext& ctx, Hyprutils::Memory::CWeakPointer<CBorderPassElement> element, const CRegion& damage) {
+    CBorderPassElement* elem = element.get();
+
+    // Same weak-over-unique rule as hkGLDrawTex: borrow, never lock.
+    PHLWINDOW pWindow;
+    if (elem)
+        pWindow = elem->m_data.window.lock();
+
+    const std::string* path = nullptr;
+    if (pWindow) {
+        Desktop::View::CWindow* rawWin = pWindow.get();
+        if (auto it = g_mWindowBorderShaders.find(rawWin); it != g_mWindowBorderShaders.end())
+            path = &it->second;
+        else if (!g_sActiveBorderShader.empty() && Desktop::focusState()->isWindowActive(pWindow))
+            // Active-focus mode: the effect follows the focused window. Must
+            // not hold a reference into g_sActiveBorderShader past this call
+            // into the compiled cache — borrow for the lookup only.
+            path = &g_sActiveBorderShader;
+        else {
+            const auto& initClass    = rawWin->metadata().initialAppID();
+            const auto& currentClass = rawWin->metadata().appID();
+            auto        classIt      = g_mWindowClassBorderShaderMap.find(initClass);
+            if (classIt == g_mWindowClassBorderShaderMap.end())
+                classIt = g_mWindowClassBorderShaderMap.find(currentClass);
+            if (classIt != g_mWindowClassBorderShaderMap.end())
+                path = &classIt->second;
+        }
+    }
+
+    // Fast path: the overwhelming majority of draws have no border shader.
+    // While the active-focus mode is on, windows without their own border
+    // shader draw NOTHING: the native gradient ring reads as a dark band and
+    // the silhouette is meant to be transparent everywhere but the wave.
+    if (!path) {
+        if (g_bSuppressNativeBorder) return;
+        ((TBorderDraw)g_pBorderDrawHook->m_original)(thisptr, ctx, element, damage);
+        return;
+    }
+
+    CompiledShader* cs = getOrCompileBorderShader(*path);
+    if (!cs) {
+        ((TBorderDraw)g_pBorderDrawHook->m_original)(thisptr, ctx, element, damage);
+        return;
+    }
+
+    auto& R = ctx.m_data;
+    if (R.damage.empty())
+        return;
+
+    const CBox innerBox = [&] {
+        CBox b = elem->m_data.box;
+        R.renderModif.applyToBox(b);
+        return b;
+    }();
+
+    const int scaledBorderSize = std::round(std::round(elem->m_data.borderSize * R.pMonitor->m_scale) * R.renderModif.combinedScale());
+    if (scaledBorderSize < 1)
+        return;
+
+    // adjust box: the ring canvas is the window box + border width on every
+    // side, plus the effect's declared padding (Umbriel's effect padding:
+    // canvas grows, layout does not — the padding paints over the gap space).
+    const int padPx = cs->paddingPx;
+    CBox newBox = innerBox;
+    newBox.x -= scaledBorderSize + padPx;
+    newBox.y -= scaledBorderSize + padPx;
+    newBox.width += 2 * (scaledBorderSize + padPx);
+    newBox.height += 2 * (scaledBorderSize + padPx);
+
+    const int roundPx = elem->m_data.round + (elem->m_data.round == 0 ? 0 : scaledBorderSize);
+
+    const auto& glMatrix = g_pHyprRenderer->projectBoxToTarget(ctx, newBox);
+
+    const bool savedBlend = Render::GL::g_pHyprOpenGL->blendEnabled();
+    Render::GL::g_pHyprOpenGL->blend(true);
+
+    // Bind our program. hkUseShader must not push window-shader uniforms here —
+    // the border draw pushes its own below — so clear the entry around the call.
+    CompiledShader* savedEntry = g_pCurrentCompiledShader;
+    g_pCurrentCompiledShader   = nullptr;
+    Render::GL::g_pHyprOpenGL->useShader(cs->shader);
+    g_pCurrentCompiledShader = savedEntry;
+
+    // Geometry: the ring canvas in logical px. umbriel_size = newBox/scale, the
+    // hole is the window rect inset by the border width + padding.
+    const auto  mon   = R.pMonitor.lock();
+    const float scale = mon ? mon->m_scale : 1.0f;
+    const float logicalW = newBox.width / scale, logicalH = newBox.height / scale;
+    const float thickLogical = (scaledBorderSize + padPx) / scale;
+    const float holeX = thickLogical / logicalW, holeY = thickLogical / logicalH;
+    const float holeW = 1.0 - 2.0 * holeX, holeH = 1.0 - 2.0 * holeY;
+    const float radiusLogical = roundPx / scale;
+
+    cs->shader->setUniformMatrix3fv(SHADER_PROJ, 1, GL_TRUE, glMatrix.getMatrix());
+    if (cs->timeLoc >= 0) {
+        const float t = std::chrono::duration_cast<std::chrono::duration<float>>(
+                            std::chrono::steady_clock::now() - g_pluginStartTime)
+                            .count();
+        glUniform1f(cs->timeLoc, t);
+    }
+    if (cs->seedLoc >= 0)
+        glUniform1f(cs->seedLoc, animSeedFor(pWindow.get()));
+    if (cs->alphaLoc >= 0)
+        glUniform1f(cs->alphaLoc, elem->m_data.a);
+    if (cs->surfaceSizeLoc >= 0)
+        glUniform2f(cs->surfaceSizeLoc, logicalW, logicalH);
+    if (cs->holeLoc >= 0)
+        glUniform4f(cs->holeLoc, holeX, holeY, holeW, holeH);
+    if (cs->radiusLoc >= 0)
+        glUniform4f(cs->radiusLoc, radiusLogical, radiusLogical, radiusLogical, radiusLogical);
+    if (cs->scaleLoc >= 0)
+        glUniform1f(cs->scaleLoc, scale);
+    if (cs->expandLoc >= 0)
+        glUniform2f(cs->expandLoc, padPx / logicalW, padPx / logicalH);
+    if (cs->paletteCountLoc >= 0)
+        glUniform1i(cs->paletteCountLoc, 0);
+    if (cs->paletteLoc >= 0) {
+        // A fixed 4-stop fallback standing in for the theme palette this pass
+        // cannot read. Stop 0 doubles as dual-orbit's steady base ring, so it
+        // is deliberately dark; the later stops are bright ice-cyan so the
+        // orbiting highlights pop against it.
+        const float palette[16] = {0.07f, 0.12f, 0.19f, 1.0f, 0.45f, 0.95f, 1.0f, 1.0f,
+                                   0.25f, 0.70f, 0.95f, 1.0f, 0.60f, 0.92f, 1.0f, 1.0f};
+        glUniform4fv(cs->paletteLoc, 4, palette);
+    }
+
+    // Continuous redraw while the shader binds `time` — but only the ring:
+    // damageWindow would repaint the whole window (blur included) every frame
+    // for a change that lives entirely in the border. The ring box is
+    // monitor-local buffer px here; damageBox wants global logical coords.
+    if (cs->usesTime && pWindow) {
+        CBox dmg = newBox;
+        dmg.scale(1.0 / scale);
+        if (mon)
+            dmg.translate(mon->m_position);
+        dmg.expand(2);
+        g_pHyprRenderer->damageBox(dmg);
+    }
+
+    glBindVertexArray(cs->shader->getUniformLocation(SHADER_SHADER_VAO));
+
+    // Same draw region as the native border: never the window interior.
+    CRegion borderRegion = R.damage.copy().intersect(newBox);
+    borderRegion.subtract(innerBox.copy().expand(-scaledBorderSize - roundPx));
+    if (R.clipBox.width != 0 && R.clipBox.height != 0)
+        borderRegion.intersect(R.clipBox);
+
+    if (!borderRegion.empty()) {
+        borderRegion.forEachRect([&ctx](const auto& RECT) {
+            Render::GL::g_pHyprOpenGL->scissor(ctx, &RECT, ctx.m_data.transformDamage);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        });
+    }
+
+    glBindVertexArray(0);
+    Render::GL::g_pHyprOpenGL->blend(savedBlend);
+}
+
+// --- SHADOW HOOK ---
+// CHyprOpenGLImpl::renderRoundedShadow draws every window shadow. While the
+// active-focus border mode is on, shadows are suppressed entirely: the ring is
+// transparent by design and the shadow's gradient over it reads as the dark
+// band the effect is supposed to remove. Both overloads funnel into the
+// two-gradient one, so hooking that covers every caller.
+typedef void (*TRoundedShadow)(void* thisptr, Render::CRenderContext& ctx, const CBox& box, int round, float roundingPower, int range,
+                               const Config::CGradientValueData& grad1, const Config::CGradientValueData& grad2, float lerp, float a,
+                               const Render::SWindowRenderPresentation& presentation);
+
+void hkRoundedShadow(void* thisptr, Render::CRenderContext& ctx, const CBox& box, int round, float roundingPower, int range,
+                     const Config::CGradientValueData& grad1, const Config::CGradientValueData& grad2, float lerp, float a,
+                     const Render::SWindowRenderPresentation& presentation) {
+    if (g_bSuppressNativeBorder)
+        return;
+    ((TRoundedShadow)g_pShadowHook->m_original)(thisptr, ctx, box, round, roundingPower, range, grad1, grad2, lerp, a, presentation);
+}

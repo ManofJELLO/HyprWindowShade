@@ -4,13 +4,20 @@
 // resolve from the host process at dlopen, so we don't link -llua ourselves.
 #include <lua.hpp>
 
+using Config::CCssGapData;
+
 // --- DEFINE EXTERN VARIABLES ---
 HANDLE                                                PHANDLE = nullptr;
 std::vector<CHyprSignalListener>                      g_Listeners;
 std::unordered_map<Desktop::View::CWindow*, std::string>        g_mWindowManualShaders;
+std::unordered_map<Desktop::View::CWindow*, std::string>        g_mWindowBorderShaders;
 std::unordered_map<Desktop::View::CWindow*, WindowShaderState>  g_mWindowRuleShaders;
 std::map<std::string, std::string>                    g_mLayerNamespaceShaderMap;
 std::map<std::string, std::string>                    g_mWindowClassShaderMap;
+std::map<std::string, std::string>                    g_mWindowClassBorderShaderMap;
+std::string                                           g_sActiveBorderShader;
+bool                                                  g_bSuppressNativeBorder = false;
+CFunctionHook*                                        g_pShadowHook           = nullptr;
 std::map<std::string, CompiledShader>                 g_mCompiledCShaders;
 std::map<std::string, time_t>                         g_mFailedShaderMtimes;
 std::map<std::string, time_t>                         g_mDurationWarnedMtimes;
@@ -26,6 +33,7 @@ PreCloseSnapshot                                      g_preCloseSnapshot;
 PendingLayerRetime                                    g_pendingLayerRetime;
 CFunctionHook*                                        g_pGLDrawTexHook          = nullptr;
 CFunctionHook*                                        g_pUseShaderHook          = nullptr;
+CFunctionHook*                                        g_pBorderDrawHook         = nullptr;
 CFunctionHook*                                        g_pFadeoutCreateHook      = nullptr;
 CFunctionHook*                                        g_pFadeoutDoneHook        = nullptr;
 CFunctionHook*                                        g_pLayerFadeoutCreateHook = nullptr;
@@ -90,6 +98,146 @@ namespace shadeActions {
         else
             g_mWindowManualShaders[rawWin] = path;
         g_pHyprRenderer->damageWindow(pWindow);
+    }
+
+    // --- BORDER SHADER ACTIONS ---
+    // Same conventions as the window-shader actions: "clear"/"none" removes,
+    // every change damages the windows it affects. bordershader targets the
+    // most recently active window (toggle semantics); classbordershader keys by
+    // class like classshader.
+    //
+    // Ring width: a border shader declares what it needs (`// @border <px>`)
+    // because the ring is Hyprland's own general:border_size, a global config
+    // value with no per-shader equivalent. Applied on the first activation,
+    // restored when the LAST border assignment is cleared, so the plugin never
+    // fights a config tool that reapplies its own value — a config reload while
+    // the effect runs still resets it until the shader is applied again.
+
+    // Saved general:border_size while border shaders are active. The ring
+    // paints OVER the existing gap space — verified live: with the user's gaps
+    // (5) the ring renders complete on all four edges, the shared spacing
+    // between windows already leaves it room, and inactive windows keep their
+    // configured gaps untouched. So the plugin never writes gaps_in/gaps_out:
+    // spacing belongs to the user's config, with or without an effect. Saved
+    // once, restored on the last clear, re-asserted after config reloads.
+    static int           g_savedBorderSize = -1;
+    static bool          g_bBorderGeomSaved = false;
+
+    // Writes a runtime config table through the same path the user's own
+    // `hyprctl dispatch 'hl.config({...})'` takes — but as a lua FUNCTION, so
+    // the dispatch shorthand treats it as a callable action instead of erroring
+    // on hl.config's nil return ("expected a dispatcher" toast).
+    static void setRuntimeConfig(const std::string& luaTable) {
+        HyprlandAPI::invokeHyprctlCommand("dispatch", "function() hl.config(" + luaTable + ") end");
+    }
+
+    static int currentConfigInt(const std::string& name) {
+        static std::unordered_map<std::string, CConfigValue<Config::INTEGER>> s_values;
+        auto it = s_values.try_emplace(name, name).first;
+        return sc<int>(*it->second);
+    }
+
+    // Writes the target border_size for a ring of `need` px. Gaps are never
+    // written: the ring draws over the existing spacing, and inactive windows
+    // keep their configured gaps. Always writes: the call runs once per
+    // apply/reload, not per frame.
+    static void assertBorderGeom(int need) {
+        if (need <= 0 || !g_bBorderGeomSaved) return;
+        setRuntimeConfig(std::format("{{ general = {{ border_size = {} }} }}", need));
+    }
+
+    // Applies the declared ring width of `path` (0 = leave alone). border_size
+    // is saved once — a second shader never saves the plugin's own override as
+    // "the user's" — and nothing else is touched: the ring draws over the gap
+    // space between windows, so the layout and the user's spacing stay as
+    // configured.
+    static void applyBorderGeomFor(const std::string& path) {
+        const int need = declaredBorderWidth(path);
+        if (need <= 0) return;
+        if (!g_bBorderGeomSaved) {
+            g_savedBorderSize  = currentConfigInt("general:border_size");
+            g_bBorderGeomSaved = true;
+        }
+        assertBorderGeom(need);
+    }
+
+    // Restores the saved config values when no border shader assignment is
+    // left anywhere (active-focus, per-window or per-class).
+    static void restoreBorderGeomIfIdle() {
+        if (!g_bBorderGeomSaved) return;
+        if (!g_sActiveBorderShader.empty() || !g_mWindowBorderShaders.empty() || !g_mWindowClassBorderShaderMap.empty())
+            return;
+        setRuntimeConfig(std::format("{{ general = {{ border_size = {} }} }}", g_savedBorderSize));
+        g_bBorderGeomSaved = false;
+    }
+
+    // Config reloads re-apply the user's values; re-assert the widest declared
+    // ring while any border assignment survives the reload.
+    static void reassertBorderGeomAfterReload() {
+        if (!g_bBorderGeomSaved) return;
+        int need = 0;
+        if (!g_sActiveBorderShader.empty()) need = std::max(need, declaredBorderWidth(g_sActiveBorderShader));
+        for (auto& [_, p] : g_mWindowBorderShaders) need = std::max(need, declaredBorderWidth(p));
+        for (auto& [_, p] : g_mWindowClassBorderShaderMap) need = std::max(need, declaredBorderWidth(p));
+        if (need > 0) assertBorderGeom(need);
+        else restoreBorderGeomIfIdle();
+    }
+
+    // PLUGIN_EXIT: the maps are being cleared either way, so restore the saved
+    // geometry unconditionally — the "assignments remain" guard must not fire.
+    static void restoreBorderGeomIfIdleOnExit() {
+        if (!g_bBorderGeomSaved) return;
+        setRuntimeConfig(std::format("{{ general = {{ border_size = {} }} }}", g_savedBorderSize));
+        g_bBorderGeomSaved = false;
+    }
+
+    static void toggleBorderShader(const std::string& path) {
+        if (path.empty()) return;
+
+        PHLWINDOW pWindow = g_lastActiveWindow.lock();
+        if (!pWindow) return;
+
+        Desktop::View::CWindow* rawWin = pWindow.get();
+        if (path == "clear" || path == "none" || g_mWindowBorderShaders.find(rawWin) != g_mWindowBorderShaders.end()) {
+            g_mWindowBorderShaders.erase(rawWin);
+            restoreBorderGeomIfIdle();
+        } else {
+            g_mWindowBorderShaders[rawWin] = path;
+            applyBorderGeomFor(path);
+        }
+        g_pHyprRenderer->damageWindow(pWindow);
+    }
+
+    static void setClassBorderShader(const std::string& cls, const std::string& path) {
+        if (path == "clear" || path == "none") {
+            g_mWindowClassBorderShaderMap.erase(cls);
+            restoreBorderGeomIfIdle();
+        } else {
+            g_mWindowClassBorderShaderMap[cls] = path;
+            applyBorderGeomFor(path);
+        }
+
+        for (auto& w : Desktop::windowState()->windows())
+            if (w && (w->metadata().initialAppID() == cls || w->metadata().appID() == cls))
+                g_pHyprRenderer->damageWindow(w);
+    }
+
+    // Active-focus border shader: one path, applied to whichever window has
+    // focus. Every window's ring can change (the effect moves with focus), so
+    // set/clear damages all monitors — the cheap, unambiguous version. While
+    // the mode is on, windows without their own border shader draw NO native
+    // border: their ring is transparent, matching the wavy silhouette.
+    static void setActiveBorderShader(const std::string& path) {
+        if (path == "clear" || path == "none") {
+            g_sActiveBorderShader.clear();
+            g_bSuppressNativeBorder = false;
+            restoreBorderGeomIfIdle();
+        } else {
+            g_sActiveBorderShader   = path;
+            g_bSuppressNativeBorder = true;
+            applyBorderGeomFor(path);
+        }
+        damageAllMonitors();
     }
 
     static void setClassShader(const std::string& cls, const std::string& path) {
@@ -167,6 +315,22 @@ static int luaClassShader(lua_State* L) {
     shadeActions::setClassShader(a, b);
     return 0;
 }
+static int luaToggleBorderShader(lua_State* L) {
+    const char* path = luaL_checkstring(L, 1);
+    shadeActions::toggleBorderShader(path);
+    return 0;
+}
+static int luaClassBorderShader(lua_State* L) {
+    const char* a = luaL_checkstring(L, 1);
+    const char* b = luaL_checkstring(L, 2);
+    shadeActions::setClassBorderShader(a, b);
+    return 0;
+}
+static int luaActiveBorderShader(lua_State* L) {
+    const char* path = luaL_checkstring(L, 1);
+    shadeActions::setActiveBorderShader(path);
+    return 0;
+}
 static int luaToggleClassShader(lua_State* L) {
     const char* a = luaL_checkstring(L, 1);
     const char* b = luaL_checkstring(L, 2);
@@ -222,6 +386,44 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     } else {
         HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] FATAL: CGLElementRenderer::draw(CTexPassElement) not found!", CHyprColor(1.0f, 0.0f, 0.0f, 1.0f), 10000.0f);
     }
+
+    // --- V0.57-border HOOK 2b: CGLElementRenderer::draw(CBorderPassElement) ---
+    // Optional, like the close hooks: if the symbol is missing, border shaders
+    // are unavailable and everything else keeps working.
+    for (auto& m : methodsDraw) {
+        if (m.signature.find("18CGLElementRenderer4draw") != std::string::npos &&
+            m.signature.find("CBorderPassElement")         != std::string::npos) {
+            void* borderDrawAddr = m.address;
+            if (borderDrawAddr) {
+                g_pBorderDrawHook = HyprlandAPI::createFunctionHook(PHANDLE, borderDrawAddr, (void*)&hkBorderDraw);
+                g_pBorderDrawHook->hook();
+            }
+            break;
+        }
+    }
+    if (!g_pBorderDrawHook)
+        HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] Border pass hook not found — bordershader: disabled.",
+                                     CHyprColor(1.0f, 0.7f, 0.2f, 1.0f), 8000.0f);
+
+    // --- V0.57-border HOOK 2c: CHyprOpenGLImpl::renderRoundedShadow (long overload) ---
+    // Optional: without it shadows stay on while the active-focus mode runs.
+    auto methodsShadow = HyprlandAPI::findFunctionsByName(PHANDLE, "renderRoundedShadow");
+    for (auto& m : methodsShadow) {
+        // The two-gradient overload: `ESC_` marks the repeated CGradientValueData
+        // parameter that distinguishes it from the single-gradient wrapper.
+        if (m.signature.find("15CHyprOpenGLImpl19renderRoundedShadow") != std::string::npos &&
+            m.signature.find("CGradientValueDataESC_") != std::string::npos) {
+            void* shadowAddr = m.address;
+            if (shadowAddr) {
+                g_pShadowHook = HyprlandAPI::createFunctionHook(PHANDLE, shadowAddr, (void*)&hkRoundedShadow);
+                g_pShadowHook->hook();
+            }
+            break;
+        }
+    }
+    if (!g_pShadowHook)
+        HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] Shadow hook not found — shadows stay on in focus-border mode.",
+                                     CHyprColor(1.0f, 0.7f, 0.2f, 1.0f), 8000.0f);
 
     // --- V0.56 HOOK 2: useShader ---
     auto methodsUse = HyprlandAPI::findFunctionsByName(PHANDLE, "useShader");
@@ -446,6 +648,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         Desktop::View::CWindow* rawWin = window.get();
         g_mWindowManualShaders.erase(rawWin);
         g_mWindowRuleShaders.erase(rawWin);
+        g_mWindowBorderShaders.erase(rawWin);
         g_mWindowOpenTimes.erase(rawWin);
         g_mWindowMotion.erase(rawWin);
         g_mWindowOneShots.erase(rawWin);
@@ -463,11 +666,24 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     // --- LUA FUNCTIONS (hl.plugin.HyprWindowShade.* — for Lua-based configs) ---
     // Removed automatically on plugin unload (per PluginAPI.hpp), but PLUGIN_EXIT
     // calls removeLuaFunction defensively to keep teardown symmetric.
+    // --- BORDER RING RE-ASSERT ON CONFIG RELOAD ---
+    // hve (or any config tool) owns the config and resets general:* on every
+    // reload, which collapses the ring the border shader declared with
+    // `// @border <px>`. User decision (odd/tasks/border-shader.md L5): the
+    // config tool applies its values and the shader re-declares its runtime
+    // need right after — so while any border assignment is active, the widest
+    // declared ring (and its gap compensation) is re-applied here, after the
+    // reload finished.
+    g_Listeners.push_back(Event::bus()->m_events.config.reloaded.listen([]() { shadeActions::reassertBorderGeomAfterReload(); }));
+
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "layershader",        &luaLayerShader);
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "togglelayershader",  &luaToggleLayerShader);
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "togglewindowshader", &luaToggleWindowShader);
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "classshader",        &luaClassShader);
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "toggleclassshader",  &luaToggleClassShader);
+    HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "bordershader",       &luaToggleBorderShader);
+    HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "classbordershader",  &luaClassBorderShader);
+    HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "activebordershader", &luaActiveBorderShader);
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "layeropenanim",      &luaLayerOpenAnim);
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "layercloseanim",     &luaLayerCloseAnim);
     HyprlandAPI::addLuaFunction(PHANDLE, "HyprWindowShade", "reloadshaders",      &luaReloadShaders);
@@ -481,8 +697,16 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 APICALL EXPORT void PLUGIN_EXIT() {
     g_Listeners.clear();
 
+    // Hand the ring geometry back before anything else: the mode's config
+    // writes must not outlive the hooks that re-assert them.
+    shadeActions::restoreBorderGeomIfIdleOnExit();
+    g_bSuppressNativeBorder = false;
+
     g_mWindowManualShaders.clear();
     g_mWindowRuleShaders.clear();
+    g_mWindowBorderShaders.clear();
+    g_mWindowClassBorderShaderMap.clear();
+    g_sActiveBorderShader.clear();
     g_mLayerNamespaceShaderMap.clear();
     g_mWindowClassShaderMap.clear();
     g_mFailedShaderMtimes.clear();
@@ -525,6 +749,8 @@ APICALL EXPORT void PLUGIN_EXIT() {
     if (g_pFadeoutRenderBoxHook)      HyprlandAPI::removeFunctionHook(PHANDLE, g_pFadeoutRenderBoxHook);
     if (g_pLayerFadeoutRenderBoxHook) HyprlandAPI::removeFunctionHook(PHANDLE, g_pLayerFadeoutRenderBoxHook);
     if (g_pArrangeLayersHook)         HyprlandAPI::removeFunctionHook(PHANDLE, g_pArrangeLayersHook);
+    if (g_pBorderDrawHook)            HyprlandAPI::removeFunctionHook(PHANDLE, g_pBorderDrawHook);
+    if (g_pShadowHook)                HyprlandAPI::removeFunctionHook(PHANDLE, g_pShadowHook);
 
     HyprlandAPI::removeLuaFunction(PHANDLE, "HyprWindowShade", "layershader");
     HyprlandAPI::removeLuaFunction(PHANDLE, "HyprWindowShade", "togglelayershader");

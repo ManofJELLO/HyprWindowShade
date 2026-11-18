@@ -22,10 +22,13 @@ using Render::GL::CHyprOpenGLImpl;
 
 // --- V0.56 HOOK TARGETS ---
 #include <hyprland/src/render/pass/TexPassElement.hpp>
+#include <hyprland/src/render/pass/BorderPassElement.hpp>
 
 // --- PLUGIN SYSTEM ---
 #include <hyprland/src/plugins/HookSystem.hpp>
 #include <hyprland/src/plugins/PluginAPI.hpp>
+#include <hyprland/src/config/ConfigValue.hpp>
+#include <hyprland/src/config/shared/complex/ComplexDataTypes.hpp>
 #include <hyprland/src/desktop/view/window/Window.hpp>
 #include <hyprland/src/desktop/view/window/WindowPresentation.hpp>
 #include <hyprland/src/desktop/view/window/WindowMetadata.hpp>
@@ -83,6 +86,12 @@ extern std::vector<CHyprSignalListener> g_Listeners;
 // identity. String-keyed maps below stay std::map — small-N tree lookups on
 // short keys are comparable to hashing without the bucket-allocation overhead.
 extern std::unordered_map<Desktop::View::CWindow*, std::string> g_mWindowManualShaders;
+
+// --- BORDER SHADER ASSIGNMENT ---
+// Border shaders draw in the ring pass around the window (Umbriel-style border
+// canvas), keyed independently of the content-shader maps above so both can be
+// used at once or separately.
+extern std::unordered_map<Desktop::View::CWindow*, std::string> g_mWindowBorderShaders;
 
 struct WindowShaderState {
     std::string active;
@@ -406,6 +415,15 @@ struct CompiledShader {
     // so a shaded window loses its dim entirely — the same way it lost its
     // corner rounding before the wrapper started re-applying that.
     GLint     dimLoc          = -1; // float: tint multiplier, 1.0 = no dim
+    // Border-shader uniforms (umbriel ring pass). Valid only for entries
+    // compiled by getOrCompileBorderShader; -1 when absent in the source.
+    GLint     holeLoc         = -1; // vec4: window rect inside the ring, normalised
+    GLint     radiusLoc       = -1; // vec4: per-corner radii, logical px
+    GLint     scaleLoc        = -1; // float: monitor scale
+    GLint     paletteCountLoc = -1; // int: theme palette count, 0 for now
+    GLint     paletteLoc      = -1; // vec4[4]: fallback palette stops
+    GLint     expandLoc       = -1; // vec2: declared padding, normalised to the canvas
+    int       paddingPx       = 0;  // declared `// @padding <px>` beyond the ring
     bool      usesTime        = false;
     // Seconds the one-shot animation should run for, declared in the shader as
     // `// @duration 0.35`. <0 means the shader didn't say.
@@ -440,6 +458,16 @@ inline constexpr const char* LAYER_CATCH_ALL = "*";
 
 extern std::map<std::string, std::string>          g_mLayerNamespaceShaderMap;
 extern std::map<std::string, std::string>          g_mWindowClassShaderMap;
+extern std::map<std::string, std::string>          g_mWindowClassBorderShaderMap;
+// Active-focus border shader: applies to whichever window currently has
+// focus (Umbriel's model — the effect follows focus). Empty = off.
+extern std::string                                g_sActiveBorderShader;
+// While an active-focus border shader is set, the native border is suppressed
+// for windows WITHOUT a border shader: their ring renders transparent (the
+// desktop shows through) instead of the native gradient, which read as a dark
+// band around every window. Cleared together with the mode.
+extern bool                                       g_bSuppressNativeBorder;
+extern std::string                                g_sActiveBorderShader;
 
 // Layer surfaces (bars, notifications, rofi/wofi) have no rule tags in v0.56, so
 // their animations are keyed by namespace like the rest of the layer API rather
@@ -468,6 +496,11 @@ extern std::map<std::string, time_t>               g_mDurationWarnedMtimes;
 // V0.55: hook the concrete renderer that draws texture pass elements
 extern CFunctionHook* g_pGLDrawTexHook;
 extern CFunctionHook* g_pUseShaderHook;
+// V0.57-border: hook the concrete renderer that draws BORDER pass elements
+// (CGLElementRenderer::draw(CRenderContext, CBorderPassElement, CRegion)).
+// Optional in the same way the close-animation hooks are: if the symbol is not
+// found, border shaders are simply unavailable and everything else keeps working.
+extern CFunctionHook* g_pBorderDrawHook;
 // Optional — close animations degrade to "off" if either symbol is missing,
 // rather than taking the whole plugin down.
 extern CFunctionHook* g_pFadeoutCreateHook;
@@ -476,6 +509,10 @@ extern CFunctionHook* g_pLayerFadeoutCreateHook;
 extern CFunctionHook* g_pLayerFadeoutDoneHook;
 extern CFunctionHook* g_pFadeoutRenderBoxHook;
 extern CFunctionHook* g_pLayerFadeoutRenderBoxHook;
+
+// While the active-focus mode is on, the native SHADOW is suppressed too: it
+// darkens the ring area and reads as the dark band behind the floating wave.
+extern CFunctionHook* g_pShadowHook;
 
 // --- ACTIVE RENDER CONTEXT ---
 // Set by hkGLDrawTex before delegating; consumed by hkUseShader during the call.
@@ -538,7 +575,14 @@ extern float               g_pCurrentRoundPower;
 
 // --- FUNCTION DECLARATIONS ---
 CompiledShader*                             getOrCompileShader(const std::string& shaderPath);
+CompiledShader*                             getOrCompileBorderShader(const std::string& shaderPath);
+int                                         declaredBorderWidth(const std::string& shaderPath);
+int                                         declaredBorderPadding(const std::string& shaderPath);
 void                                        hkGLDrawTex(void* thisptr, Render::CRenderContext& ctx, Hyprutils::Memory::CWeakPointer<CTexPassElement> element, const CRegion& damage);
+void                                        hkBorderDraw(void* thisptr, Render::CRenderContext& ctx, Hyprutils::Memory::CWeakPointer<CBorderPassElement> element, const CRegion& damage);
+void                                        hkRoundedShadow(void* thisptr, Render::CRenderContext& ctx, const CBox& box, int round, float roundingPower, int range,
+                                                            const Config::CGradientValueData& grad1, const Config::CGradientValueData& grad2, float lerp, float a,
+                                                            const Render::SWindowRenderPresentation& presentation);
 Hyprutils::Memory::CWeakPointer<CShader>    hkUseShader(CHyprOpenGLImpl* thisptr, Hyprutils::Memory::CWeakPointer<CShader> prog);
 void                                        applyShaderRulesSafe(PHLWINDOW pWindow);
 void                                        latchTransformFlavour(Desktop::View::CWindow* raw, uint8_t flavour);
