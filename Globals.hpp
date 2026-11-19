@@ -521,8 +521,6 @@ extern CFunctionHook* g_pUseShaderHook;
 // Optional in the same way the close-animation hooks are: if the symbol is not
 // found, border shaders are simply unavailable and everything else keeps working.
 extern CFunctionHook* g_pBorderDrawHook;
-// V0.57: the direct border draw on IHyprRenderer (bypasses the border pass).
-extern CFunctionHook* g_pNativeBorderHook;
 // Optional — close animations degrade to "off" if either symbol is missing,
 // rather than taking the whole plugin down.
 extern CFunctionHook* g_pFadeoutCreateHook;
@@ -602,11 +600,6 @@ int                                         declaredBorderWidth(const std::strin
 int                                         declaredBorderPadding(const std::string& shaderPath);
 void                                        hkGLDrawTex(void* thisptr, Render::CRenderContext& ctx, Hyprutils::Memory::CWeakPointer<CTexPassElement> element, const CRegion& damage);
 void                                        hkBorderDraw(void* thisptr, Render::CRenderContext& ctx, Hyprutils::Memory::CWeakPointer<CBorderPassElement> element, const CRegion& damage);
-// V0.57 ALSO draws window borders through IHyprRenderer::draw(SBorderData) — a
-// direct call that bypasses the border pass entirely, so hkBorderDraw never sees
-// it and the native ring keeps painting under the effect canvas (the green line
-// peeking through the canvas's hole-cut AA). Hook it with the same policy.
-void                                        hkNativeBorderDraw(void* thisptr, Render::CRenderContext& ctx, const CBorderPassElement::SBorderData& data, const CRegion& damage);
 void                                        hkRoundedShadow(void* thisptr, Render::CRenderContext& ctx, const CBox& box, int round, float roundingPower, int range,
                                                             const Config::CGradientValueData& grad1, const Config::CGradientValueData& grad2, float lerp, float a,
                                                             const Render::SWindowRenderPresentation& presentation);

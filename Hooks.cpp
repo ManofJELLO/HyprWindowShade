@@ -2604,23 +2604,6 @@ static const std::string* borderShaderPathFor(const PHLWINDOW& pWindow) {
     return nullptr;
 }
 
-// --- V0.57: IHyprRenderer::draw(SBorderData) — the direct border draw ---
-// Window borders that Hyprland draws straight through the renderer (not as a
-// border pass element) never reach hkBorderDraw, so the native ring kept
-// painting under the effect canvas — visible as a green line through the
-// canvas's hole-cut AA whenever an effect with a short outer band ran. Same
-// policy as the pass hook: a window with a border shader gets its ring only
-// from the canvas, and while active-focus mode is on windows without a
-// shader draw no native ring at all.
-typedef void (*TNativeBorderDraw)(void* thisptr, Render::CRenderContext& ctx, const CBorderPassElement::SBorderData& data, const CRegion& damage);
-
-void hkNativeBorderDraw(void* thisptr, Render::CRenderContext& ctx, const CBorderPassElement::SBorderData& data, const CRegion& damage) {
-    PHLWINDOW pWindow = data.window.lock();
-    if (borderShaderPathFor(pWindow) || (!pWindow && g_bSuppressNativeBorder))
-        return;
-    ((TNativeBorderDraw)g_pNativeBorderHook->m_original)(thisptr, ctx, data, damage);
-}
-
 void hkBorderDraw(void* thisptr, Render::CRenderContext& ctx, Hyprutils::Memory::CWeakPointer<CBorderPassElement> element, const CRegion& damage) {
     CBorderPassElement* elem = element.get();
 
@@ -2629,7 +2612,23 @@ void hkBorderDraw(void* thisptr, Render::CRenderContext& ctx, Hyprutils::Memory:
     if (elem)
         pWindow = elem->m_data.window.lock();
 
-    const std::string* path = borderShaderPathFor(pWindow);
+    const std::string* path = nullptr;
+    if (pWindow) {
+        Desktop::View::CWindow* rawWin = pWindow.get();
+        if (auto it = g_mWindowBorderShaders.find(rawWin); it != g_mWindowBorderShaders.end())
+            path = &it->second;
+        else if (!g_sActiveBorderShader.empty() && Desktop::focusState()->isWindowActive(pWindow))
+            path = &g_sActiveBorderShader;
+        else {
+            const auto& initClass    = rawWin->metadata().initialAppID();
+            const auto& currentClass = rawWin->metadata().appID();
+            auto        classIt      = g_mWindowClassBorderShaderMap.find(initClass);
+            if (classIt == g_mWindowClassBorderShaderMap.end())
+                classIt = g_mWindowClassBorderShaderMap.find(currentClass);
+            if (classIt != g_mWindowClassBorderShaderMap.end())
+                path = &classIt->second;
+        }
+    }
 
     // Fast path: the overwhelming majority of draws have no border shader.
     // While the active-focus mode is on, windows without their own border

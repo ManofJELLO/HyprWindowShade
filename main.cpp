@@ -70,7 +70,6 @@ PendingLayerRetime                                    g_pendingLayerRetime;
 CFunctionHook*                                        g_pGLDrawTexHook          = nullptr;
 CFunctionHook*                                        g_pUseShaderHook          = nullptr;
 CFunctionHook*                                        g_pBorderDrawHook         = nullptr;
-CFunctionHook*                                        g_pNativeBorderHook       = nullptr;
 CFunctionHook*                                        g_pFadeoutCreateHook      = nullptr;
 CFunctionHook*                                        g_pFadeoutDoneHook        = nullptr;
 CFunctionHook*                                        g_pLayerFadeoutCreateHook = nullptr;
@@ -457,24 +456,6 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     if (!g_pBorderDrawHook)
         HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] Border pass hook not found — bordershader: disabled.",
                                      CHyprColor(1.0f, 0.7f, 0.2f, 1.0f), 8000.0f);
-
-    // --- V0.57 HOOK 2d: IHyprRenderer::draw(SBorderData) — the direct border draw ---
-    // Window borders Hyprland draws straight through the renderer bypass the
-    // border pass (and hook 2b), so the native ring kept painting under the
-    // effect canvas. Same policy as the pass hook: no ring when a shader owns
-    // the window's border, none either in active-focus mode for windows
-    // without their own shader. Optional — without it the native ring simply
-    // keeps painting underneath the canvas.
-    for (auto& m : methodsDraw) {
-        if (m.signature.find("SBorderData") != std::string::npos && m.signature.find("draw") != std::string::npos) {
-            void* nativeBorderAddr = m.address;
-            if (nativeBorderAddr) {
-                g_pNativeBorderHook = HyprlandAPI::createFunctionHook(PHANDLE, nativeBorderAddr, (void*)&hkNativeBorderDraw);
-                g_pNativeBorderHook->hook();
-            }
-            break;
-        }
-    }
 
     // --- V0.57-border HOOK 2c: CHyprOpenGLImpl::renderRoundedShadow (long overload) ---
     // Optional: without it shadows stay on while the active-focus mode runs.
