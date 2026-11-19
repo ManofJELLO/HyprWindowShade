@@ -1645,8 +1645,19 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
             // supported way to read a window's logical geometry.
             Vector2D sz(0, 0);
             if (contextWindow) {
-                if (const auto box = contextWindow->logicalBox())
+                // surfaceLogicalBox, not logicalBox: the view's logicalBox spans
+                // the window WITH its shadow margins (measured ~+29x+32 on a
+                // 1161x1328 kitty), while the texture this shader draws spans
+                // the surface box alone. A shader that laid art out against
+                // logicalBox placed its frame ~15px outside the real window
+                // edge and split its perimeter against a longer rim — exactly
+                // the drift paired border/window effects showed. The border
+                // pass's hole is the real window box, so the window pass must
+                // answer with the same box for the pair to coordinate.
+                if (const auto box = contextWindow->surfaceLogicalBox())
                     sz = box->size();
+                else if (const auto lbox = contextWindow->logicalBox())
+                    sz = lbox->size();
             }
             // A layer surface and a close animation's snapshot both arrive with
             // no window, and used to leave this at (0,0). Any shader converting
@@ -2571,6 +2582,45 @@ static void bindThemePalette(GLint countLoc, GLint paletteLoc) {
 // border shader this returns Hyprland's own draw untouched.
 typedef void (*TBorderDraw)(void* thisptr, Render::CRenderContext& ctx, Hyprutils::Memory::CWeakPointer<CBorderPassElement> element, const CRegion& damage);
 
+// Which border shader, if any, applies to this window: per-window assignment,
+// the active-focus effect, or a class rule. Returns a borrowed pointer — the
+// caller must not hold it past this call (the maps can mutate between frames).
+static const std::string* borderShaderPathFor(const PHLWINDOW& pWindow) {
+    if (!pWindow)
+        return nullptr;
+    Desktop::View::CWindow* rawWin = pWindow.get();
+    if (auto it = g_mWindowBorderShaders.find(rawWin); it != g_mWindowBorderShaders.end())
+        return &it->second;
+    if (!g_sActiveBorderShader.empty() && Desktop::focusState()->isWindowActive(pWindow))
+        // Active-focus mode: the effect follows the focused window.
+        return &g_sActiveBorderShader;
+    const auto& initClass    = rawWin->metadata().initialAppID();
+    const auto& currentClass = rawWin->metadata().appID();
+    auto        classIt      = g_mWindowClassBorderShaderMap.find(initClass);
+    if (classIt == g_mWindowClassBorderShaderMap.end())
+        classIt = g_mWindowClassBorderShaderMap.find(currentClass);
+    if (classIt != g_mWindowClassBorderShaderMap.end())
+        return &classIt->second;
+    return nullptr;
+}
+
+// --- V0.57: IHyprRenderer::draw(SBorderData) — the direct border draw ---
+// Window borders that Hyprland draws straight through the renderer (not as a
+// border pass element) never reach hkBorderDraw, so the native ring kept
+// painting under the effect canvas — visible as a green line through the
+// canvas's hole-cut AA whenever an effect with a short outer band ran. Same
+// policy as the pass hook: a window with a border shader gets its ring only
+// from the canvas, and while active-focus mode is on windows without a
+// shader draw no native ring at all.
+typedef void (*TNativeBorderDraw)(void* thisptr, Render::CRenderContext& ctx, const CBorderPassElement::SBorderData& data, const CRegion& damage);
+
+void hkNativeBorderDraw(void* thisptr, Render::CRenderContext& ctx, const CBorderPassElement::SBorderData& data, const CRegion& damage) {
+    PHLWINDOW pWindow = data.window.lock();
+    if (borderShaderPathFor(pWindow) || (!pWindow && g_bSuppressNativeBorder))
+        return;
+    ((TNativeBorderDraw)g_pNativeBorderHook->m_original)(thisptr, ctx, data, damage);
+}
+
 void hkBorderDraw(void* thisptr, Render::CRenderContext& ctx, Hyprutils::Memory::CWeakPointer<CBorderPassElement> element, const CRegion& damage) {
     CBorderPassElement* elem = element.get();
 
@@ -2579,26 +2629,7 @@ void hkBorderDraw(void* thisptr, Render::CRenderContext& ctx, Hyprutils::Memory:
     if (elem)
         pWindow = elem->m_data.window.lock();
 
-    const std::string* path = nullptr;
-    if (pWindow) {
-        Desktop::View::CWindow* rawWin = pWindow.get();
-        if (auto it = g_mWindowBorderShaders.find(rawWin); it != g_mWindowBorderShaders.end())
-            path = &it->second;
-        else if (!g_sActiveBorderShader.empty() && Desktop::focusState()->isWindowActive(pWindow))
-            // Active-focus mode: the effect follows the focused window. Must
-            // not hold a reference into g_sActiveBorderShader past this call
-            // into the compiled cache — borrow for the lookup only.
-            path = &g_sActiveBorderShader;
-        else {
-            const auto& initClass    = rawWin->metadata().initialAppID();
-            const auto& currentClass = rawWin->metadata().appID();
-            auto        classIt      = g_mWindowClassBorderShaderMap.find(initClass);
-            if (classIt == g_mWindowClassBorderShaderMap.end())
-                classIt = g_mWindowClassBorderShaderMap.find(currentClass);
-            if (classIt != g_mWindowClassBorderShaderMap.end())
-                path = &classIt->second;
-        }
-    }
+    const std::string* path = borderShaderPathFor(pWindow);
 
     // Fast path: the overwhelming majority of draws have no border shader.
     // While the active-focus mode is on, windows without their own border
@@ -2662,8 +2693,23 @@ void hkBorderDraw(void* thisptr, Render::CRenderContext& ctx, Hyprutils::Memory:
     // hole is the window rect inset by the border width + padding.
     const auto  mon   = R.pMonitor.lock();
     const float scale = mon ? mon->m_scale : 1.0f;
-    const float logicalW = newBox.width / scale, logicalH = newBox.height / scale;
+    // The hole's logical size must be the window's EXACT logical box — the same
+    // box the window pass binds as surface_size (surfaceLogicalBox). Deriving
+    // it from the integer device canvas instead (innerBox/scale) left a ~0.03%
+    // stretch and a ~2px perimeter mismatch at fractional monitor scales: the
+    // paired overlay's art then walked a couple of px ahead of the border's on
+    // a 1.0667x monitor while integer-scale monitors were pixel-exact. Declaring
+    // both halves against the same logical box makes the two stretches
+    // identical, so the paired art cancels the fractional-scale wobble.
+    const Vector2D winLogical = [&] {
+        if (pWindow)
+            if (const auto box = pWindow->surfaceLogicalBox())
+                return box->size();
+        return Vector2D(innerBox.width / scale, innerBox.height / scale);
+    }();
     const float thickLogical = (scaledBorderSize + padPx) / scale;
+    const float logicalW = winLogical.x + 2.0f * thickLogical;
+    const float logicalH = winLogical.y + 2.0f * thickLogical;
     const float holeX = thickLogical / logicalW, holeY = thickLogical / logicalH;
     const float holeW = 1.0 - 2.0 * holeX, holeH = 1.0 - 2.0 * holeY;
     cs->shader->setUniformMatrix3fv(SHADER_PROJ, 1, GL_TRUE, glMatrix.getMatrix());
