@@ -29,6 +29,7 @@ downloads it.
 - [Quick start](#quick-start)
 - [Requirements](#requirements) · [Install](#install)
 - [Window shaders](#window-shaders) — [stacking](#stacking) · [fullscreen](#fullscreen) · [fallback rules](#fallback-rules)
+- [Border shaders](#border-shaders) — [directives](#directives) · [pairs](#pairs) · [theme palette](#theme-palette)
 - [Layer shaders](#layer-shaders)
 - [Open and close animations](#open-and-close-animations)
 - [Move and resize animations](#move-and-resize-animations)
@@ -428,6 +429,76 @@ hl.bind("SUPER + W", shade("togglewindowshader", shaders.pixelate))
 ```
 
 ---
+
+## Border shaders
+
+A border shader replaces the window's border with a shader run on the ring
+around it: the canvas is the window plus `border_size` px on every side, the
+window is cut out of it as a hole (one pixel of antialiasing), and where the
+shader doesn't paint, the desktop shows through. Border shaders are written
+against Umbriel's border API, so the community collection's border presets
+port with minimal edits.
+
+### Applying one
+
+```lua
+hl.plugin.HyprWindowShade.activebordershader("/home/USERNAME/.config/hypr/shaders/umbriel/effects/flowering-vine.glsl")
+```
+
+| Function | Arguments | Effect |
+|---|---|---|
+| `bordershader` | `(path\|"clear"\|"none")` | Border shader on the currently focused window. |
+| `classbordershader` | `(class, path\|"clear"\|"none")` | Border shader on every window matching the class. |
+| `activebordershader` | `(path\|"clear"\|"none")` | Border shader that follows the focused window. |
+| `activewindowshader` | `(path\|"clear"\|"none")` | Window overlay that follows the focused window — the inner half of a [pair](#pairs). |
+
+Editing the shader file applies live; the plugin re-checks its timestamp and
+recompiles. A shader with a `time` uniform keeps the ring redrawing by itself,
+and only the ring — the window's content and blur are not repainted per frame.
+
+### Directives
+
+A border shader declares what it needs in its comments:
+
+| Directive | Meaning |
+|---|---|
+| `// @border <px>` | Width of the ring the effect paints. The plugin applies `general:border_size` on activation, restores your value on clear and re-asserts it after a config reload. Gaps are never touched — the ring paints over the existing spacing. |
+| `// @padding <px>` | Extra transparent space beyond the band: the canvas grows, the layout doesn't. |
+| `// @speed <n>` | Multiplies the seconds bound to `umbriel_time`, the way Umbriel does it. Omit it if the shader expects raw seconds. |
+
+Border shaders get Umbriel's API: `umbriel_size`, `umbriel_scale`,
+`umbriel_time`, `umbriel_border_hole`, `umbriel_border_radius`,
+`umbriel_border_distance(uv)`, `umbriel_expand`, `umbriel_palette`,
+`umbriel_palette_at(t)` and `umbriel_sample(uv)` (a synthesized two-pixel rim,
+so effects that mix against the native ring keep their halo).
+
+### Pairs
+
+Umbriel's border presets are pairs: a border effect on the ring outside the
+window plus a window overlay over its content, driven by the same clock. The
+`activewindowshader` function is the inner half of such a pair, and the two
+travel together when the focus changes. For the two halves to agree, the
+overlay has to declare the palette uniforms and use the same
+`umbriel_palette_at()`, and its `// @speed` has to match the border's. The
+[paired-effects guide](docs/paired-effects.md) has the details and the list of
+pairs.
+
+### Theme palette
+
+Both the border pass and the window pass read
+`~/.config/hypr/shaders/umbriel/palette.txt` — four lines of `r g b a` in
+Umbriel's stop order (`accent_primary`, `accent_secondary`, `warning`,
+`error`). The file is re-read at start, after every config reload and on a
+hot timestamp watch, so a theme tool can rewrite it live. With no file there
+is a built-in fallback palette.
+
+### Known limits
+
+- Hyprland's native band can show under the effect canvas when the effect's
+  art is narrower than the native border.
+- The palette path is fixed; making it configurable would be better.
+- Pair sync at the corners depends on the rounding Hyprland reports per
+  surface.
 
 ## Layer shaders
 
@@ -899,6 +970,10 @@ Lua string.
 | `classshader` | `(class, path\|"clear"\|"none")` | Force a shader on every window matching the class. `clear`/`none` removes it. |
 | `toggleclassshader` | `(class, path)` | Toggle the class shader on/off. |
 | `togglewindowshader` | `(path)` | Toggle a shader on the currently focused window only. Pass `"clear"`/`"none"` to remove. |
+| `bordershader` | `(path\|"clear"\|"none")` | Border shader on the currently focused window. |
+| `classbordershader` | `(class, path\|"clear"\|"none")` | Border shader on every window matching the class. |
+| `activebordershader` | `(path\|"clear"\|"none")` | Border shader that follows the focused window. |
+| `activewindowshader` | `(path\|"clear"\|"none")` | Window overlay that follows the focused window. |
 | `layershader` | `(namespace, path\|"clear"\|"none")` | Force a shader on a layer namespace (e.g. `rofi`, `mpvpaper`). |
 | `togglelayershader` | `(namespace, path)` | Toggle a layer shader on/off. |
 | `layeropenanim` | `(namespace, path[@sec]\|"clear"\|"none")` | One-shot animation when a layer of that namespace appears. |
