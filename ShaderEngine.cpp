@@ -88,6 +88,20 @@ static bool parseDeclaredOverlay(const std::string& src) {
     return std::regex_search(src, OVERLAY_RE);
 }
 
+// `// @speed <n>` — Umbriel's preset-speed contract: the host premultiplies
+// umbriel_time by the preset's speed (src/view/effects.cpp: seconds *
+// preset->speed). Our port feeds raw seconds, so the directive does the same
+// job here. Defaults to 1 (raw seconds).
+static const std::regex SPEED_RE(R"(//[ \t]*@speed[ \t]+([0-9]*\.?[0-9]+))");
+static float parseDeclaredSpeed(const std::string& src) {
+    std::smatch m;
+    if (!std::regex_search(src, m, SPEED_RE)) return 1.0f;
+    try {
+        const float s = std::stof(m[1].str());
+        return s > 0.0f ? s : 1.0f;
+    } catch (...) { return 1.0f; }
+}
+
 static std::string captureFragmentLog(const std::string& src) {
     GLuint sh = glCreateShader(GL_FRAGMENT_SHADER);
     const char* csrc = src.c_str();
@@ -275,6 +289,15 @@ CompiledShader* getOrCompileShader(const std::string& shaderPath) {
     entry.shader->createProgram(Render::GL::g_pHyprOpenGL->m_shaders->TEXVERTSRC320, shaderCode, true, true);
 
     const GLuint prog = entry.shader->program();
+    // Window-pass shaders may declare the theme palette too (Umbriel's paired
+    // window overlays read the same stops the border effect sees), and the
+    // border geometry uniforms: paired overlays mirror the border's ring, so
+    // they need the same corner radius Hyprland is about to round with.
+    entry.paletteCountLoc = glGetUniformLocation(prog, "umbriel_palette_count");
+    entry.paletteLoc      = glGetUniformLocation(prog, "umbriel_palette");
+    entry.holeLoc         = glGetUniformLocation(prog, "umbriel_border_hole");
+    entry.radiusLoc       = glGetUniformLocation(prog, "umbriel_border_radius");
+    entry.cornerRadiusLoc = glGetUniformLocation(prog, "umbriel_corner_radius");
     if (prog == 0) {
         std::string log = captureFragmentLog(shaderCode);
         std::string msg = "[HyprWindowShade] Shader Compile FAILED: " + shaderPath;
@@ -330,6 +353,7 @@ CompiledShader* getOrCompileShader(const std::string& shaderPath) {
     // Using the location instead of substring matching avoids false positives
     // like "lifetime" or "uniform_time_offset".
     entry.usesTime    = (entry.timeLoc >= 0);
+    entry.timeSpeed   = parseDeclaredSpeed(shaderCode);
     entry.sourceMtime = currentMtime;
     entry.lastStatAt  = now;
 
@@ -386,4 +410,248 @@ bool declaredAnimTiming(const std::string& shaderPath, float& duration, bool& ov
     duration = parseDeclaredDuration(src);
     overlay  = parseDeclaredOverlay(src);
     return true;
+}
+
+// A border shader can declare the ring width it needs, in px:
+//
+//     // @border 14
+//
+// Applied on activation (the ring is Hyprland's own general:border_size and
+// has no per-shader equivalent), restored when the last border assignment is
+// cleared. Same comment-directive channel as @duration: the CPU has to know
+// the number and GLSL ES cannot carry it in a uniform initializer.
+static const std::regex BORDER_RE(R"(//[ \t]*@border[ \t]+([0-9]*\.?[0-9]+))");
+
+static int parseDeclaredBorderWidth(const std::string& shaderPath) {
+    std::ifstream shaderFile(shaderPath);
+    if (!shaderFile.is_open()) return 0;
+    std::stringstream buffer;
+    buffer << shaderFile.rdbuf();
+    const std::string src = buffer.str();
+    std::smatch m;
+    if (!std::regex_search(src, m, BORDER_RE)) return 0;
+    try {
+        const int w = std::round(std::stof(m[1].str()));
+        return w > 0 ? w : 0;
+    } catch (...) {}
+    return 0;
+}
+
+int declaredBorderWidth(const std::string& shaderPath) {
+    return parseDeclaredBorderWidth(shaderPath);
+}
+
+// An effect can ask for paint space BEYOND the ring, in px:
+//
+//     // @padding 10
+//
+// Umbriel's model (border_rect.h): the effect declares transparent padding and
+// the canvas grows to `thickness + margin + padding` while the LAYOUT keeps
+// budgeting only the border width — the padding paints over the existing gap
+// space. Same here: the hook expands the canvas by this amount and damages it,
+// without touching layout or gaps.
+static const std::regex PADDING_RE(R"(//[ \t]*@padding[ \t]+([0-9]*\.?[0-9]+))");
+
+static int parseDeclaredBorderPadding(const std::string& shaderPath) {
+    std::ifstream shaderFile(shaderPath);
+    if (!shaderFile.is_open()) return 0;
+    std::stringstream buffer;
+    buffer << shaderFile.rdbuf();
+    const std::string src = buffer.str();
+    std::smatch m;
+    if (!std::regex_search(src, m, PADDING_RE)) return 0;
+    try {
+        const int p = std::round(std::stof(m[1].str()));
+        return p > 0 ? p : 0;
+    } catch (...) {}
+    return 0;
+}
+
+int declaredBorderPadding(const std::string& shaderPath) {
+    return parseDeclaredBorderPadding(shaderPath);
+}
+
+// --- BORDER SHADER COMPILATION (Umbriel-style ring pass) ---
+// Border shaders draw in Hyprland's own border pass: a ring quad around the
+// window (window box + border_size on every side), with the window interior
+// scissored away. The contract mirrors Umbriel's border effects, so community
+// shaders port with minimal edits:
+//
+//   vec4 border(vec2 uv)   // premultiplied colour+coverage, uv 0..1 over the ring
+//
+// The wrapper provides everything Umbriel's compositor provides: umbriel_size,
+// umbriel_scale, umbriel_time, umbriel_border_hole, umbriel_border_radius, the
+// umbriel_border_distance() rounded-box SDF, and the hole cut with one buffer
+// pixel of AA — Umbriel's kBorderSuffix, ported verbatim. umbriel_palette_count
+// reads 0 so `theme_color` guards pass; umbriel_expand is fixed at 0 because
+// this canvas is already the ring itself.
+//
+// Compiled and cached alongside window shaders under the "border:" key prefix:
+// the cache, hot-reload and failure handling are identical, and a border shader
+// and a window shader can share a path without colliding.
+static const char kBorderPreamble[] = R"(
+precision highp float;
+in vec2 v_texcoord;
+out vec4 fragColor;
+
+// Provided by HyprWindowShade — Umbriel border API.
+uniform vec2  umbriel_size;          // ring canvas in logical px
+uniform float umbriel_scale;         // monitor scale
+uniform vec4  umbriel_border_hole;   // window rect inside the canvas, normalised
+uniform vec4  umbriel_border_radius; // per-corner radii, logical px (tl, tr, br, bl)
+uniform vec2  umbriel_expand;        // declared effect padding, normalised to the canvas
+uniform int   umbriel_palette_count; // 0 — theme palettes not supported here
+uniform float plugin_alpha;          // window opacity
+uniform float time;                  // seconds since plugin load; drives redraw
+uniform float seed;                  // per-window random seed
+
+#define umbriel_time time
+#define surface_size umbriel_size
+// Theme palettes are not available in this pass: count reads 0 and
+// umbriel_palette_at returns a neutral ice-white so effects that sample the
+// palette without a guard (e.g. dual-orbit) stay visible. Guarding effects
+// check umbriel_palette_count first and never reach this.
+uniform vec4 umbriel_palette[4];
+vec4 umbriel_palette_at(float t) {
+    if (umbriel_palette_count <= 0) return vec4(0.07, 0.12, 0.19, 1.0);
+    float span = float(umbriel_palette_count);
+    float pos  = clamp(t, 0.0, 0.999) * span;
+    float index = floor(pos);
+    float next = index + 1.0;
+    vec4 from = umbriel_palette[0];
+    vec4 to = umbriel_palette[0];
+    for (int i = 0; i < 4; i++) {
+        if (float(i) >= span) break;
+        if (float(i) == index) from = umbriel_palette[i];
+        if (float(i) == next) to = umbriel_palette[i];
+    }
+    return mix(from, to, pos - index);
+}
+
+// Rounded-box SDF of the window hole, signed LOGICAL px, negative inside the
+// window. Ported from Umbriel's kBorderSection (effect_shader.c).
+float umbriel_border_distance(vec2 uv) {
+  vec2 half_size = umbriel_border_hole.zw * umbriel_size * 0.5;
+  vec2 p = (uv - umbriel_border_hole.xy) * umbriel_size - half_size;
+  float r = p.y < 0.0 ? (p.x < 0.0 ? umbriel_border_radius.x : umbriel_border_radius.y)
+                      : (p.x < 0.0 ? umbriel_border_radius.w : umbriel_border_radius.z);
+  r = min(r, min(half_size.x, half_size.y));
+  vec2 q = abs(p) - half_size + r;
+  return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+}
+
+// Window-content sampling is not available in the border pass (the ring has no
+// window texture bound). Effects that call umbriel_sample get a SYNTHESIZED
+// native instead: the window's coverage footprint — opaque inside the hole,
+// then Umbriel's thin native rim (border_width defaults to 2) — with no
+// colour. The rest of the reserved band stays transparent so the effect's own
+// glow paints it: with a full-width opaque ring, (1 - native.a) would be zero
+// across the band and halo-style effects (dual-orbit) would lose their heads.
+vec4 umbriel_sample(vec2 uv) {
+    float d = umbriel_border_distance(uv);
+    float a = d < 0.0 ? 1.0 : (1.0 - smoothstep(1.5, 2.5, d));
+    return vec4(0.0, 0.0, 0.0, a);
+}
+)";
+
+static const char kBorderSuffix[] = R"(
+void main() {
+    vec4 c = border(v_texcoord);
+    // Umbriel's compositor suffix: the client hole is cut with one buffer px of AA.
+    c *= smoothstep(-0.5, 0.5, umbriel_border_distance(v_texcoord) * umbriel_scale);
+    // Premultiplied output (blend is GL_ONE, GL_ONE_MINUS_SRC_ALPHA): clamp
+    // colour to what alpha allows, then fold in the window's opacity.
+    fragColor = vec4(min(c.rgb, vec3(c.a)), c.a) * plugin_alpha;
+}
+)";
+
+CompiledShader* getOrCompileBorderShader(const std::string& shaderPath) {
+    const auto now = std::chrono::steady_clock::now();
+    // Same cache contract as getOrCompileShader, namespaced so a border shader
+    // and a window shader can share a path without colliding.
+    const std::string cacheKey = "border:" + shaderPath;
+
+    if (auto it = g_mCompiledCShaders.find(cacheKey); it != g_mCompiledCShaders.end()) {
+        if (now - it->second.lastStatAt < STAT_INTERVAL)
+            return &it->second;
+        it->second.lastStatAt = now;
+        const time_t mtimeNow = fileMtime(shaderPath);
+        if (mtimeNow == 0 || it->second.sourceMtime == mtimeNow)
+            return &it->second;
+        g_mCompiledCShaders.erase(it);
+    }
+
+    const time_t currentMtime = fileMtime(shaderPath);
+
+    if (auto fit = g_mFailedShaderMtimes.find(cacheKey); fit != g_mFailedShaderMtimes.end()) {
+        if (fit->second == currentMtime)
+            return nullptr;
+        g_mFailedShaderMtimes.erase(fit);
+    }
+
+    std::ifstream shaderFile(shaderPath);
+    if (!shaderFile.is_open()) {
+        g_mFailedShaderMtimes[cacheKey] = 0;
+        return nullptr;
+    }
+
+    std::stringstream buffer;
+    buffer << shaderFile.rdbuf();
+    std::string shaderCode = buffer.str();
+
+    // The preamble must sit AFTER the file's `#version` line (GLSL requires
+    // #version first), so split on the first newline.
+    const size_t eol = shaderCode.find('\n');
+    if (eol == std::string::npos || shaderCode.compare(0, 8, "#version") != 0) {
+        HyprlandAPI::addNotification(PHANDLE, "[HyprWindowShade] Border shader must start with `#version 320 es`: " + shaderPath,
+                                     CHyprColor(1.0f, 0.0f, 0.0f, 1.0f), 10000.0f);
+        g_mFailedShaderMtimes[cacheKey] = currentMtime;
+        return nullptr;
+    }
+    // A `void main(` in the border file would fight the wrapper's suffix main.
+    // Rename it like the window path does; the function stays but never runs.
+    if (std::smatch m; std::regex_search(shaderCode, m, MAIN_RE))
+        shaderCode.replace(m.position(0), m.length(0), "void border_user_main()");
+
+    shaderCode.insert(eol + 1, kBorderPreamble);
+    shaderCode += kBorderSuffix;
+
+    CompiledShader entry;
+    entry.shader = Hyprutils::Memory::makeShared<CShader>();
+    entry.shader->createProgram(Render::GL::g_pHyprOpenGL->m_shaders->TEXVERTSRC320, shaderCode, true, true);
+
+    const GLuint prog = entry.shader->program();
+    if (prog == 0) {
+        std::string log = captureFragmentLog(shaderCode);
+        std::string msg = "[HyprWindowShade] Border shader compile FAILED: " + shaderPath;
+        if (!log.empty()) {
+            if (log.size() > 200) log.resize(200);
+            msg += "\n";
+            msg += log;
+        }
+        HyprlandAPI::addNotification(PHANDLE, msg, CHyprColor(1.0f, 0.0f, 0.0f, 1.0f), 15000.0f);
+        g_mFailedShaderMtimes[cacheKey] = currentMtime;
+        return nullptr;
+    }
+
+    // umbriel_palette: a fixed 4-stop ice-white ramp, so palette-sampling
+    // effects get something visible; effects that guard on the count ignore it.
+    entry.paletteCountLoc = glGetUniformLocation(prog, "umbriel_palette_count");
+    entry.paletteLoc      = glGetUniformLocation(prog, "umbriel_palette");
+    entry.expandLoc       = glGetUniformLocation(prog, "umbriel_expand");
+    entry.paddingPx       = parseDeclaredBorderPadding(shaderPath);
+    entry.timeLoc         = glGetUniformLocation(prog, "time");
+    entry.seedLoc         = glGetUniformLocation(prog, "seed");
+    entry.alphaLoc        = glGetUniformLocation(prog, "plugin_alpha");
+    entry.surfaceSizeLoc  = glGetUniformLocation(prog, "umbriel_size");
+    entry.holeLoc         = glGetUniformLocation(prog, "umbriel_border_hole");
+    entry.radiusLoc       = glGetUniformLocation(prog, "umbriel_border_radius");
+    entry.scaleLoc        = glGetUniformLocation(prog, "umbriel_scale");
+    entry.usesTime        = (entry.timeLoc >= 0);
+    entry.timeSpeed       = parseDeclaredSpeed(shaderCode);
+    entry.sourceMtime     = currentMtime;
+    entry.lastStatAt      = now;
+
+    auto [insertedIt, _] = g_mCompiledCShaders.emplace(cacheKey, std::move(entry));
+    return &insertedIt->second;
 }

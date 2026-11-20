@@ -7,6 +7,11 @@
 #include <hyprutils/utils/ScopeGuard.hpp>
 #include <string_view>
 
+// Forward declaration: the palette helper lives further down, after the
+// window-pass draw hook that also uses it.
+static void bindThemePalette(GLint countLoc, GLint paletteLoc);
+#include <sys/stat.h>
+
 #include <cstdio>
 
 // --- ACTIVE RENDER CONTEXT ---
@@ -946,6 +951,11 @@ static int collectBaseLayers(const PHLWINDOW& pWindow, const PHLLS& pLS, const s
             } else {
                 if (classShader)                                out[n++] = classShader;
                 if (!state.fallback.empty())                    out[n++] = &state.fallback;
+                // Active-focus overlay: below the imperative toggle (an
+                // explicit per-window assignment wins), above the rest — same
+                // precedence the active border shader has. Stacks as one more
+                // layer; the cap guard keeps the caller's animation slot free.
+                if (!g_sActiveWindowShader.empty() && isActive && n < MAX_SHADER_STAGES - 1) out[n++] = &g_sActiveWindowShader;
                 if (manualShader)                               out[n++] = manualShader;
                 if (isFloating)  { if (!state.floating.empty())  out[n++] = &state.floating; }
                 else             { if (!state.tiled.empty())     out[n++] = &state.tiled; }
@@ -957,6 +967,8 @@ static int collectBaseLayers(const PHLWINDOW& pWindow, const PHLLS& pLS, const s
             // No rules at all, so there is nothing to opt this window into
             // being shaded while fullscreen — and opting in is the only way.
             if (classShader)                                    out[n++] = classShader;
+            if (!g_sActiveWindowShader.empty() && n < MAX_SHADER_STAGES - 1 &&
+                Desktop::focusState()->isWindowActive(pWindow)) out[n++] = &g_sActiveWindowShader;
             if (manualShader)                                   out[n++] = manualShader;
         }
 
@@ -1608,7 +1620,7 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
             const float t = std::chrono::duration_cast<std::chrono::duration<float>>(
                                 std::chrono::steady_clock::now() - g_pluginStartTime)
                                 .count();
-            glUniform1f(activeEntry->timeLoc, t);
+            glUniform1f(activeEntry->timeLoc, t * activeEntry->timeSpeed);
         }
         if (activeEntry->alphaLoc >= 0) {
             // Offscreen stages always render fully opaque. Window opacity is a
@@ -1633,8 +1645,19 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
             // supported way to read a window's logical geometry.
             Vector2D sz(0, 0);
             if (contextWindow) {
-                if (const auto box = contextWindow->logicalBox())
+                // surfaceLogicalBox, not logicalBox: the view's logicalBox spans
+                // the window WITH its shadow margins (measured ~+29x+32 on a
+                // 1161x1328 kitty), while the texture this shader draws spans
+                // the surface box alone. A shader that laid art out against
+                // logicalBox placed its frame ~15px outside the real window
+                // edge and split its perimeter against a longer rim — exactly
+                // the drift paired border/window effects showed. The border
+                // pass's hole is the real window box, so the window pass must
+                // answer with the same box for the pair to coordinate.
+                if (const auto box = contextWindow->surfaceLogicalBox())
                     sz = box->size();
+                else if (const auto lbox = contextWindow->logicalBox())
+                    sz = lbox->size();
             }
             // A layer surface and a close animation's snapshot both arrive with
             // no window, and used to leave this at (0,0). Any shader converting
@@ -1658,6 +1681,24 @@ Hyprutils::Memory::CWeakPointer<CShader> hkUseShader(CHyprOpenGLImpl* thisptr, H
             // their parent window's box above; that is what lets a shader build
             // one coherent field across a window instead of per-surface.
             glUniform2f(activeEntry->surfaceSizeLoc, (float)sz.x, (float)sz.y);
+        }
+        if (activeEntry->paletteCountLoc >= 0 || activeEntry->paletteLoc >= 0)
+            bindThemePalette(activeEntry->paletteCountLoc, activeEntry->paletteLoc);
+        if (activeEntry->radiusLoc >= 0 || activeEntry->holeLoc >= 0) {
+            // Paired-overlay geometry: the window itself is the hole (full
+            // 0..1), and the corner radius is whatever Hyprland is rounding
+            // this surface with, in logical px — the same value the border
+            // pass derives from its own element. Hard-coded radii in paired
+            // overlays would drift from the border at other users' configs.
+            float scaleNow = 1.0f;
+            if (g_pCurrentRenderCtx)
+                if (auto mon = g_pCurrentRenderCtx->m_data.pMonitor.lock())
+                    scaleNow = mon->m_scale;
+            glUniform4f(activeEntry->holeLoc, 0.0f, 0.0f, 1.0f, 1.0f);
+            glUniform4f(activeEntry->radiusLoc, g_pCurrentRound / scaleNow, g_pCurrentRound / scaleNow,
+                        g_pCurrentRound / scaleNow, g_pCurrentRound / scaleNow);
+            glUniform4f(activeEntry->cornerRadiusLoc, g_pCurrentRound / scaleNow, g_pCurrentRound / scaleNow,
+                        g_pCurrentRound / scaleNow, g_pCurrentRound / scaleNow);
         }
         if (activeEntry->mouseLoc >= 0 && Pointer::mgr()) {
             const Vector2D p = Pointer::mgr()->position();
@@ -2495,4 +2536,253 @@ void applyShaderRulesSafe(PHLWINDOW pWindow) {
     } else {
         g_mWindowRuleShaders.erase(rawWin);
     }
+}
+
+// --- THEME PALETTE BINDING (shared by the border and window passes) ---------
+// Re-stats the palette file with a light throttle so a theme tool can rewrite
+// it live; missing or malformed file -> built-in fallback. Both passes bind
+// the same 4 stops (Umbriel's order: accent_primary, accent_secondary,
+// warning, error) so paired border/overlay effects stay in phase.
+static void bindThemePalette(GLint countLoc, GLint paletteLoc);
+static void bindThemePalette(GLint countLoc, GLint paletteLoc) {
+    static const float fallback[16] = {0.07f, 0.12f, 0.19f, 1.0f, 0.45f, 0.95f, 1.0f, 1.0f,
+                                       0.25f, 0.70f, 0.95f, 1.0f, 0.60f, 0.92f, 1.0f, 1.0f};
+    static std::chrono::steady_clock::time_point s_paletteStat{};
+    static time_t s_paletteMtime = 0;
+    if (std::chrono::steady_clock::now() - s_paletteStat > std::chrono::milliseconds(400)) {
+        s_paletteStat = std::chrono::steady_clock::now();
+        const char* home = getenv("HOME");
+        if (home) {
+            std::string palPath = std::string(home) + "/.config/hypr/shaders/umbriel/palette.txt";
+            struct stat st {};
+            if (::stat(palPath.c_str(), &st) == 0) {
+                if (st.st_mtime != s_paletteMtime) {
+                    s_paletteMtime = st.st_mtime;
+                    loadThemePaletteFile();
+                }
+            } else if (g_themePaletteLoaded) {
+                s_paletteMtime = 0;
+                g_themePaletteLoaded = false; // file gone: back to fallback
+            }
+        }
+    }
+    if (countLoc >= 0)
+        // Count must be 4: with 0 umbriel_palette_at returns the wrapper's
+        // hard-coded colour and ignores the bound palette.
+        glUniform1i(countLoc, 4);
+    if (paletteLoc >= 0)
+        glUniform4fv(paletteLoc, 4, g_themePaletteLoaded ? g_themePalette : fallback);
+}
+
+// --- BORDER PASS HOOK (Umbriel-style ring pass) ---
+// CGLElementRenderer::draw(CRenderContext, CBorderPassElement, CRegion) draws
+// every border ring. For windows with a border shader assigned, replace the
+// native border draw entirely — like Umbriel replaces its native ring — with
+// the compiled border shader running over the same ring canvas. Without a
+// border shader this returns Hyprland's own draw untouched.
+typedef void (*TBorderDraw)(void* thisptr, Render::CRenderContext& ctx, Hyprutils::Memory::CWeakPointer<CBorderPassElement> element, const CRegion& damage);
+
+// Which border shader, if any, applies to this window: per-window assignment,
+// the active-focus effect, or a class rule. Returns a borrowed pointer — the
+// caller must not hold it past this call (the maps can mutate between frames).
+static const std::string* borderShaderPathFor(const PHLWINDOW& pWindow) {
+    if (!pWindow)
+        return nullptr;
+    Desktop::View::CWindow* rawWin = pWindow.get();
+    if (auto it = g_mWindowBorderShaders.find(rawWin); it != g_mWindowBorderShaders.end())
+        return &it->second;
+    if (!g_sActiveBorderShader.empty() && Desktop::focusState()->isWindowActive(pWindow))
+        // Active-focus mode: the effect follows the focused window.
+        return &g_sActiveBorderShader;
+    const auto& initClass    = rawWin->metadata().initialAppID();
+    const auto& currentClass = rawWin->metadata().appID();
+    auto        classIt      = g_mWindowClassBorderShaderMap.find(initClass);
+    if (classIt == g_mWindowClassBorderShaderMap.end())
+        classIt = g_mWindowClassBorderShaderMap.find(currentClass);
+    if (classIt != g_mWindowClassBorderShaderMap.end())
+        return &classIt->second;
+    return nullptr;
+}
+
+void hkBorderDraw(void* thisptr, Render::CRenderContext& ctx, Hyprutils::Memory::CWeakPointer<CBorderPassElement> element, const CRegion& damage) {
+    CBorderPassElement* elem = element.get();
+
+    // Same weak-over-unique rule as hkGLDrawTex: borrow, never lock.
+    PHLWINDOW pWindow;
+    if (elem)
+        pWindow = elem->m_data.window.lock();
+
+    const std::string* path = nullptr;
+    if (pWindow) {
+        Desktop::View::CWindow* rawWin = pWindow.get();
+        if (auto it = g_mWindowBorderShaders.find(rawWin); it != g_mWindowBorderShaders.end())
+            path = &it->second;
+        else if (!g_sActiveBorderShader.empty() && Desktop::focusState()->isWindowActive(pWindow))
+            path = &g_sActiveBorderShader;
+        else {
+            const auto& initClass    = rawWin->metadata().initialAppID();
+            const auto& currentClass = rawWin->metadata().appID();
+            auto        classIt      = g_mWindowClassBorderShaderMap.find(initClass);
+            if (classIt == g_mWindowClassBorderShaderMap.end())
+                classIt = g_mWindowClassBorderShaderMap.find(currentClass);
+            if (classIt != g_mWindowClassBorderShaderMap.end())
+                path = &classIt->second;
+        }
+    }
+
+    // Fast path: the overwhelming majority of draws have no border shader.
+    // While the active-focus mode is on, windows without their own border
+    // shader draw NOTHING: the native gradient ring reads as a dark band and
+    // the silhouette is meant to be transparent everywhere but the wave.
+    if (!path) {
+        if (g_bSuppressNativeBorder) return;
+        ((TBorderDraw)g_pBorderDrawHook->m_original)(thisptr, ctx, element, damage);
+        return;
+    }
+
+    CompiledShader* cs = getOrCompileBorderShader(*path);
+    if (!cs) {
+        ((TBorderDraw)g_pBorderDrawHook->m_original)(thisptr, ctx, element, damage);
+        return;
+    }
+
+    auto& R = ctx.m_data;
+    if (R.damage.empty())
+        return;
+
+    const CBox innerBox = [&] {
+        CBox b = elem->m_data.box;
+        R.renderModif.applyToBox(b);
+        return b;
+    }();
+
+    const int scaledBorderSize = std::round(std::round(elem->m_data.borderSize * R.pMonitor->m_scale) * R.renderModif.combinedScale());
+    if (scaledBorderSize < 1)
+        return;
+
+    // adjust box: the ring canvas is the window box + border width on every
+    // side, plus the effect's declared padding (Umbriel's effect padding:
+    // canvas grows, layout does not — the padding paints over the gap space).
+    const int padPx = cs->paddingPx;
+    CBox newBox = innerBox;
+    newBox.x -= scaledBorderSize + padPx;
+    newBox.y -= scaledBorderSize + padPx;
+    newBox.width += 2 * (scaledBorderSize + padPx);
+    newBox.height += 2 * (scaledBorderSize + padPx);
+
+    const int roundPx = elem->m_data.round + (elem->m_data.round == 0 ? 0 : scaledBorderSize);
+    // umbriel_border_radius is the HOLE radius (the window's own rounding, the
+    // contour the border art follows) — NOT the outer canvas radius. Paired
+    // window overlays bind the same value, so their art continues the border's
+    // across the rim on any user's config.
+
+    const auto& glMatrix = g_pHyprRenderer->projectBoxToTarget(ctx, newBox);
+
+    const bool savedBlend = Render::GL::g_pHyprOpenGL->blendEnabled();
+    Render::GL::g_pHyprOpenGL->blend(true);
+
+    // Bind our program. hkUseShader must not push window-shader uniforms here —
+    // the border draw pushes its own below — so clear the entry around the call.
+    CompiledShader* savedEntry = g_pCurrentCompiledShader;
+    g_pCurrentCompiledShader   = nullptr;
+    Render::GL::g_pHyprOpenGL->useShader(cs->shader);
+    g_pCurrentCompiledShader = savedEntry;
+
+    // Geometry: the ring canvas in logical px. umbriel_size = newBox/scale, the
+    // hole is the window rect inset by the border width + padding.
+    const auto  mon   = R.pMonitor.lock();
+    const float scale = mon ? mon->m_scale : 1.0f;
+    // The hole's logical size must be the window's EXACT logical box — the same
+    // box the window pass binds as surface_size (surfaceLogicalBox). Deriving
+    // it from the integer device canvas instead (innerBox/scale) left a ~0.03%
+    // stretch and a ~2px perimeter mismatch at fractional monitor scales: the
+    // paired overlay's art then walked a couple of px ahead of the border's on
+    // a 1.0667x monitor while integer-scale monitors were pixel-exact. Declaring
+    // both halves against the same logical box makes the two stretches
+    // identical, so the paired art cancels the fractional-scale wobble.
+    const Vector2D winLogical = [&] {
+        if (pWindow)
+            if (const auto box = pWindow->surfaceLogicalBox())
+                return box->size();
+        return Vector2D(innerBox.width / scale, innerBox.height / scale);
+    }();
+    const float thickLogical = (scaledBorderSize + padPx) / scale;
+    const float logicalW = winLogical.x + 2.0f * thickLogical;
+    const float logicalH = winLogical.y + 2.0f * thickLogical;
+    const float holeX = thickLogical / logicalW, holeY = thickLogical / logicalH;
+    const float holeW = 1.0 - 2.0 * holeX, holeH = 1.0 - 2.0 * holeY;
+    cs->shader->setUniformMatrix3fv(SHADER_PROJ, 1, GL_TRUE, glMatrix.getMatrix());
+    if (cs->timeLoc >= 0) {
+        const float t = std::chrono::duration_cast<std::chrono::duration<float>>(
+                            std::chrono::steady_clock::now() - g_pluginStartTime)
+                            .count();
+        glUniform1f(cs->timeLoc, t * cs->timeSpeed);
+    }
+    if (cs->seedLoc >= 0)
+        glUniform1f(cs->seedLoc, animSeedFor(pWindow.get()));
+    if (cs->alphaLoc >= 0)
+        glUniform1f(cs->alphaLoc, elem->m_data.a);
+    if (cs->surfaceSizeLoc >= 0)
+        glUniform2f(cs->surfaceSizeLoc, logicalW, logicalH);
+    if (cs->holeLoc >= 0)
+        glUniform4f(cs->holeLoc, holeX, holeY, holeW, holeH);
+    if (cs->radiusLoc >= 0) {
+        const float holeRadiusLogical = elem->m_data.round / scale;
+        glUniform4f(cs->radiusLoc, holeRadiusLogical, holeRadiusLogical, holeRadiusLogical, holeRadiusLogical);
+    }
+    if (cs->scaleLoc >= 0)
+        glUniform1f(cs->scaleLoc, scale);
+    if (cs->expandLoc >= 0)
+        glUniform2f(cs->expandLoc, padPx / logicalW, padPx / logicalH);
+    if (cs->paletteCountLoc >= 0 || cs->paletteLoc >= 0)
+        bindThemePalette(cs->paletteCountLoc, cs->paletteLoc);
+
+    // Continuous redraw while the shader binds `time` — but only the ring:
+    // damageWindow would repaint the whole window (blur included) every frame
+    // for a change that lives entirely in the border. The ring box is
+    // monitor-local buffer px here; damageBox wants global logical coords.
+    if (cs->usesTime && pWindow) {
+        CBox dmg = newBox;
+        dmg.scale(1.0 / scale);
+        if (mon)
+            dmg.translate(mon->m_position);
+        dmg.expand(2);
+        g_pHyprRenderer->damageBox(dmg);
+    }
+
+    glBindVertexArray(cs->shader->getUniformLocation(SHADER_SHADER_VAO));
+
+    // Same draw region as the native border: never the window interior.
+    CRegion borderRegion = R.damage.copy().intersect(newBox);
+    borderRegion.subtract(innerBox.copy().expand(-scaledBorderSize - roundPx));
+    if (R.clipBox.width != 0 && R.clipBox.height != 0)
+        borderRegion.intersect(R.clipBox);
+
+    if (!borderRegion.empty()) {
+        borderRegion.forEachRect([&ctx](const auto& RECT) {
+            Render::GL::g_pHyprOpenGL->scissor(ctx, &RECT, ctx.m_data.transformDamage);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        });
+    }
+
+    glBindVertexArray(0);
+    Render::GL::g_pHyprOpenGL->blend(savedBlend);
+}
+
+// --- SHADOW HOOK ---
+// CHyprOpenGLImpl::renderRoundedShadow draws every window shadow. While the
+// active-focus border mode is on, shadows are suppressed entirely: the ring is
+// transparent by design and the shadow's gradient over it reads as the dark
+// band the effect is supposed to remove. Both overloads funnel into the
+// two-gradient one, so hooking that covers every caller.
+typedef void (*TRoundedShadow)(void* thisptr, Render::CRenderContext& ctx, const CBox& box, int round, float roundingPower, int range,
+                               const Config::CGradientValueData& grad1, const Config::CGradientValueData& grad2, float lerp, float a,
+                               const Render::SWindowRenderPresentation& presentation);
+
+void hkRoundedShadow(void* thisptr, Render::CRenderContext& ctx, const CBox& box, int round, float roundingPower, int range,
+                     const Config::CGradientValueData& grad1, const Config::CGradientValueData& grad2, float lerp, float a,
+                     const Render::SWindowRenderPresentation& presentation) {
+    if (g_bSuppressNativeBorder)
+        return;
+    ((TRoundedShadow)g_pShadowHook->m_original)(thisptr, ctx, box, round, roundingPower, range, grad1, grad2, lerp, a, presentation);
 }
